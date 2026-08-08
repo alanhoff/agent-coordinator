@@ -1,570 +1,466 @@
 from __future__ import annotations
 
 import contextlib
-import datetime as dt
 import io
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPTS = PACKAGE_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-import coordinator_state  # noqa: E402
+sys.path.insert(0, str(ROOT / "src"))
+
+from coordinator.cli import state as state_cli  # noqa: E402
+from coordinator.state import store as state_owner  # noqa: E402
+from coordinator.state.store import MAX_STATE_BYTES, StateError, StateStore, validate_state  # noqa: E402
 
 
-class CoordinatorStateTests(unittest.TestCase):
+class DurableStateTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="coordinator-state-test-")
+        self.temporary = tempfile.TemporaryDirectory()
         self.base = pathlib.Path(self.temporary.name)
-        self.state_root = self.base / "state"
+        self.home = self.base / "home"
+        self.home.mkdir()
         self.repo = self.base / "repo"
         self.repo.mkdir()
-        self.env = mock.patch.dict(
-            os.environ, {"COORDINATOR_TMP_ROOT": str(self.state_root)}, clear=False
+        self.session = self.base / "private" / "session.json"
+        self.environment = mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
+        self.environment.start()
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(self.session))
+        created = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Coordinate durable work",
+            "--session-file", str(self.session), "--mutation-id", "init-001",
         )
-        self.env.start()
+        self.workflow_id = created["data"]["workflow_id"]
 
     def tearDown(self) -> None:
-        self.env.stop()
+        self.environment.stop()
         self.temporary.cleanup()
 
-    def run_main(self, arguments):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = coordinator_state.main(arguments)
-        return code, stdout.getvalue(), stderr.getvalue()
+    def cli(self, *arguments: str, expected: int = 0) -> dict:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            code = state_cli.main([*arguments, "--json"])
+        self.assertEqual(code, expected, output.getvalue())
+        return json.loads(output.getvalue())
 
-    def init(self, task: str = "Build adaptive feature") -> str:
-        code, output, error = self.run_main(
-            ["init", "--repo", str(self.repo), "--task", task, "--json"]
+    def mutation(self, command: str, revision: int, mutation: str, *arguments: str, session: pathlib.Path | None = None, expected: int = 0) -> dict:
+        return self.cli(
+            command,
+            "--workflow-id", self.workflow_id,
+            "--session-file", str(session or self.session),
+            "--mutation-id", mutation,
+            "--expected-revision", str(revision),
+            *arguments,
+            expected=expected,
         )
-        self.assertEqual(code, 0, error)
-        return json.loads(output)["workflow_id"]
 
-    def add_node(self, workflow_id: str, node_id: str, dependencies=(), priority=50):
-        args = [
-            "node-add", "--workflow-id", workflow_id,
-            "--node-id", node_id,
-            "--stage", "implementation",
-            "--title", node_id,
-            "--agent-type", "implementer",
-            "--model", "gpt-5.6-terra",
-            "--reasoning-effort", "high",
-            "--routing-rationale", "Current bounded route",
-            "--priority", str(priority),
-            "--write-scope", f"src/{node_id}.py",
-            "--acceptance-criterion", "Focused validation passes",
-            "--output-contract", f"Produce the validated {node_id} result",
-            "--validation-command", "python -m unittest",
-        ]
-        for dependency in dependencies:
-            args.extend(["--dependency", dependency])
-        args.append("--json")
-        code, output, error = self.run_main(args)
-        self.assertEqual(code, 0, error)
-        return json.loads(output)
+    def add(
+        self,
+        node_id: str,
+        revision: int,
+        mutation: str,
+        *extra: str,
+        scope: str | None = None,
+        expected: int = 0,
+    ) -> dict:
+        return self.mutation(
+            "node-add", revision, mutation,
+            "--node-id", node_id, "--title", node_id, "--stage", "implementation",
+            "--write-scope", scope or f"src/{node_id}", "--role", "implementer",
+            "--model", "gpt-5.6-terra", "--effort", "high",
+            "--acceptance", "focused test passes", "--rationale", "bounded implementation",
+            *extra,
+            expected=expected,
+        )
 
-    def state(self, workflow_id: str):
-        return coordinator_state.load_state(coordinator_state.temp_root(), workflow_id)
+    def test_revision_receipts_and_invalid_graph_changes_are_atomic(self) -> None:
+        replayed_init = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Coordinate durable work",
+            "--session-file", str(self.session), "--mutation-id", "init-001",
+        )
+        self.assertEqual(replayed_init["data"]["workflow_id"], self.workflow_id)
+        first = self.add("a", 1, "add-a")
+        self.assertEqual(first["data"]["revision"], 2)
+        replay = self.add("a", 1, "add-a")
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        self.add("other", 1, "stale-add", expected=20)
+        self.add("b", 2, "add-b", "--dependency", "a")
+        malformed = json.dumps({"reason": "invalid node id", "operations": [{"op": "remove", "node_id": {}}]})
+        self.mutation("graph-replan", 3, "invalid-node-id", "--plan-json", malformed, expected=2)
+        malformed = json.dumps({"reason": "invalid dependency", "operations": [{"op": "dependency_add", "node_id": "a", "dependency": {}}]})
+        self.assertEqual(
+            self.mutation("graph-replan", 3, "invalid-dependency", "--plan-json", malformed, expected=2)["code"],
+            "invalid_state",
+        )
+        malformed = json.dumps({"reason": "invalid replacement", "operations": [{"op": "supersede", "node_id": "a", "replacement": {}}]})
+        self.assertEqual(
+            self.mutation("graph-replan", 3, "invalid-replacement", "--plan-json", malformed, expected=2)["code"],
+            "invalid_state",
+        )
+        plan = json.dumps({"reason": "try cycle", "operations": [{"op": "dependency_add", "node_id": "a", "dependency": "b"}]})
+        self.mutation("graph-replan", 3, "cycle", "--plan-json", plan, expected=2)
+        self.add("collision", 3, "scope-collision", scope="src/a/file.py", expected=2)
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["revision"], 3)
+        self.assertEqual(set(state["nodes"]), {"a", "b"})
 
-    def test_exact_task_resumes_and_abort_resume_is_recoverable(self) -> None:
-        workflow_id = self.init("Same task")
-        second = self.init("Same task")
-        self.assertEqual(workflow_id, second)
-        self.add_node(workflow_id, "work")
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "running", "--increment-attempt", "--task-name", "work_1", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, error = self.run_main([
-            "abort", "--workflow-id", workflow_id, "--reason", "operator interruption", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        self.assertEqual(self.state(workflow_id)["nodes"]["work"]["status"], "interrupted")
-        code, _, error = self.run_main([
-            "resume", "--workflow-id", workflow_id, "--message", "continue", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        self.assertIn(self.state(workflow_id)["status"], {"planning", "running"})
+    def test_takeover_fences_old_controller_and_launch_reconciliation_is_explicit(self) -> None:
+        self.add("work", 1, "add-work")
+        second_session = self.base / "private" / "second.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(second_session))
+        takeover = self.mutation("controller-takeover", 2, "takeover-1", session=second_session)
+        self.assertTrue(takeover["data"]["resume_required"])
+        self.mutation("event", 3, "old-controller", "--kind", "test", "--message", "old", expected=20)
+        self.mutation("event", 3, "before-resume", "--kind", "test", "--message", "new", session=second_session, expected=20)
+        resumed = self.mutation("resume", 3, "resume-1", "--message", "reconciled takeover", session=second_session)
+        self.assertEqual(resumed["data"]["controller_epoch"], 2)
+        self.mutation("node-update", 4, "claim-1", "--node-id", "work", "--launch-state", "claimed", "--request-id", "request-1", session=second_session)
+        self.mutation("node-update", 5, "uncertain-1", "--node-id", "work", "--launch-state", "reconcile_required", "--reconciliation", "provider timed out", session=second_session)
+        self.mutation("node-update", 6, "unsafe-retry", "--node-id", "work", "--launch-state", "unclaimed", session=second_session, expected=2)
+        self.mutation("node-update", 6, "safe-retry", "--node-id", "work", "--launch-state", "unclaimed", "--reconciliation", "provider confirms no child", session=second_session)
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["nodes"]["work"]["launch"]["state"], "unclaimed")
+        self.assertEqual(state["nodes"]["work"]["attempts"][0]["outcome"], "provider confirmed not launched")
 
-    def test_task_and_replan_files_support_shell_sensitive_cross_platform_input(self) -> None:
-        task_file = self.base / "task input with spaces.txt"
-        task_text = "Implement A & B with quoted value \"x\"\nand preserve multiline context"
-        task_file.write_text(task_text, encoding="utf-8")
-        code, output, error = self.run_main([
-            "init", "--repo", str(self.repo), "--task-file", str(task_file), "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        workflow_id = json.loads(output)["workflow_id"]
-        self.assertEqual(self.state(workflow_id)["task"], task_text)
-        self.add_node(workflow_id, "a")
-        self.add_node(workflow_id, "b", ["a"])
+    def test_failed_attempt_can_be_routed_and_relaunched_without_losing_history(self) -> None:
+        self.add("work", 1, "add-work")
+        self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
+        self.mutation(
+            "node-update", 3, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-1",
+        )
+        self.mutation(
+            "node-update", 4, "bind-work", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", "child-1",
+        )
+        self.mutation("node-update", 5, "run-work", "--node-id", "work", "--status", "running")
+        self.mutation(
+            "node-update", 6, "fail-work", "--node-id", "work",
+            "--status", "failed", "--attempt-outcome", "tests failed",
+        )
+        route = (
+            "--node-id", "work", "--role", "fixer", "--model", "gpt-5.6-terra",
+            "--effort", "high", "--rationale", "fix the failed attempt",
+        )
+        self.mutation("node-route", 7, "reroute-work", *route)
+        replay = self.mutation("node-route", 7, "reroute-work", *route)
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        node = StateStore().load(self.workflow_id)["nodes"]["work"]
+        self.assertEqual((node["status"], node["launch"]["state"], node["route"]["attempt"]), ("pending", "unclaimed", 2))
+        self.assertEqual((node["attempts"][0]["number"], node["attempts"][0]["outcome"]), (1, "tests failed"))
+        self.assertIsNotNone(node["attempts"][0]["finished_at"])
 
-        plan_file = self.base / "graph plan with spaces.json"
-        plan_file.write_text(json.dumps({
-            "reason": "Validation changed priority",
-            "operations": [
-                {"op": "patch", "node_id": "b", "changes": {"priority": 97}},
-            ],
-        }), encoding="utf-8")
-        code, _, error = self.run_main([
-            "graph-replan", "--workflow-id", workflow_id,
-            "--plan-file", str(plan_file), "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        self.assertEqual(self.state(workflow_id)["nodes"]["b"]["priority"], 97)
+        self.mutation("node-update", 8, "ready-retry", "--node-id", "work", "--status", "ready")
+        self.mutation(
+            "node-update", 9, "claim-retry", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-2",
+        )
+        attempts = StateStore().load(self.workflow_id)["nodes"]["work"]["attempts"]
+        self.assertEqual([attempt["number"] for attempt in attempts], [1, 2])
+        self.assertEqual(attempts[0]["outcome"], "tests failed")
 
-    def test_windows_write_scopes_are_case_insensitive(self) -> None:
-        with mock.patch.object(coordinator_state.os, "name", "nt"):
-            self.assertTrue(coordinator_state._scopes_overlap("Src/Chat.py", "src/chat.py"))
-            self.assertTrue(coordinator_state._scopes_overlap("SRC/**", "src/sub/file.py"))
-            self.assertFalse(coordinator_state._scopes_overlap("src/a.py", "src/b.py"))
+    def test_aborted_workflow_allows_only_preexisting_launch_reconciliation(self) -> None:
+        self.add("absent", 1, "add-absent")
+        self.add("found", 2, "add-found")
+        self.add("running", 3, "add-running")
+        self.mutation("node-update", 4, "ready-running", "--node-id", "running", "--status", "ready")
+        self.mutation(
+            "node-update", 5, "claim-absent", "--node-id", "absent",
+            "--launch-state", "claimed", "--request-id", "request-absent",
+        )
+        self.mutation(
+            "node-update", 6, "uncertain-absent", "--node-id", "absent",
+            "--launch-state", "reconcile_required", "--reconciliation", "provider timeout",
+        )
+        self.mutation(
+            "node-update", 7, "claim-found", "--node-id", "found",
+            "--launch-state", "claimed", "--request-id", "request-found",
+        )
+        self.mutation(
+            "node-update", 8, "uncertain-found", "--node-id", "found",
+            "--launch-state", "reconcile_required", "--reconciliation", "provider timeout",
+        )
+        self.mutation(
+            "node-update", 9, "claim-running", "--node-id", "running",
+            "--launch-state", "claimed", "--request-id", "request-running",
+        )
+        self.mutation(
+            "node-update", 10, "bind-running", "--node-id", "running",
+            "--launch-state", "bound", "--child-id", "child-running",
+        )
+        self.mutation("node-update", 11, "run-running", "--node-id", "running", "--status", "running")
+        self.mutation("abort", 12, "abort-workflow", "--reason", "operator stopped")
+        self.mutation(
+            "node-update", 13, "reject-different-known-child", "--node-id", "running",
+            "--launch-state", "bound", "--child-id", "child-different",
+            "--reconciliation", "provider reports a different child", expected=2,
+        )
+        unchanged = StateStore().load(self.workflow_id)
+        self.assertEqual(unchanged["revision"], 13)
+        self.assertEqual(
+            (unchanged["nodes"]["running"]["launch"]["state"], unchanged["nodes"]["running"]["launch"]["child_id"]),
+            ("reconcile_required", "child-running"),
+        )
+        self.mutation(
+            "node-update", 13, "reject-known-child-absence", "--node-id", "running",
+            "--launch-state", "unclaimed", "--reconciliation", "provider confirms no child", expected=2,
+        )
+        absent = (
+            "--node-id", "absent", "--launch-state", "unclaimed",
+            "--reconciliation", "provider confirms no child",
+        )
+        self.mutation("node-update", 13, "resolve-absent", *absent)
+        self.mutation(
+            "node-update", 14, "resolve-found", "--node-id", "found",
+            "--launch-state", "bound", "--child-id", "child-found",
+            "--reconciliation", "provider confirms existing child",
+        )
+        self.mutation(
+            "node-update", 15, "resolve-known-child", "--node-id", "running",
+            "--launch-state", "bound", "--child-id", "child-running",
+            "--reconciliation", "provider confirms the known child",
+        )
+        replay = self.mutation("node-update", 13, "resolve-absent", *absent)
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        self.mutation("event", 16, "terminal-event", "--kind", "test", "--message", "blocked", expected=2)
 
-    def test_cycle_rejection_is_atomic(self) -> None:
-        workflow_id = self.init()
-        self.add_node(workflow_id, "a")
-        self.add_node(workflow_id, "b", ["a"])
-        self.add_node(workflow_id, "c", ["b"])
-        before = self.state(workflow_id)
-        code, _, _ = self.run_main([
-            "dependency-add", "--workflow-id", workflow_id,
-            "--node-id", "a", "--dependency", "c",
-            "--reason", "attempt a cycle", "--json",
-        ])
-        self.assertEqual(code, 2)
-        after = self.state(workflow_id)
-        self.assertEqual(before["nodes"], after["nodes"])
-        self.assertEqual(before["graph_revision"], after["graph_revision"])
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual((state["status"], state["phase"], state["controller"]["recovery_status"]), ("aborted", "aborted", "reconcile_required"))
+        self.assertEqual(state["nodes"]["absent"]["launch"]["state"], "unclaimed")
+        self.assertEqual(state["nodes"]["absent"]["attempts"][0]["outcome"], "provider confirmed not launched")
+        self.assertEqual(state["nodes"]["found"]["launch"]["state"], "bound")
+        self.assertEqual(state["nodes"]["found"]["launch"]["child_id"], "child-found")
+        running = state["nodes"]["running"]
+        self.assertEqual((running["status"], running["launch"]["state"]), ("cancelled", "bound"))
+        self.assertEqual(running["launch"]["child_id"], "child-running")
+        self.assertIsNone(running["attempts"][0]["finished_at"])
+        self.assertIsNone(running["attempts"][0]["outcome"])
 
-    def test_supersede_rewires_dependents_and_records_revision(self) -> None:
-        workflow_id = self.init()
-        self.add_node(workflow_id, "research")
-        self.add_node(workflow_id, "old_impl", ["research"])
-        self.add_node(workflow_id, "docs", ["old_impl"])
-        self.add_node(workflow_id, "new_impl", ["research"], priority=90)
-        before_revision = self.state(workflow_id)["graph_revision"]
-        code, output, error = self.run_main([
-            "node-supersede", "--workflow-id", workflow_id,
-            "--node-id", "old_impl", "--replacement", "new_impl",
-            "--reason", "repository evidence changed the boundary", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        result = json.loads(output)
-        state = self.state(workflow_id)
-        self.assertGreater(result["graph_revision"], before_revision)
-        self.assertEqual(state["nodes"]["old_impl"]["status"], "skipped")
-        self.assertEqual(state["nodes"]["old_impl"]["superseded_by"], "new_impl")
-        self.assertIn("old_impl", state["nodes"]["new_impl"]["supersedes"])
-        self.assertEqual(state["nodes"]["docs"]["dependencies"], ["new_impl"])
+    def test_post_abort_recovery_can_transfer_and_complete_a_discovered_child(self) -> None:
+        self.add("work", 1, "add-work")
+        self.mutation(
+            "node-update", 2, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-1",
+        )
+        self.mutation(
+            "node-update", 3, "uncertain-work", "--node-id", "work",
+            "--launch-state", "reconcile_required", "--reconciliation", "provider timeout",
+        )
+        self.mutation("abort", 4, "abort-workflow", "--reason", "controller stopped")
 
-    def test_atomic_batch_replan_rolls_back_invalid_plan(self) -> None:
-        workflow_id = self.init()
-        self.add_node(workflow_id, "a")
-        self.add_node(workflow_id, "b", ["a"])
-        before = self.state(workflow_id)
-        plan = {
-            "reason": "invalid coupled edit",
-            "operations": [
-                {"op": "patch", "node_id": "a", "changes": {"priority": 99}},
-                {"op": "remove", "node_id": "a"},
-            ],
-        }
-        code, _, _ = self.run_main([
-            "graph-replan", "--workflow-id", workflow_id,
-            "--plan-json", json.dumps(plan), "--json",
-        ])
-        self.assertEqual(code, 2)
-        after = self.state(workflow_id)
-        self.assertEqual(before["nodes"], after["nodes"])
-        self.assertEqual(before["graph_revision"], after["graph_revision"])
+        second_session = self.base / "private" / "second.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(second_session))
+        takeover = self.mutation("controller-takeover", 5, "takeover-aborted", session=second_session)
+        replayed_takeover = self.mutation("controller-takeover", 5, "takeover-aborted", session=second_session)
+        self.assertEqual((takeover["data"]["revision"], replayed_takeover["data"]["revision"]), (6, 6))
+        self.mutation("resume", 6, "resume-recovery", "--message", "resume provider recovery", session=second_session)
+        replayed_resume = self.mutation(
+            "resume", 6, "resume-recovery", "--message", "resume provider recovery", session=second_session
+        )
+        self.assertEqual(replayed_resume["code"], "mutation_reconciled")
+        self.mutation(
+            "node-update", 7, "bind-work", "--node-id", "work", "--launch-state", "bound",
+            "--child-id", "child-1", "--reconciliation", "provider found existing child", session=second_session,
+        )
+        self.assertEqual(StateStore().load(self.workflow_id)["controller"]["recovery_status"], "reconcile_required")
+        self.mutation(
+            "node-update", 8, "terminal-without-evidence", "--node-id", "work",
+            "--launch-state", "terminal", "--attempt-outcome", "stopped after abort",
+            session=second_session, expected=2,
+        )
+        complete = (
+            "--node-id", "work", "--launch-state", "terminal",
+            "--reconciliation", "provider confirms child stopped", "--attempt-outcome", "stopped after abort",
+        )
+        self.mutation("node-update", 8, "complete-child", *complete, session=second_session)
+        replayed = self.mutation("node-update", 8, "complete-child", *complete, session=second_session)
+        self.assertEqual(replayed["code"], "mutation_reconciled")
 
-    def test_patch_priority_controls_ready_order_and_running_work_is_immutable(self) -> None:
-        workflow_id = self.init()
-        self.add_node(workflow_id, "low", priority=10)
-        self.add_node(workflow_id, "high", priority=90)
-        diagnostics_code, diagnostics_output, diagnostics_error = self.run_main([
-            "graph-validate", "--workflow-id", workflow_id, "--json"
-        ])
-        self.assertEqual(diagnostics_code, 0, diagnostics_error)
-        self.assertEqual(json.loads(diagnostics_output)["ready_nodes"], ["high", "low"])
+        state = StateStore().load(self.workflow_id)
+        attempt = state["nodes"]["work"]["attempts"][0]
+        self.assertEqual((state["status"], state["controller"]["recovery_status"]), ("aborted", "clean"))
+        self.assertEqual((state["nodes"]["work"]["launch"]["state"], attempt["outcome"]), ("terminal", "stopped after abort"))
+        self.assertIsNotNone(attempt["finished_at"])
+        third_session = self.base / "private" / "third.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(third_session))
+        self.mutation("controller-takeover", 9, "takeover-clean-abort", session=third_session, expected=2)
 
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "high",
-            "--status", "running", "--increment-attempt", "--agent-id", "agent-123", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, _ = self.run_main([
-            "node-patch", "--workflow-id", workflow_id, "--node-id", "high",
-            "--priority", "1", "--reason", "stale plan", "--json",
-        ])
-        self.assertEqual(code, 2)
-        self.assertEqual(self.state(workflow_id)["nodes"]["high"]["priority"], 90)
-
-    def test_node_scoped_blocker_leaves_independent_branch_ready(self) -> None:
-        workflow_id = self.init()
-        self.add_node(workflow_id, "blocked_branch", priority=90)
-        self.add_node(workflow_id, "independent", priority=80)
-        code, output, error = self.run_main([
-            "block", "--workflow-id", workflow_id,
-            "--node-id", "blocked_branch", "--confidence", "medium",
-            "--reason", "Two incompatible public contracts",
-            "--needed", "Choose the stable contract",
-            "--recommendation", "Keep the current public field",
-            "--example", "Option A preserves clients",
-            "--impact", "Option B breaks clients",
-            "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        blocker_id = json.loads(output)["blocker_id"]
-        status_code, status_output, status_error = self.run_main([
-            "graph-validate", "--workflow-id", workflow_id, "--json"
-        ])
-        self.assertEqual(status_code, 0, status_error)
-        self.assertEqual(json.loads(status_output)["ready_nodes"], ["independent"])
-        code, _, error = self.run_main([
-            "unblock", "--workflow-id", workflow_id,
-            "--blocker-id", blocker_id, "--resolution", "Selected stable contract", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-
-    def test_finish_requires_valid_terminal_graph_and_new_commit(self) -> None:
-        workflow_id = self.init("Finish task")
-        self.add_node(workflow_id, "done")
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "done",
-            "--status", "running", "--increment-attempt", "--agent-name", "done_agent", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "done",
-            "--status", "done", "--summary", "implemented and validated",
-            "--validation-evidence", "unit test output: 12 passed", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, error = self.run_main([
-            "requirement-set", "--workflow-id", workflow_id,
-            "--requirement-id", "req-1", "--text", "Implement the requested feature",
-            "--source", "user", "--status", "satisfied", "--confidence", "high",
-            "--evidence", "done node produced and validated the feature", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        snapshot = {
-            "available": True,
-            "head": "new-head",
-            "branch": "main",
-            "dirty_entries": [],
-            "captured_at": coordinator_state.iso_now(),
-        }
-        with mock.patch.object(coordinator_state, "git_snapshot", return_value=snapshot):
-            code, output, error = self.run_main([
-                "finish", "--workflow-id", workflow_id,
-                "--commit", "new-head", "--summary", "complete",
-                "--validation", "unit tests passed", "--json",
-            ])
-        self.assertEqual(code, 0, error)
-        self.assertEqual(json.loads(output)["status"], "completed")
-
-
-    def test_start_is_blocked_until_dependencies_are_terminal(self) -> None:
-        workflow_id = self.init("Dependency gate")
-        self.add_node(workflow_id, "research")
-        self.add_node(workflow_id, "implementation", ["research"])
-        code, _, _ = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "implementation",
-            "--status", "running", "--increment-attempt", "--agent-id", "agent-impl", "--json",
-        ])
-        self.assertEqual(code, 2)
-        self.assertEqual(self.state(workflow_id)["nodes"]["implementation"]["status"], "pending")
-
-    def test_independent_overlapping_scopes_are_rejected_but_serialized_scopes_are_valid(self) -> None:
-        workflow_id = self.init("Scope gate")
-        self.add_node(workflow_id, "broad")
-        # Replace the first node scope with a directory boundary.
-        code, _, error = self.run_main([
-            "node-patch", "--workflow-id", workflow_id, "--node-id", "broad",
-            "--write-scope", "src", "--reason", "owns the source tree", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, _ = self.run_main([
-            "node-add", "--workflow-id", workflow_id,
-            "--node-id", "conflict", "--stage", "implementation", "--title", "conflict",
-            "--agent-type", "implementer", "--model", "gpt-5.6-luna",
-            "--reasoning-effort", "medium", "--routing-rationale", "bounded",
-            "--write-scope", "src/conflict.py", "--acceptance-criterion", "passes",
-            "--output-contract", "produce conflict implementation",
-            "--validation-command", "python -m unittest",
-            "--json",
-        ])
-        self.assertEqual(code, 2)
-        self.assertNotIn("conflict", self.state(workflow_id)["nodes"])
-
-        serialized = self.add_node(workflow_id, "serialized", ["broad"])
-        code, _, error = self.run_main([
-            "node-patch", "--workflow-id", workflow_id, "--node-id", "serialized",
-            "--write-scope", "src/serialized.py", "--reason", "serialized follow-up", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, output, error = self.run_main([
-            "graph-validate", "--workflow-id", workflow_id, "--json"
-        ])
-        self.assertEqual(code, 0, error)
-        self.assertEqual(json.loads(output)["write_scope_collisions"], [])
-
-    def test_stale_route_and_malformed_batch_are_rejected_atomically(self) -> None:
-        workflow_id = self.init("Fresh route")
-        self.add_node(workflow_id, "work")
-        root = coordinator_state.temp_root()
-        state = self.state(workflow_id)
-        old = coordinator_state.utcnow() - dt.timedelta(hours=1)
-        state["nodes"]["work"]["route_history"][-1]["at"] = old.isoformat().replace("+00:00", "Z")
-        coordinator_state.write_state(root, state)
-        code, _, _ = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "running", "--increment-attempt", "--agent-id", "agent-work", "--json",
-        ])
-        self.assertEqual(code, 2)
-        self.assertEqual(self.state(workflow_id)["nodes"]["work"]["status"], "pending")
-
-        before = self.state(workflow_id)
-        plan = {
-            "reason": "malformed scope",
-            "operations": [
-                {"op": "patch", "node_id": "work", "changes": {"write_scope": "src"}}
-            ],
-        }
-        code, _, _ = self.run_main([
-            "graph-replan", "--workflow-id", workflow_id,
-            "--plan-json", json.dumps(plan), "--json",
-        ])
-        self.assertEqual(code, 2)
-        after = self.state(workflow_id)
-        self.assertEqual(before["nodes"], after["nodes"])
-        self.assertEqual(before["graph_revision"], after["graph_revision"])
-
-    def test_cleanup_removes_state_older_than_five_days(self) -> None:
-        workflow_id = self.init("Old task")
-        path = coordinator_state.state_path(coordinator_state.temp_root(), workflow_id)
+    def test_unknown_stored_fields_are_reported_without_repair(self) -> None:
+        store = StateStore()
+        path = store._state_path(self.workflow_id)
         raw = json.loads(path.read_text(encoding="utf-8"))
-        old = coordinator_state.utcnow() - dt.timedelta(days=6)
-        raw["updated_at"] = old.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        raw["unexpected"] = True
+        before = json.dumps(raw, sort_keys=True)
         path.write_text(json.dumps(raw), encoding="utf-8")
-        os.utime(path.parent, (old.timestamp(), old.timestamp()))
-        removed = coordinator_state.cleanup_stale(coordinator_state.temp_root())
-        self.assertEqual(removed, [workflow_id])
+        with self.assertRaises(StateError):
+            store.load(self.workflow_id)
+        self.assertEqual(json.dumps(json.loads(path.read_text(encoding="utf-8")), sort_keys=True), before)
+        self.cli(
+            "session-open", "--repo", str(self.repo), "--session-file", str(self.repo / "bearer.json"), expected=20
+        )
+        self.assertFalse((self.repo / "bearer.json").exists())
 
-    def test_cleanup_removes_nested_stale_artifacts_from_recent_workflow(self) -> None:
-        workflow_id = self.init("Recent state with stale nested artifact")
-        workflow_root = coordinator_state.state_path(
-            coordinator_state.temp_root(), workflow_id
-        ).parent
-        nested = workflow_root / "downloads" / "old" / "artifact.tmp"
-        nested.parent.mkdir(parents=True)
-        nested.write_text("obsolete", encoding="utf-8")
-        old = coordinator_state.utcnow() - dt.timedelta(days=6)
-        os.utime(nested, (old.timestamp(), old.timestamp()))
-        os.utime(nested.parent, (old.timestamp(), old.timestamp()))
-        removed = coordinator_state.cleanup_stale(coordinator_state.temp_root())
-        self.assertFalse(nested.exists())
-        self.assertTrue(any("artifact.tmp" in item for item in removed))
+    def test_state_boundary_rejects_duplicate_keys_bool_integers_oversize_and_filename_mismatch(self) -> None:
+        store = StateStore()
+        path = store._state_path(self.workflow_id)
+        original = path.read_bytes()
+        duplicate = original.decode("utf-8").replace(
+            '"task": "Coordinate durable work"',
+            '"task": "first", "task": "second"',
+        )
+        path.write_text(duplicate, encoding="utf-8")
+        with self.assertRaisesRegex(StateError, "duplicate key"):
+            store.load(self.workflow_id)
+        path.write_bytes(original)
 
-    def test_done_requires_validation_evidence_and_finish_requires_resolved_ledger(self) -> None:
-        workflow_id = self.init("Evidence gates")
-        self.add_node(workflow_id, "work")
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "running", "--increment-attempt", "--agent-id", "agent-work", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, _ = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "done", "--summary", "implemented", "--json",
-        ])
-        self.assertEqual(code, 2)
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "done", "--summary", "implemented",
-            "--validation-evidence", "focused test passed", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, _ = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--artifact", "late mutation", "--json",
-        ])
-        self.assertEqual(code, 2)
+        surrogate = original.decode("utf-8").replace(
+            '"task": "Coordinate durable work"',
+            '"task": "\\ud800"',
+        )
+        path.write_text(surrogate, encoding="utf-8")
+        with self.assertRaisesRegex(StateError, "Unicode scalar"):
+            store.load(self.workflow_id)
+        path.write_bytes(original)
 
-        snapshot = {
-            "available": True,
-            "head": "new-head",
-            "branch": "main",
-            "dirty_entries": [],
-            "captured_at": coordinator_state.iso_now(),
-        }
-        with mock.patch.object(coordinator_state, "git_snapshot", return_value=snapshot):
-            code, _, _ = self.run_main([
-                "finish", "--workflow-id", workflow_id, "--commit", "new-head",
-                "--summary", "complete", "--validation", "focused test passed", "--json",
-            ])
-        self.assertEqual(code, 2)
+        state = json.loads(original)
+        state["conventions"].update({"max_parallel": True, "reserve": False})
+        with self.assertRaisesRegex(StateError, "max_parallel"):
+            validate_state(state)
 
-        code, _, error = self.run_main([
-            "requirement-set", "--workflow-id", workflow_id,
-            "--requirement-id", "req", "--text", "complete work", "--source", "user",
-            "--status", "active", "--confidence", "high", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        with mock.patch.object(coordinator_state, "git_snapshot", return_value=snapshot):
-            code, _, _ = self.run_main([
-                "finish", "--workflow-id", workflow_id, "--commit", "new-head",
-                "--summary", "complete", "--validation", "focused test passed", "--json",
-            ])
-        self.assertEqual(code, 2)
+        wrong = store.workflows / "wrong-name.json"
+        wrong.write_bytes(original)
+        os.chmod(wrong, 0o600)
+        mismatch = next(error for candidate, _state, error in store.iter_records() if candidate == wrong)
+        self.assertEqual(mismatch.code, "corrupt_state")
 
-        code, _, error = self.run_main([
-            "requirement-set", "--workflow-id", workflow_id,
-            "--requirement-id", "req", "--text", "complete work", "--source", "user",
-            "--status", "satisfied", "--confidence", "high",
-            "--evidence", "work node validated", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        with mock.patch.object(coordinator_state, "git_snapshot", return_value=snapshot):
-            code, _, error = self.run_main([
-                "finish", "--workflow-id", workflow_id, "--commit", "new-head",
-                "--summary", "complete", "--validation", "focused test passed", "--json",
-            ])
-        self.assertEqual(code, 0, error)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(StateError, "exceeds"):
+            store._atomic_json(path, {"payload": "x" * MAX_STATE_BYTES})
+        self.assertEqual(path.read_bytes(), before)
 
-    def test_resolved_requirement_requires_evidence(self) -> None:
-        workflow_id = self.init("Requirement evidence")
-        code, _, _ = self.run_main([
-            "requirement-set", "--workflow-id", workflow_id,
-            "--requirement-id", "req", "--text", "must hold", "--source", "user",
-            "--status", "satisfied", "--confidence", "high", "--json",
-        ])
-        self.assertEqual(code, 2)
-        self.assertEqual(self.state(workflow_id)["requirements"], [])
+    def test_state_boundary_rejects_mismatched_attempt_completion_fields(self) -> None:
+        self.add("work", 1, "add-work")
+        self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
+        self.mutation(
+            "node-update", 3, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-1",
+        )
+        self.mutation(
+            "node-update", 4, "bind-work", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", "child-1",
+        )
+        self.mutation("node-update", 5, "run-work", "--node-id", "work", "--status", "running")
 
-    def test_patch_can_change_output_and_validation_contracts(self) -> None:
-        workflow_id = self.init("Patch contracts")
-        self.add_node(workflow_id, "work")
-        code, output, error = self.run_main([
-            "node-patch", "--workflow-id", workflow_id, "--node-id", "work",
-            "--output-contract", "produce a migration report",
-            "--validation-command", "python scripts/check.py",
-            "--reason", "new repository evidence changed the deliverable", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        node = json.loads(output)
-        self.assertEqual(node["output_contract"], ["produce a migration report"])
-        self.assertEqual(node["validation_commands"], ["python scripts/check.py"])
+        active = StateStore().load(self.workflow_id)
+        active["nodes"]["work"]["attempts"][0]["outcome"] = "premature outcome"
+        with self.assertRaisesRegex(StateError, "completion fields"):
+            validate_state(active)
 
-    def test_same_scope_replacement_can_be_added_then_supersede_atomically(self) -> None:
-        workflow_id = self.init("Same scope replacement")
-        self.add_node(workflow_id, "old")
-        self.add_node(workflow_id, "consumer", ["old"])
-        # Serialize the replacement behind the old node just long enough to
-        # avoid a concurrent scope collision. Supersession removes that edge.
-        self.add_node(workflow_id, "replacement", ["old"])
-        code, _, error = self.run_main([
-            "node-supersede", "--workflow-id", workflow_id,
-            "--node-id", "old", "--replacement", "replacement",
-            "--reason", "replace the future implementation plan", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        state = self.state(workflow_id)
-        self.assertEqual(state["nodes"]["replacement"]["dependencies"], [])
-        self.assertEqual(state["nodes"]["consumer"]["dependencies"], ["replacement"])
-        self.assertEqual(state["nodes"]["old"]["status"], "skipped")
+        self.mutation(
+            "node-update", 6, "fail-work", "--node-id", "work",
+            "--status", "failed", "--attempt-outcome", "tests failed",
+        )
+        terminal = StateStore().load(self.workflow_id)
+        terminal["nodes"]["work"]["attempts"][0]["outcome"] = None
+        with self.assertRaisesRegex(StateError, "completion fields"):
+            validate_state(terminal)
 
-    def test_batch_supersession_defers_intermediate_validation_until_final_graph(self) -> None:
-        workflow_id = self.init("Atomic supersession reversal")
-        self.add_node(workflow_id, "old")
-        self.add_node(workflow_id, "consumer", ["old"])
-        self.add_node(workflow_id, "replacement", ["consumer"])
-        plan = {
-            "reason": "Reverse the stale chain atomically",
-            "operations": [
-                {"op": "supersede", "node_id": "old", "replacement": "replacement"},
-                {"op": "dependency_remove", "node_id": "replacement", "dependency": "consumer"},
-            ],
-        }
-        code, _, error = self.run_main([
-            "graph-replan", "--workflow-id", workflow_id,
-            "--plan-json", json.dumps(plan), "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        state = self.state(workflow_id)
-        self.assertEqual(state["nodes"]["old"]["status"], "skipped")
-        self.assertEqual(state["nodes"]["consumer"]["dependencies"], ["replacement"])
-        self.assertEqual(state["nodes"]["replacement"]["dependencies"], [])
+    def test_launch_id_uniqueness_and_recovery_status_wait_for_every_uncertain_launch(self) -> None:
+        self.add("a", 1, "add-a")
+        self.add("b", 2, "add-b")
+        self.add("c", 3, "add-c")
+        self.mutation("node-update", 4, "claim-a", "--node-id", "a", "--launch-state", "claimed", "--request-id", "request-shared")
+        self.mutation(
+            "node-update", 5, "claim-b-duplicate", "--node-id", "b", "--launch-state", "claimed", "--request-id", "request-shared", expected=2
+        )
+        self.mutation("node-update", 5, "claim-b", "--node-id", "b", "--launch-state", "claimed", "--request-id", "request-b")
+        self.mutation("node-update", 6, "uncertain-a", "--node-id", "a", "--launch-state", "reconcile_required")
+        self.mutation("node-update", 7, "uncertain-b", "--node-id", "b", "--launch-state", "reconcile_required")
+        self.mutation(
+            "node-update", 8, "clear-a", "--node-id", "a", "--launch-state", "unclaimed", "--reconciliation", "provider confirms no child"
+        )
+        self.assertEqual(StateStore().load(self.workflow_id)["controller"]["recovery_status"], "reconcile_required")
+        self.mutation(
+            "node-update", 9, "bind-b", "--node-id", "b", "--launch-state", "bound", "--child-id", "child-shared", "--reconciliation", "provider confirms child"
+        )
+        self.assertEqual(StateStore().load(self.workflow_id)["controller"]["recovery_status"], "clean")
+        self.mutation("node-update", 10, "claim-c", "--node-id", "c", "--launch-state", "claimed", "--request-id", "request-c")
+        self.mutation(
+            "node-update", 11, "bind-c-duplicate", "--node-id", "c", "--launch-state", "bound", "--child-id", "child-shared", expected=2
+        )
+        self.assertEqual(StateStore().load(self.workflow_id)["revision"], 11)
 
-    def test_finish_detects_changes_hidden_behind_same_porcelain_status(self) -> None:
-        subprocess.run(["git", "-C", str(self.repo), "init"], check=True, stdout=subprocess.PIPE)
-        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "State Test"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "state@example.test"], check=True)
-        tracked = self.repo / "tracked.txt"
-        tracked.write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "add", "tracked.txt"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "base"], check=True, stdout=subprocess.PIPE)
-        tracked.write_text("pre-existing dirty\n", encoding="utf-8")
+    def test_finish_requires_commit_checkpoint_and_terminal_workflow_cannot_reopen(self) -> None:
+        self.add("work", 1, "add-work")
+        self.mutation(
+            "finish", 2, "finish-short", "--summary", "done", "--validation", "passed", "--commit", "abc", expected=2
+        )
+        commit = "a" * 40
+        self.mutation("node-update", 2, "skip-work", "--node-id", "work", "--status", "skipped")
+        self.mutation(
+            "node-update", 3, "claim-skipped", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-1", expected=2,
+        )
+        malformed = StateStore().load(self.workflow_id)
+        node = malformed["nodes"]["work"]
+        node["launch"].update({
+            "state": "claimed", "request_id": "request-1", "claimed_at": malformed["updated_at"],
+        })
+        node["attempts"].append({
+            "number": 1, "started_at": malformed["updated_at"], "finished_at": None, "outcome": None,
+        })
+        with self.assertRaisesRegex(StateError, "terminal status cannot retain an active launch"):
+            validate_state(malformed)
+        self.mutation(
+            "finish", 3, "finish-valid", "--summary", "done", "--validation", "passed", "--commit", commit
+        )
+        self.mutation("resume", 4, "reopen", "--message", "reopen", expected=2)
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual((state["status"], state["phase"], state["git"]["checkpoint"]), ("completed", "completed", commit))
+        state["status"] = "running"
+        with self.assertRaisesRegex(StateError, "completed workflow phase"):
+            validate_state(state)
 
-        workflow_id = self.init("Preserve initial dirty state")
-        initial = self.state(workflow_id)["git"]["initial"]
-        self.assertTrue(initial["available"])
-        self.assertTrue(initial["dirty_fingerprint"])
-        self.add_node(workflow_id, "work")
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "running", "--increment-attempt", "--agent-id", "agent", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, error = self.run_main([
-            "node-update", "--workflow-id", workflow_id, "--node-id", "work",
-            "--status", "done", "--summary", "task committed",
-            "--validation-evidence", "focused validation passed", "--json",
-        ])
-        self.assertEqual(code, 0, error)
-        code, _, error = self.run_main([
-            "requirement-set", "--workflow-id", workflow_id,
-            "--requirement-id", "req", "--text", "preserve dirty state", "--source", "user",
-            "--status", "satisfied", "--confidence", "high",
-            "--evidence", "task commit created", "--json",
-        ])
-        self.assertEqual(code, 0, error)
+    def test_state_lock_removes_only_proven_stale_evidence(self) -> None:
+        store = StateStore()
+        store._ensure_private_directory(store.locks)
+        lock = store.locks / "probe.lock"
+        stale = json.dumps({"pid": 999999, "nonce": "a" * 32, "created_at": state_owner.now_iso()}).encode()
+        lock.write_bytes(stale)
+        os.chmod(lock, 0o600)
+        with mock.patch.object(state_owner, "_process_is_proven_dead", return_value=True):
+            with store._lock("probe"):
+                self.assertNotEqual(lock.read_bytes(), stale)
+        self.assertFalse(lock.exists())
 
-        task_file = self.repo / "task.txt"
-        task_file.write_text("task\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "add", "task.txt"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "task"], check=True, stdout=subprocess.PIPE)
-        head = subprocess.run(
-            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            check=True, stdout=subprocess.PIPE, text=True,
-        ).stdout.strip()
+        live = json.dumps({"pid": os.getpid(), "nonce": "b" * 32, "created_at": state_owner.now_iso()}).encode()
+        lock.write_bytes(live)
+        os.chmod(lock, 0o600)
+        with self.assertRaisesRegex(StateError, "locked"):
+            with store._lock("probe"):
+                pass
+        self.assertEqual(lock.read_bytes(), live)
 
-        tracked.write_text("different dirty content\n", encoding="utf-8")
-        changed = coordinator_state.git_snapshot(str(self.repo))
-        self.assertEqual(changed["dirty_entries"], initial["dirty_entries"])
-        self.assertNotEqual(changed["dirty_fingerprint"], initial["dirty_fingerprint"])
-        code, _, _ = self.run_main([
-            "finish", "--workflow-id", workflow_id, "--commit", head,
-            "--summary", "complete", "--validation", "focused validation passed", "--json",
-        ])
-        self.assertEqual(code, 2)
+        lock.write_bytes(b"{")
+        before = lock.read_bytes()
+        with mock.patch.object(state_owner, "_process_is_proven_dead", return_value=True):
+            with self.assertRaisesRegex(StateError, "locked"):
+                with store._lock("probe"):
+                    pass
+        self.assertEqual(lock.read_bytes(), before)
 
-        tracked.write_text("pre-existing dirty\n", encoding="utf-8")
-        code, _, error = self.run_main([
-            "finish", "--workflow-id", workflow_id, "--commit", head,
-            "--summary", "complete", "--validation", "focused validation passed", "--json",
-        ])
-        self.assertEqual(code, 0, error)
+        with (
+            mock.patch.object(state_owner.os, "name", "nt"),
+            mock.patch.object(state_owner, "_windows_process_is_proven_dead", return_value=True) as query,
+            mock.patch.object(state_owner.os, "kill", side_effect=AssertionError("Windows must not call os.kill")),
+        ):
+            self.assertTrue(state_owner._process_is_proven_dead(123))
+        query.assert_called_once_with(123)
 
 
 if __name__ == "__main__":
