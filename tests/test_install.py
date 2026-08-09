@@ -76,13 +76,15 @@ def recovery_journal(owned: standalone.Paths, phase: str, transaction: str) -> d
 class GlobalInstallTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = pathlib.Path(self.temporary.name)
+        self.base = pathlib.Path(self.temporary.name).resolve()
         self.home = self.base / "home"
         self.home.mkdir()
         self.source, self.commit = committed_source(self.base / "source")
         self.release = self.base / "release"
         build_release.build(self.source, self.release, self.commit)
-        self.environment = mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
+        self.environment = mock.patch.dict(
+            os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}, clear=False
+        )
         self.environment.start()
 
     def tearDown(self) -> None:
@@ -208,7 +210,9 @@ class GlobalInstallTests(unittest.TestCase):
         home_link = self.base / "home-link"
         home_link.symlink_to(self.home, target_is_directory=True)
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(home_link)}, clear=False), contextlib.redirect_stdout(output):
+        with mock.patch.dict(
+            os.environ, {"HOME": str(home_link), "USERPROFILE": str(home_link)}, clear=False
+        ), contextlib.redirect_stdout(output):
             code = standalone.main(["status", "--json"])
         result = json.loads(output.getvalue())
         self.assertEqual((code, result["code"], result["data"]["mismatches"]), (1, "install_drift", ["paths:unsafe_path"]))
@@ -283,7 +287,9 @@ class GlobalInstallTests(unittest.TestCase):
         home_link.symlink_to(real_home, target_is_directory=True)
 
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(home_link)}, clear=False), contextlib.redirect_stdout(output):
+        with mock.patch.dict(
+            os.environ, {"HOME": str(home_link), "USERPROFILE": str(home_link)}, clear=False
+        ), contextlib.redirect_stdout(output):
             code = standalone.main(["cleanup", "--json"])
         result = json.loads(output.getvalue())
         self.assertEqual((code, result["code"]), (20, "unsafe_path"))

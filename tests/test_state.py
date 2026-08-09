@@ -16,19 +16,21 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from coordinator.cli import state as state_cli  # noqa: E402
 from coordinator.state import store as state_owner  # noqa: E402
-from coordinator.state.store import MAX_STATE_BYTES, StateError, StateStore, validate_state  # noqa: E402
+from coordinator.state.store import MAX_STATE_BYTES, StateError, StateStore, ready_nodes, validate_state  # noqa: E402
 
 
 class DurableStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = pathlib.Path(self.temporary.name)
+        self.base = pathlib.Path(self.temporary.name).resolve()
         self.home = self.base / "home"
         self.home.mkdir()
         self.repo = self.base / "repo"
         self.repo.mkdir()
         self.session = self.base / "private" / "session.json"
-        self.environment = mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
+        self.environment = mock.patch.dict(
+            os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}, clear=False
+        )
         self.environment.start()
         self.cli("session-open", "--repo", str(self.repo), "--session-file", str(self.session))
         created = self.cli(
@@ -108,6 +110,29 @@ class DurableStateTests(unittest.TestCase):
         state = StateStore().load(self.workflow_id)
         self.assertEqual(state["revision"], 3)
         self.assertEqual(set(state["nodes"]), {"a", "b"})
+
+    def test_launch_claim_requires_dependency_and_workflow_readiness(self) -> None:
+        self.add("dependency", 1, "add-dependency")
+        self.add("work", 2, "add-work", "--dependency", "dependency")
+        rejected = self.mutation(
+            "node-update", 3, "claim-dependent", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-work", expected=2,
+        )
+        self.assertEqual(rejected["code"], "invalid_state")
+        self.assertEqual(self.cli("graph-validate", "--workflow-id", self.workflow_id)["data"]["ready_nodes"], ["dependency"])
+        self.mutation("block", 3, "block-workflow", "--reason", "pause", "--needed", "approval")
+        self.assertEqual(self.cli("graph-validate", "--workflow-id", self.workflow_id)["data"]["ready_nodes"], [])
+        self.mutation(
+            "node-update", 4, "claim-blocked", "--node-id", "dependency",
+            "--launch-state", "claimed", "--request-id", "request-dependency", expected=2,
+        )
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual((state["revision"], state["nodes"]["dependency"]["launch"]["state"]), (4, "unclaimed"))
+        state["status"] = "planning"
+        self.assertEqual(ready_nodes(state), [])
+        state["blockers"][0].update({"status": "resolved", "resolution": "approved"})
+        state["status"] = "blocked"
+        self.assertEqual(ready_nodes(state), [])
 
     def test_takeover_fences_old_controller_and_launch_reconciliation_is_explicit(self) -> None:
         self.add("work", 1, "add-work")
@@ -304,6 +329,26 @@ class DurableStateTests(unittest.TestCase):
             "session-open", "--repo", str(self.repo), "--session-file", str(self.repo / "bearer.json"), expected=20
         )
         self.assertFalse((self.repo / "bearer.json").exists())
+
+    def test_intermediate_alias_cannot_redirect_control_or_bearer_writes(self) -> None:
+        outside_home = self.base / "outside" / "home"
+        (outside_home / "private").mkdir(parents=True)
+        alias = self.base / "intermediate-alias"
+        alias.symlink_to(outside_home.parent, target_is_directory=True)
+        repository = state_owner.canonical_repository(self.repo)
+        control_store = StateStore(alias / "home" / ".agent-coordinator")
+        safe_bearer = self.base / "safe-bearer" / "session.json"
+        with self.assertRaisesRegex(StateError, "unsafe directory"):
+            control_store.open_session(repository, safe_bearer)
+        self.assertFalse((outside_home / ".agent-coordinator").exists())
+        self.assertFalse(safe_bearer.exists())
+
+        bearer_store = StateStore(self.base / "safe-control")
+        outside_bearer = alias / "home" / "private" / "session.json"
+        with self.assertRaisesRegex(StateError, "unsafe directory"):
+            bearer_store.open_session(repository, outside_bearer)
+        self.assertFalse((outside_home / "private" / "session.json").exists())
+        self.assertFalse((self.base / "safe-control").exists())
 
     def test_state_boundary_rejects_duplicate_keys_bool_integers_oversize_and_filename_mismatch(self) -> None:
         store = StateStore()

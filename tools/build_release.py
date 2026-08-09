@@ -73,7 +73,7 @@ def _commit(root: pathlib.Path, supplied: str | None) -> str:
     if pathlib.Path(_git(root, "rev-parse", "--show-toplevel")).resolve() != root:
         raise RuntimeError("release root must be the Git worktree root")
     head = _git(root, "rev-parse", "--verify", "HEAD^{commit}").lower()
-    value = supplied.lower() if supplied else head
+    value = supplied if supplied else head
     if not COMMIT_RE.fullmatch(value):
         raise ValueError("source commit must be a full lowercase Git object ID")
     resolved = _git(root, "rev-parse", "--verify", value + "^{commit}").lower()

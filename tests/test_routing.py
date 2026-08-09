@@ -35,6 +35,12 @@ class RoutingTests(unittest.TestCase):
         result = choose(task(stage="review"), {"allowed_models": ["gpt-5.6-terra"], "allowed_efforts": ["high"], "budget": "quality"})
         self.assertEqual(result["route"], {"role": "reviewer", "model": "gpt-5.6-terra", "effort": "high"})
         self.assertEqual(len(result["task_digest"]), 64)
+        fallback = choose(
+            task(stage="architecture", complexity=5, ambiguity=5, criticality=5, coupling=5, novelty=5, determinism=1),
+            {"allowed_models": ["gpt-5.6-luna"], "allowed_efforts": ["none"], "budget": "value"},
+        )
+        self.assertFalse(fallback["alternatives"][0]["viable"])
+        self.assertIn("fallback because no allowed route met required capacity", fallback["rationale"])
 
     def test_unknown_and_out_of_range_input_is_rejected(self) -> None:
         with self.assertRaises(RoutingError):

@@ -145,6 +145,11 @@ def choose(task_value: Any, profile_value: Any = None) -> dict[str, Any]:
             )
     alternatives.sort(key=lambda item: (item["viable"], item["score"]), reverse=True)
     selected = next((item for item in alternatives if item["viable"]), alternatives[0])
+    selection = (
+        "highest ranked allowed viable route"
+        if selected["viable"]
+        else "highest ranked allowed fallback because no allowed route met required capacity"
+    )
     canonical = json.dumps(task, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     role = STAGES[task["stage"]]
     if role not in ROLES:
@@ -153,8 +158,8 @@ def choose(task_value: Any, profile_value: Any = None) -> dict[str, Any]:
         "task_digest": hashlib.sha256(canonical).hexdigest(),
         "route": {"role": role, "model": selected["model"], "effort": selected["effort"]},
         "rationale": (
-            f"{task['stage']} requires capacity {required:.2f}; selected the highest ranked "
-            f"allowed viable route under the {profile['budget']} profile"
+            f"{task['stage']} requires capacity {required:.2f}; selected the {selection} "
+            f"under the {profile['budget']} profile"
         ),
         "inputs": task,
         "profile": profile,

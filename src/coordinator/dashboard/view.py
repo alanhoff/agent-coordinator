@@ -323,12 +323,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: Any) -> None:
         return
 
-    def _headers(self, status: int, content_type: str) -> None:
+    def _headers(self, status: int, content_type: str, *, nonce: str | None = None) -> None:
+        inline_source = f"'nonce-{nonce}'" if nonce else "'none'"
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("Pragma", "no-cache")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'nonce-dashboard'; style-src 'nonce-dashboard'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            f"default-src 'none'; script-src {inline_source}; style-src {inline_source}; connect-src 'self'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -359,9 +364,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if set(query) != {"capability"} or len(supplied) != 1 or not secrets.compare_digest(supplied[0], self.server.capability):
                 self._reject(HTTPStatus.UNAUTHORIZED, "unauthorized")
                 return
-            nonce = "dashboard"
+            nonce = secrets.token_urlsafe(32)
             body = INTERACTIVE_HTML.format(nonce=nonce, interval_ms=self.server.interval_ms).encode()
-            self._headers(HTTPStatus.OK, "text/html; charset=utf-8")
+            self._headers(HTTPStatus.OK, "text/html; charset=utf-8", nonce=nonce)
             self.wfile.write(body)
             return
         if parsed.path != "/api/snapshot" or not secrets.compare_digest(self.headers.get("X-Coordinator-Capability", ""), self.server.capability):

@@ -24,12 +24,14 @@ from coordinator.state.store import StateStore, canonical_repository, new_state,
 class DashboardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = pathlib.Path(self.temporary.name)
+        self.base = pathlib.Path(self.temporary.name).resolve()
         self.home = self.base / "home"
         self.home.mkdir()
         self.repo = self.base / "repo"
         self.repo.mkdir()
-        self.environment = mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
+        self.environment = mock.patch.dict(
+            os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}, clear=False
+        )
         self.environment.start()
         state = new_state(canonical_repository(self.repo), '<script src="https://evil.invalid/x.js">attack</script>', "session-dashboard")
         state["nodes"]["work"] = {
@@ -157,13 +159,30 @@ class DashboardTests(unittest.TestCase):
         try:
             expected_host = f"127.0.0.1:{server.server_port}"
             connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-            connection.request("GET", f"/?capability={server.capability}", headers={"Host": expected_host})
-            response = connection.getresponse()
-            body = response.read()
-            self.assertEqual(response.status, 200)
+
+            def page() -> tuple[str, bytes]:
+                connection.request("GET", f"/?capability={server.capability}", headers={"Host": expected_host})
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                csp = response.getheader("Content-Security-Policy")
+                self.assertIsNotNone(csp)
+                assert csp is not None
+                prefix = "script-src 'nonce-"
+                self.assertIn(prefix, csp)
+                nonce = csp.split(prefix, 1)[1].split("'", 1)[0]
+                self.assertRegex(nonce, r"^[A-Za-z0-9_-]{43}$")
+                self.assertIn(f"style-src 'nonce-{nonce}'", csp)
+                self.assertIn(f'<style nonce="{nonce}">'.encode(), body)
+                self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
+                return nonce, body
+
+            nonce, body = page()
             self.assertNotIn(server.capability.encode(), body)
             self.assertIn(b"Git, checkpoint, controller, resume, and recovery", body)
             self.assertIn(b"},250);", body)
+            second_nonce, _ = page()
+            self.assertNotEqual(second_nonce, nonce)
             connection.request("GET", "/api/snapshot", headers={"Host": expected_host, "X-Coordinator-Capability": server.capability})
             response = connection.getresponse()
             self.assertEqual(response.status, 200)

@@ -324,6 +324,10 @@ def graph_diagnostics(nodes: Mapping[str, Mapping[str, Any]], *, case_sensitive:
 
 def ready_nodes(state: Mapping[str, Any]) -> list[str]:
     nodes = state["nodes"]
+    if state["status"] == "blocked" or any(
+        item["status"] == "active" and item["node_id"] is None for item in state["blockers"]
+    ):
+        return []
     blocked = {item["node_id"] for item in state["blockers"] if item["status"] == "active" and item["node_id"]}
     ready = []
     for node_id, node in nodes.items():
@@ -1384,8 +1388,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 if args.launch_state not in allowed_launch[old_launch]:
                     raise StateError(f"invalid launch transition {old_launch} -> {args.launch_state}")
                 if args.launch_state == "claimed":
-                    if node["status"] not in ("pending", "ready"):
-                        raise StateError("launch claim requires pending or ready node status")
+                    if args.node_id not in ready_nodes(state):
+                        raise StateError("launch claim requires ready, dependency-safe, unblocked future work")
                     if not args.request_id:
                         raise StateError("launch claim requires --request-id")
                     if node["attempts"] and node["attempts"][-1]["finished_at"] is None:

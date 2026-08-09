@@ -150,6 +150,8 @@ class PackageTests(unittest.TestCase):
             source, commit = committed_source(base / "source")
             with self.assertRaises(RuntimeError):
                 build_release.build(source, base / "fake", "f" * 40)
+            with self.assertRaisesRegex(ValueError, "lowercase"):
+                build_release.build(source, base / "uppercase", commit.upper())
             (source / "skill" / "README.md").write_text("drift\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "differ"):
                 build_release.build(source, base / "drift", commit)
