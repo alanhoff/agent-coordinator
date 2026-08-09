@@ -115,6 +115,40 @@ class GlobalInstallTests(unittest.TestCase):
         second = standalone.ensure_global(package, between_sessions=True)
         self.assertFalse(second["changed"])
 
+        executable = owned.package / "scripts" / "coordinator_state.py"
+        original_mode = executable.stat().st_mode & 0o777
+        os.chmod(executable, 0o644)
+        if os.name != "nt":
+            with self.assertRaisesRegex(standalone.InstallError, "package mode mismatch"):
+                standalone.verify_directory(owned.package)
+        with mock.patch.object(standalone.os, "name", "nt"):
+            self.assertEqual(standalone.verify_directory(owned.package).version, "3.0.0")
+        reparse = mock.Mock(
+            st_mode=owned.package.lstat().st_mode,
+            st_file_attributes=getattr(standalone.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+        )
+        with (
+            mock.patch.object(standalone.os, "name", "nt"),
+            mock.patch.object(type(owned.package), "lstat", return_value=reparse),
+            self.assertRaisesRegex(standalone.InstallError, "real directory") as raised,
+        ):
+            standalone.verify_directory(owned.package)
+        self.assertEqual(raised.exception.code, "unsafe_path")
+        real_lstat = type(owned.package).lstat
+        scripts = owned.package / "scripts"
+
+        def reparse_scripts(path: pathlib.Path) -> os.stat_result | mock.Mock:
+            return reparse if path == scripts else real_lstat(path)
+
+        with (
+            mock.patch.object(standalone.os, "name", "nt"),
+            mock.patch.object(type(owned.package), "lstat", reparse_scripts),
+            self.assertRaisesRegex(standalone.InstallError, "unsafe filesystem entry") as raised,
+        ):
+            standalone.verify_directory(owned.package)
+        self.assertEqual(raised.exception.code, "unsafe_path")
+        os.chmod(executable, original_mode)
+
         alias = self.base / "config-alias.toml"
         os.link(config, alias)
         info = config.lstat()
@@ -149,6 +183,7 @@ class GlobalInstallTests(unittest.TestCase):
         owned.package.parent.mkdir(parents=True)
         missing = self.base / "missing-package"
         owned.package.symlink_to(missing, target_is_directory=True)
+        native_target = owned.package.readlink()
         command = [
             "ensure-global", "--source", str(self.release / "coordinator-3.0.0.zip"),
             "--between-sessions", "--json",
@@ -157,7 +192,9 @@ class GlobalInstallTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             code = standalone.main(command)
         self.assertEqual((code, json.loads(output.getvalue())["code"]), (20, "unsafe_path"))
-        self.assertEqual(owned.package.readlink(), missing)
+        self.assertTrue(owned.package.is_symlink())
+        self.assertEqual(owned.package.readlink(), native_target)
+        self.assertFalse(missing.exists())
         self.assertFalse(owned.journal.exists() or owned.journal.is_symlink())
         self.assertFalse(any(owned.package.parent.glob(".coordinator.new.*")))
         self.assertFalse(owned.roles.parent.exists() and any(owned.roles.parent.glob(".coordinator.new.*")))

@@ -187,6 +187,7 @@ def _verify_contents(
     *,
     label: str,
     package_digest: str,
+    enforce_modes: bool = True,
 ) -> VerifiedPackage:
     manifest = _manifest(manifest_bytes)
     expected = set(manifest["files"])
@@ -200,7 +201,7 @@ def _verify_contents(
         data = files[relative]
         if len(data) != spec["size"] or not secrets.compare_digest(_sha256(data), spec["sha256"]):
             raise InstallError(f"package content mismatch: {relative}", code="checksum_mismatch")
-        if modes[relative] != spec["mode"]:
+        if enforce_modes and modes[relative] != spec["mode"]:
             raise InstallError(f"package mode mismatch: {relative}", code="invalid_package")
     try:
         version = files["VERSION"].decode("utf-8").strip()
@@ -221,7 +222,7 @@ def verify_directory(root: pathlib.Path) -> VerifiedPackage:
         info = root.lstat()
     except OSError as exc:
         raise InstallError(f"package directory is unavailable: {root}", code="invalid_source") from exc
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info):
         raise InstallError("package source must be a real directory", code="unsafe_path")
     manifest_path = root / "manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -236,7 +237,7 @@ def verify_directory(root: pathlib.Path) -> VerifiedPackage:
     for path in root.rglob("*"):
         relative = path.relative_to(root).as_posix()
         item = path.lstat()
-        if stat.S_ISLNK(item.st_mode) or not (stat.S_ISDIR(item.st_mode) or stat.S_ISREG(item.st_mode)):
+        if stat.S_ISLNK(item.st_mode) or _is_reparse(item) or not (stat.S_ISDIR(item.st_mode) or stat.S_ISREG(item.st_mode)):
             raise InstallError(f"package contains an unsafe filesystem entry: {relative}", code="unsafe_path")
         if stat.S_ISREG(item.st_mode):
             if item.st_nlink != 1:
@@ -253,7 +254,14 @@ def verify_directory(root: pathlib.Path) -> VerifiedPackage:
     if observed != set(manifest["files"]):
         raise InstallError("package directory is incomplete", code="invalid_package")
     digest = _sha256(manifest_bytes + b"\0" + b"".join(_sha256(files[name]).encode() for name in sorted(files)))
-    return _verify_contents(manifest_bytes, files, modes, label=str(root.resolve()), package_digest=digest)
+    return _verify_contents(
+        manifest_bytes,
+        files,
+        modes,
+        label=str(root.resolve()),
+        package_digest=digest,
+        enforce_modes=os.name != "nt",
+    )
 
 
 def verify_zip(data: bytes, *, label: str, exact_sha256: str | None = None, external_manifest: bytes | None = None) -> VerifiedPackage:
