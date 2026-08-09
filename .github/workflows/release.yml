@@ -86,6 +86,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions: {}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +114,7 @@ jobs:
           PROJECT_DIR: ${{ runner.temp }}/project
           RELEASE_DIR: ${{ runner.temp }}/public-release
         run: |
-          python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
+          python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(exist_ok=True); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
           python "${{ runner.temp }}/public-release/install.py" ensure-global --source "${{ runner.temp }}/public-release/coordinator-latest.zip" --between-sessions --json
           python "${{ runner.temp }}/public-release/install.py" status --json
           python "${{ runner.temp }}/public-release/install.py" check-updates --source "${{ runner.temp }}/public-release/coordinator-latest.zip" --json
