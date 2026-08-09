@@ -1306,6 +1306,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
     if command == "node-add":
         node = _new_node(args)
+        operation = {**node, "route": {"rationale": args.rationale, "attempt": 1}}
 
         def add(state: dict[str, Any]) -> dict[str, Any]:
             if args.node_id in state["nodes"]:
@@ -1315,7 +1316,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             state["nodes"][args.node_id] = node
             return add_event(state, "node_added", args.title, args.node_id)
 
-        state, result, replay = _mutate_command(store, args, command, node, add)
+        state, result, replay = _mutate_command(store, args, command, operation, add)
         return 0, "mutation_reconciled" if replay else "node_added", {**_public_state(state), "event": result}, []
 
     if command == "node-route":
