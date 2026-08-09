@@ -1,0 +1,6 @@
+interface:
+  display_name: "Coordinator"
+  short_description: "Durable multi-agent workflow coordination"
+  default_prompt: "Use $coordinator to plan, route, persist, monitor, reconcile, and complete this task with bounded specialist agents."
+policy:
+  allow_implicit_invocation: true

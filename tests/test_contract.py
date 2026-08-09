@@ -1,143 +1,86 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
+import os
 import pathlib
 import re
+import subprocess
 import sys
 import unittest
 
-PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPTS = PACKAGE_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-import install  # noqa: E402
+from coordinator import VERSION  # noqa: E402
+from coordinator.install import standalone  # noqa: E402
 
 
-class ContractTests(unittest.TestCase):
-    def test_layout_frontmatter_and_portability_contract(self) -> None:
-        required = [
-            "SKILL.md", "README.md", "REVIEW_LOG.md", "VERSION", "manifest.json",
-            "agents/openai.yaml", "scripts/install.py", "scripts/install.sh",
-            "scripts/install.cmd", "scripts/coordinator_state.py",
-            "scripts/model_router.py", "scripts/doctor.py",
-        ]
-        for relative in required:
-            self.assertTrue((PACKAGE_ROOT / relative).is_file(), relative)
-        skill = (PACKAGE_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertTrue(skill.startswith("---\nname: coordinator\n"))
-        for phrase in (
-            "Bootstrap before any task work",
-            "Remote `SKILL.md` invocation",
-            "Mandatory adaptive control loop",
-            "gpt-5.6-sol",
-            "model_reasoning_effort = \"max\"",
-            "Every spawn must explicitly provide",
-            "at least two final adversarial review/fix rounds",
-            "Windows CMD",
-            "five-day cleanup",
+class PublicContractTests(unittest.TestCase):
+    def test_v3_source_and_public_metadata_are_complete(self) -> None:
+        self.assertEqual(VERSION, "3.0.0")
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), VERSION)
+        for path in (
+            "README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "pyproject.toml",
+            "skill/SKILL.md", "skill/README.md", "skill/agents/openai.yaml",
+            "tools/build_release.py", "tools/verify_release.py",
         ):
-            self.assertIn(phrase, skill)
+            self.assertTrue((ROOT / path).is_file(), path)
+        for owner in ("install", "state", "routing", "dashboard", "cli"):
+            self.assertTrue((ROOT / "src" / "coordinator" / owner).is_dir(), owner)
 
-    def test_readme_has_manual_remote_install_and_restart_gate(self) -> None:
-        readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("curl -fsSL https://<source>/skills/coordinator/scripts/install.sh", readme)
-        self.assertIn("curl.exe -fsSL https://<source>/skills/coordinator/scripts/install.cmd", readme)
-        self.assertIn("%USERPROFILE%\\.agents\\skills\\coordinator", readme)
-        self.assertIn("~/.agents/skills/coordinator", readme)
-        self.assertIn("restart_required: true", readme)
-        self.assertIn("Direct remote-skill invocation", readme)
-        self.assertIn("temporary Git index", readme)
-
-    def test_manifest_hashes_and_complete_role_map(self) -> None:
-        source = install.LocalPackageSource(PACKAGE_ROOT)
-        manifest = source.manifest
-        self.assertEqual(manifest["version"], (PACKAGE_ROOT / "VERSION").read_text().strip())
-        self.assertEqual(set(manifest["project_agent_files"]), set(install.REQUIRED_AGENT_TYPES))
-        self.assertIn("manifest.json", manifest["project_skill_files"])
-        for relative, spec in manifest["files"].items():
-            data = (PACKAGE_ROOT / pathlib.PurePosixPath(relative)).read_bytes()
-            self.assertEqual(hashlib.sha256(data).hexdigest(), spec["sha256"], relative)
-            self.assertEqual(len(data), spec["size"], relative)
-        for relative in manifest["project_skill_files"]:
-            self.assertTrue((PACKAGE_ROOT / pathlib.PurePosixPath(relative)).is_file(), relative)
-
-    def test_python_3_8_syntax_and_standard_library_only(self) -> None:
-        allowed = {
-            "__future__", "argparse", "ast", "contextlib", "copy", "dataclasses",
-            "datetime", "functools", "hashlib", "http", "json", "math", "os",
-            "pathlib", "re", "secrets", "shutil", "subprocess", "sys", "tempfile",
-            "threading", "time", "tomllib", "typing", "unittest", "urllib", "install",
-        }
-        for path in sorted(SCRIPTS.glob("*.py")):
-            source = path.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(path), feature_version=(3, 8))
-            imports = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imports.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imports.add(node.module.split(".")[0])
-            self.assertFalse(imports - allowed, f"{path.name}: {sorted(imports - allowed)}")
-
-    def test_custom_agents_are_runtime_routed(self) -> None:
-        for role in install.REQUIRED_AGENT_TYPES:
-            path = PACKAGE_ROOT / "assets" / "project" / ".codex" / "agents" / f"{role}.toml"
+    def test_exact_roles_and_thin_entry_scripts(self) -> None:
+        roles = ROOT / "skill" / "agents" / "roles"
+        self.assertEqual({path.stem for path in roles.glob("*.toml")}, set(standalone.ROLES))
+        for path in roles.glob("*.toml"):
             text = path.read_text(encoding="utf-8")
-            for field in ("name", "description", "developer_instructions"):
-                self.assertRegex(text, rf"(?m)^\s*{field}\s*=")
-            self.assertIsNone(re.search(r"(?m)^\s*(model|model_reasoning_effort)\s*=", text), role)
+            self.assertRegex(text, r"(?m)^name = ")
+            self.assertRegex(text, r"(?m)^description = ")
+            self.assertRegex(text, r"(?m)^developer_instructions = ")
+            self.assertIsNone(re.search(r"(?m)^\s*(model|model_reasoning_effort)\s*=", text))
+        scripts = ROOT / "skill" / "scripts"
+        for name in ("install.py", "doctor.py", "coordinator_state.py", "model_router.py", "dashboard.py"):
+            source = (scripts / name).read_text(encoding="utf-8")
+            self.assertLessEqual(len(source.splitlines()), 10, name)
+            self.assertIn("from coordinator", source)
+        self.assertTrue((scripts / "install.sh").is_file())
+        self.assertTrue((scripts / "install.cmd").is_file())
 
-    def test_all_18_routing_rows_and_dynamic_graph_commands_are_documented(self) -> None:
-        routing = (PACKAGE_ROOT / "references" / "model-routing.md").read_text(encoding="utf-8")
-        for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
-            for effort in ("none", "low", "medium", "high", "xhigh", "max"):
-                self.assertIn(f"| {model} | {effort} |", routing)
-        state = (SCRIPTS / "coordinator_state.py").read_text(encoding="utf-8")
-        for command in (
-            "node-patch", "dependency-add", "dependency-remove", "node-supersede",
-            "node-remove", "graph-validate", "graph-replan", "requirement-set",
-        ):
-            self.assertIn(f'add_parser("{command}"', state)
-        self.assertIn("require_valid_graph(state.get(\"nodes\", {}))", state)
-        self.assertIn('node_add.add_argument("--output-contract"', state)
-        self.assertIn('node_add.add_argument("--validation-command"', state)
-        self.assertIn('task_input.add_argument("--task-file"', state)
-        self.assertIn('plan_input.add_argument("--plan-file"', state)
-        self.assertIn("done nodes require concrete validation_evidence", state)
+    def test_runtime_imports_only_standard_library_and_coordinator(self) -> None:
+        standard = set(sys.stdlib_module_names)
+        for path in (ROOT / "src" / "coordinator").rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level:
+                    names = []
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module.split(".")[0]]
+                for name in names:
+                    self.assertTrue(name == "coordinator" or name in standard, f"{path}: {name}")
 
-    def test_hooks_have_posix_and_windows_commands(self) -> None:
-        handler = install.managed_hook_handler()
-        self.assertEqual(handler["statusMessage"], "Coordinator activation gate")
-        self.assertIn("python3", handler["command"])
-        self.assertIn("python", handler["commandWindows"])
-        self.assertIn("session-hook", handler["command"])
-
-    def test_current_config_uses_documented_agents_table_without_legacy_v2(self) -> None:
-        config = install.merge_config("")
-        self.assertIn("[agents]", config)
-        self.assertIn("max_concurrent_threads_per_session = 8", config)
-        self.assertIn("[features]", config)
-        self.assertNotIn("multi_agent_v2", config)
-
-    def test_remote_wrappers_are_cross_platform_and_standard_library_backed(self) -> None:
-        shell = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
-        cmd = (SCRIPTS / "install.cmd").read_text(encoding="utf-8")
-        self.assertIn("urllib.request", shell)
-        self.assertIn("tempfile", shell)
-        self.assertIn("urllib.request", cmd)
-        self.assertNotIn("powershell", cmd.lower())
-
-    def test_distribution_manifest_contains_no_generated_bytecode(self) -> None:
-        manifest = json.loads((PACKAGE_ROOT / "manifest.json").read_text(encoding="utf-8"))
-        bad = [
-            relative for relative in manifest["project_skill_files"]
-            if "__pycache__" in pathlib.PurePosixPath(relative).parts
-            or pathlib.PurePosixPath(relative).suffix in {".pyc", ".pyo"}
-        ]
-        self.assertEqual(bad, [])
-
+    def test_all_python_adapters_emit_json_for_invalid_invocations(self) -> None:
+        environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+        for name in ("install.py", "doctor.py", "coordinator_state.py", "model_router.py", "dashboard.py"):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "skill" / "scripts" / name), "invalid", "--json"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, name)
+            self.assertEqual(result.stderr, "", name)
+            payload = json.loads(result.stdout)
+            self.assertEqual(
+                set(payload),
+                {"command", "status", "code", "data", "warnings", "new_session_required"},
+                name,
+            )
+            self.assertEqual((payload["status"], payload["code"]), ("error", "invalid_invocation"), name)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,0 @@
-interface:
-  display_name: "Coordinator"
-  short_description: "Self-deploying adaptive multi-agent orchestration"
-  default_prompt: "Use $coordinator to bootstrap or update this project, stop for the required Codex restart when configuration changes, then execute the task end to end with a continuously mutable, resumable, ROI-routed parallel subagent DAG, iterative autofix reviews, validation, and a final task commit."
-policy:
-  allow_implicit_invocation: true

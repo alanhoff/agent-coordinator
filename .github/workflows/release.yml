@@ -1,0 +1,123 @@
+name: Release v3.0.0
+
+on:
+  push:
+    tags:
+      - v3.0.0
+
+permissions: {}
+
+jobs:
+  build:
+    if: github.ref == 'refs/tags/v3.0.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Verify the merged release tag
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
+          test "$(git rev-list -n 1 refs/tags/v3.0.0)" = "$(git rev-parse HEAD)"
+          test "$(tr -d '\r\n' < VERSION)" = "3.0.0"
+      - name: Build and verify the five assets
+        run: |
+          python tools/build_release.py --output "${{ runner.temp }}/release"
+          python tools/verify_release.py --release-dir "${{ runner.temp }}/release" --source-commit "$(git rev-parse HEAD)"
+      - name: Transfer immutable release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-v3.0.0
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: release
+    permissions:
+      contents: write
+    steps:
+      - name: Receive immutable release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-v3.0.0
+          path: ${{ runner.temp }}/release
+      - name: Publish and read back the release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          gh release create v3.0.0 \
+            "$RELEASE_DIR/coordinator-3.0.0.zip" \
+            "$RELEASE_DIR/coordinator-latest.zip" \
+            "$RELEASE_DIR/install.py" \
+            "$RELEASE_DIR/manifest.json" \
+            "$RELEASE_DIR/SHA256SUMS" \
+            --verify-tag --latest --title "Agent Coordinator v3.0.0" --generate-notes
+          gh release view --json tagName,isDraft,isPrerelease,assets > "$RUNNER_TEMP/release.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          release = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "release.json").read_text())
+          expected = {"coordinator-3.0.0.zip", "coordinator-latest.zip", "install.py", "manifest.json", "SHA256SUMS"}
+          assert release["tagName"] == "v3.0.0"
+          assert not release["isDraft"] and not release["isPrerelease"]
+          assert {asset["name"] for asset in release["assets"]} == expected
+          PY
+
+  public-verify:
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          token: ''
+      - name: Download and verify the public assets anonymously
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/public-release
+        run: |
+          python -c "import os,pathlib,urllib.request; directory=pathlib.Path(os.environ['RELEASE_DIR']); directory.mkdir(); base='https://github.com/alanhoff/agent-coordinator/releases/latest/download/'; names=('coordinator-3.0.0.zip','coordinator-latest.zip','install.py','manifest.json','SHA256SUMS'); [urllib.request.urlretrieve(base+name,directory/name) for name in names]"
+          python -c "import hashlib,os,pathlib,zipfile; directory=pathlib.Path(os.environ['RELEASE_DIR']); sums={name:digest for digest,name in (line.split('  ',1) for line in (directory/'SHA256SUMS').read_text(encoding='ascii').splitlines())}; expected={'coordinator-3.0.0.zip','coordinator-latest.zip','install.py','manifest.json'}; assert set(sums)==expected; assert all(hashlib.sha256((directory/name).read_bytes()).hexdigest()==digest for name,digest in sums.items()); assert (directory/'coordinator-3.0.0.zip').read_bytes()==(directory/'coordinator-latest.zip').read_bytes(); archive=zipfile.ZipFile(directory/'coordinator-latest.zip'); assert archive.read('coordinator/manifest.json')==(directory/'manifest.json').read_bytes()"
+          python -c "import json,os,pathlib,re,subprocess; directory=pathlib.Path(os.environ['RELEASE_DIR']); result=subprocess.run(['git','ls-remote','https://github.com/alanhoff/agent-coordinator.git','refs/tags/v3.0.0','refs/tags/v3.0.0^{}'],check=True,text=True,stdout=subprocess.PIPE,env={**os.environ,'GIT_TERMINAL_PROMPT':'0'}); refs={ref:commit for commit,ref in (line.split('\t',1) for line in result.stdout.splitlines())}; commit=refs.get('refs/tags/v3.0.0^{}') or refs.get('refs/tags/v3.0.0'); manifest=json.loads((directory/'manifest.json').read_text(encoding='utf-8')); assert isinstance(commit,str) and re.fullmatch(r'[0-9a-f]{40}',commit); assert manifest.get('version')=='3.0.0'; assert manifest.get('source_commit')==commit"
+      - name: Install and smoke the public release
+        env:
+          HOME: ${{ runner.temp }}/isolated-home
+          USERPROFILE: ${{ runner.temp }}/isolated-home
+          PROJECT_DIR: ${{ runner.temp }}/project
+          RELEASE_DIR: ${{ runner.temp }}/public-release
+        run: |
+          python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(exist_ok=True); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
+          python "${{ runner.temp }}/public-release/install.py" ensure-global --source "${{ runner.temp }}/public-release/coordinator-latest.zip" --between-sessions --json
+          python "${{ runner.temp }}/public-release/install.py" status --json
+          python "${{ runner.temp }}/public-release/install.py" check-updates --source "${{ runner.temp }}/public-release/coordinator-latest.zip" --json
+          python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/doctor.py" check --repo "${{ runner.temp }}/project" --json
+          python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/dashboard.py" watch --once --json
+          python -c "import os,subprocess; result=subprocess.run(['git','-C',os.environ['PROJECT_DIR'],'status','--porcelain','--untracked-files=all'],check=True,text=True,stdout=subprocess.PIPE); assert not result.stdout,result.stdout"
