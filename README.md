@@ -1,102 +1,172 @@
+![Agent Coordinator: a routed workflow moves through bounded specialist stages to a verified result](docs/assets/agent-coordinator-hero.png)
+
+<div align="center">
+
 # Agent Coordinator
 
-Agent Coordinator is a durable multi-agent workflow coordinator for Codex. Version 3 is a breaking, current-user global installation: its package, eight role definitions, Codex configuration, recovery data, and workflow state live under your home directory. Repositories being orchestrated receive only the task changes you authorize—no Coordinator hooks, state, lock, role, or configuration files.
+**Turn complex Codex work into a bounded, observable workflow with evidence at every handoff.**
 
-The runtime supports Python 3.11+ on Linux, macOS, and Windows and uses only the Python standard library. Releases are deterministic, closed-inventory ZIPs published through public GitHub Releases.
+Durable revisioned state, explicit dependencies and write scopes, evidence-routed specialists,
+and verified recovery—without adding Coordinator files to the repository being orchestrated.
+
+</div>
 
 ## Install
 
-Close running Codex sessions first. Download these public assets from the latest release:
+**Requires Python 3.11+ on Linux, macOS, or Windows.** Close Codex first. These commands install
+Coordinator globally for the current user; after success, reopen Codex in a new session.
 
-- [`install.py`](https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py)
-- [`manifest.json`](https://github.com/alanhoff/agent-coordinator/releases/latest/download/manifest.json)
-- [`SHA256SUMS`](https://github.com/alanhoff/agent-coordinator/releases/latest/download/SHA256SUMS)
-
-Verify the downloaded `install.py` against `SHA256SUMS`, then run:
+### Linux and macOS
 
 ```sh
-python3 install.py ensure-global --between-sessions
+d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && curl -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o "$d/install.py" && curl -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/SHA256SUMS -o "$d/SHA256SUMS" && python3 -c 'import hashlib,pathlib,sys; d=pathlib.Path(sys.argv[1]); expected=next((line.split()[0] for line in (d/"SHA256SUMS").read_text(encoding="ascii").splitlines() if line.split()[1:]==["install.py"]), None); actual=hashlib.sha256((d/"install.py").read_bytes()).hexdigest(); sys.exit(0 if expected is not None and actual==expected else 1)' "$d" && python3 "$d/install.py" ensure-global --between-sessions
 ```
 
-On Windows use `python` when that is the Python 3.11+ launcher. The installer anonymously downloads and verifies `coordinator-latest.zip`, checks the standalone and ZIP-root manifests are byte-identical, validates the exact inventory and safe archive layout, then commits one recoverable current-user transaction.
+### Windows PowerShell
 
-A successful change reports that a new Codex session is required. Start that new session before orchestration.
+```powershell
+$d=Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid()); New-Item -ItemType Directory $d | Out-Null; try { curl.exe -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o (Join-Path $d install.py); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; curl.exe -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/SHA256SUMS -o (Join-Path $d SHA256SUMS); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python -c 'import hashlib,pathlib,sys; d=pathlib.Path(sys.argv[1]); expected=next((line.split()[0] for line in (d/"SHA256SUMS").read_text(encoding="ascii").splitlines() if line.split()[1:]==["install.py"]), None); actual=hashlib.sha256((d/"install.py").read_bytes()).hexdigest(); sys.exit(0 if expected is not None and actual==expected else 1)' $d; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python (Join-Path $d install.py) ensure-global --between-sessions; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Remove-Item -Recurse -Force $d }
+```
 
-### Installed locations
+Both commands download only `install.py` and `SHA256SUMS` before verification. The verified
+installer anonymously fetches and validates `manifest.json` and `coordinator-latest.zip`, checks
+their exact inventory and manifest identity, and performs a recoverable current-user transaction.
+To inspect first, download those same two files, compare the `install.py` SHA-256 entry, review the
+script, then run `python3 install.py ensure-global --between-sessions` (`python` on Windows).
 
-| Location | Coordinator ownership |
-|---|---|
-| `~/.agents/skills/coordinator` | Verified package |
-| `~/.codex/agents/coordinator` | Eight role definitions |
-| `~/.codex/config.toml` | Marked semantic agent/feature keys only |
-| `~/.agent-coordinator` | Private metadata, locks, recovery, sessions, and workflow state |
+## Why Coordinator
 
-Existing unrelated Codex configuration is preserved. An ambiguous file, symlink/reparse point, unknown target tree, or unsafe ownership condition is reported without adoption.
+- **Recovery is part of the protocol.** Atomic, revisioned snapshots record launch claims before
+  external calls, require reconciliation after uncertain responses, and fence replaced controllers.
+- **Ownership is explicit.** Every DAG node carries dependencies, acceptance criteria, one role,
+  and a repository-relative write scope; overlapping work is serialized.
+- **Routing follows evidence.** Eight installed roles—`architect`, `designer`, `documenter`,
+  `fixer`, `implementer`, `researcher`, `reviewer`, and `validator`—have no model pins. The
+  controller selects a validated model and effort for each attempt.
+- **Your project stays clean.** Packages, roles, configuration, sessions, locks, recovery data,
+  and workflow state live under current-user global locations, never in the target repository.
+- **Observation cannot steer execution.** The dashboard reads committed snapshots and exposes no
+  workflow mutation endpoint.
+- **The release surface is closed.** Deterministic release builds have an exact inventory and an
+  independent verifier. The Python 3.11+ runtime uses only the standard library.
 
-### Upgrading from version 2
+## Give Codex a controller brief
 
-Version 3 does not adopt, update, or silently delete a v2 project-local installation. First use version control to review and remove the old Coordinator-only project commit or files while preserving your own repository configuration and changes. Then install version 3 globally between sessions. Confirm `install.py status` and `doctor.py preflight --repo PATH` before orchestration; v3 will not create replacement files in that repository.
+Each prompt explicitly invokes `$coordinator`. These are controller instructions, not fixed
+topologies: Coordinator derives the smallest useful graph and routes attempts from current evidence.
+
+**Deliver a feature with bounded parallel ownership**
+
+```text
+$coordinator Ship the saved-search feature. Inspect repository instructions, persist the acceptance
+criteria, and build the smallest dependency DAG. Parallelize only independent write scopes, route
+each node from evidence, validate the integrated behavior, and finish only at a verified commit.
+```
+
+**Diagnose an intermittent test before changing production**
+
+```text
+$coordinator Reproduce and diagnose the intermittent checkout test first. Keep diagnosis, the
+smallest owner-layer fix, and independent validation as bounded dependent work. Preserve failure
+evidence, reconcile uncertain launches, and do not mark the workflow complete without a verified run.
+```
+
+**Resume a migration safely**
+
+```text
+$coordinator Resume the interrupted schema migration workflow. Reconcile the repository and every
+uncertain launch before retrying, preserve completed evidence, replan only unclaimed future work,
+and validate rollback and forward-migration behavior before finishing.
+```
+
+**Audit a release without modifying it**
+
+```text
+$coordinator Perform a read-only release audit. Compare the tag, manifest, checksums, archive
+inventory, and documented install contract. Assign bounded research and validation scopes, make no
+repository changes, and return findings with exact evidence and unresolved limitations.
+```
+
+**Compare architectures from repository evidence**
+
+```text
+$coordinator Compare the two proposed event-processing architectures against current repository
+boundaries and requirements. Route bounded research and architecture nodes, state tradeoffs and
+missing evidence, and return a recommendation without implementing either option.
+```
 
 ## Operate
 
-The installed `SKILL.md` is the controller protocol. Useful read-only checks are:
+Run preflight before orchestration, then open the local read-only dashboard when useful:
+
+```sh
+python3 ~/.agents/skills/coordinator/scripts/doctor.py preflight --repo /absolute/repository --json
+python3 ~/.agents/skills/coordinator/scripts/dashboard.py watch --once
+python3 ~/.agents/skills/coordinator/scripts/dashboard.py serve --open
+```
+
+On Windows, use `python` and paths under `%USERPROFILE%`. The installed `SKILL.md` is the controller
+protocol. In compact form, a launch moves through **claim → bind → run → validate → finish**:
+
+1. The controller creates a dependency-safe node with acceptance criteria, route, and write scope.
+2. It commits a unique launch claim before calling an agent provider, then binds the observed child.
+3. The specialist works only its node; the controller inspects artifacts and validation evidence.
+4. `finish` requires successful visible nodes, resolved requirements and blockers, validation, and a
+   full verified commit checkpoint.
+
+If a provider response is uncertain, Coordinator records `reconcile_required`; the controller must
+find and bind the existing child or prove that none exists before retrying. A replacement controller
+uses explicit `controller-takeover` and `resume`, fencing the prior epoch before further mutation.
+
+## See the workflow without touching it
+
+![Read-only Coordinator dashboard showing workflow progress, ready work, a blocker, cost evidence, and dependency details](docs/assets/dashboard.png)
+
+*Genuine capture from a disposable public demo workflow—not generated artwork.*
+
+Humans can inspect progress, active and ready work, DAG layers and critical path, blockers, recovery
+state, capacity, attempts, and estimated or actual cost when known. `watch`, loopback `serve`, and
+self-contained `render` all derive the same view from validated committed snapshots. Dashboard
+requests cannot mutate, initialize, repair, lock, cache, or clean workflows.
+
+```sh
+python3 ~/.agents/skills/coordinator/scripts/dashboard.py watch --workflow-id WORKFLOW --once
+python3 ~/.agents/skills/coordinator/scripts/dashboard.py serve --workflow-id WORKFLOW --open
+python3 ~/.agents/skills/coordinator/scripts/dashboard.py render --workflow-id WORKFLOW --out /explicit/report.html
+```
+
+## Global footprint, updates, and migration
+
+| Current-user location | Contents |
+|---|---|
+| `~/.agents/skills/coordinator` | Verified package and controller protocol |
+| `~/.codex/agents/coordinator` | Eight role definitions |
+| `~/.codex/config.toml` | Coordinator-owned marked semantic keys; unrelated configuration is preserved |
+| `~/.agent-coordinator` | Private metadata, locks, recovery, sessions, and workflow state |
+
+Coordinator creates no hooks, state, locks, roles, configuration, or package files in repositories it
+orchestrates. Version 3 does **not** automatically adopt, update, or delete a v2 project-local
+installation. Review and remove the old Coordinator-only project commit or files with version control,
+preserving your changes, then install v3 globally and run preflight.
+
+Between Codex sessions:
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/install.py status
-python3 ~/.agents/skills/coordinator/scripts/doctor.py check
-python3 ~/.agents/skills/coordinator/scripts/dashboard.py watch --once
-```
-
-The eight roles are `architect`, `designer`, `documenter`, `fixer`, `implementer`, `researcher`, `reviewer`, and `validator`. Role files do not pin a model or reasoning effort; the controller routes each launch from validated task evidence.
-
-Workflow mutations use a private controller session file, expected prior revision, and unique mutation ID. State records launch claims before provider calls, distinguishes uncertain responses that require reconciliation, fences old controller epochs, and atomically commits complete validated snapshots. Read-only status and dashboard commands never initialize, repair, lock, cache, or clean state.
-
-### Dashboard
-
-```sh
-python3 ~/.agents/skills/coordinator/scripts/dashboard.py serve --open
-python3 ~/.agents/skills/coordinator/scripts/dashboard.py render --workflow-id ID --out report.html
-```
-
-`serve` binds only `127.0.0.1`, protects requests with an in-memory capability, exposes no mutating endpoint, and retains bounded replay only in memory. `render` creates a self-contained report at the explicit output path. Stored workflow text is treated as untrusted in both views.
-
-## Update and recovery
-
-Between sessions, check and update anonymously:
-
-```sh
 python3 ~/.agents/skills/coordinator/scripts/install.py check-updates
 python3 ~/.agents/skills/coordinator/scripts/install.py ensure-global --between-sessions
 ```
 
-`check-updates` exits 1 when an update is available. Downgrades are rejected. For a verified development build, `ensure-global` also accepts `--source PATH` for a package directory or ZIP. A custom network ZIP requires both a credential-free HTTPS `--source-url` and its exact `--source-sha256`.
+`check-updates` exits 1 when an update is available. If installation was interrupted, first run the
+zero-write `install.py recovery-status --json` and use only the exact rollback command it returns.
 
-If an interruption leaves a journal, first perform the zero-write status pass:
+## Project
 
-```sh
-python3 ~/.agents/skills/coordinator/scripts/install.py recovery-status --json
-```
+Agent Coordinator is MIT licensed. Contributions and focused reports are welcome:
 
-Run only the exact token-free rollback command it returns. Recovery stops unchanged if transaction or digest evidence differs.
-
-## Build and verify a release
-
-From a clean source commit:
-
-```sh
-python3 tools/build_release.py --output /empty/output/directory
-python3 tools/verify_release.py --release-dir /empty/output/directory
-```
-
-Two builds from the same commit produce byte-identical ZIPs, manifests, installer assets, and checksums. The independent verifier reconstructs archive inventory, content modes, source commit/version binding, safe paths, manifest identity, and standalone-installer identity.
-
-## Troubleshooting
-
-- Exit 1 is a valid negative state such as drift or an available update.
-- Exit 2 means invalid invocation or rejected semantic transition.
-- Exit 20 means safety, concurrency, recovery, network, or I/O evidence needs operator attention.
-- Run `doctor.py preflight --repo PATH --json` before a workflow to inspect Git, installation integrity, roles/config, Codex capability discovery, privacy, recovery, and state health.
-- Never place bearer files in a repository. If a controller is replaced, use `controller-takeover`, then explicit `resume`.
-- Do not delete unknown recovery or lock paths. Coordinator intentionally refuses ambiguous automatic takeover and cleanup.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md). This project is available under the [MIT License](LICENSE).
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md) — report vulnerabilities privately, not in a public issue
+- [Changelog](CHANGELOG.md)
+- [License](LICENSE)
+- [GitHub repository](https://github.com/alanhoff/agent-coordinator)
+- [Public issues](https://github.com/alanhoff/agent-coordinator/issues)
