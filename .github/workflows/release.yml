@@ -91,10 +91,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     env:
-      HOME: ${{ runner.temp }}/isolated-home
-      USERPROFILE: ${{ runner.temp }}/isolated-home
-      PROJECT_DIR: ${{ runner.temp }}/project
-      RELEASE_DIR: ${{ runner.temp }}/public-release
       PYTHONUTF8: '1'
     steps:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -102,11 +98,18 @@ jobs:
           python-version: '3.11'
           token: ''
       - name: Download and verify the public assets anonymously
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/public-release
         run: |
           python -c "import os,pathlib,urllib.request; directory=pathlib.Path(os.environ['RELEASE_DIR']); directory.mkdir(); base='https://github.com/alanhoff/agent-coordinator/releases/latest/download/'; names=('coordinator-3.0.0.zip','coordinator-latest.zip','install.py','manifest.json','SHA256SUMS'); [urllib.request.urlretrieve(base+name,directory/name) for name in names]"
           python -c "import hashlib,os,pathlib,zipfile; directory=pathlib.Path(os.environ['RELEASE_DIR']); sums={name:digest for digest,name in (line.split('  ',1) for line in (directory/'SHA256SUMS').read_text(encoding='ascii').splitlines())}; expected={'coordinator-3.0.0.zip','coordinator-latest.zip','install.py','manifest.json'}; assert set(sums)==expected; assert all(hashlib.sha256((directory/name).read_bytes()).hexdigest()==digest for name,digest in sums.items()); assert (directory/'coordinator-3.0.0.zip').read_bytes()==(directory/'coordinator-latest.zip').read_bytes(); archive=zipfile.ZipFile(directory/'coordinator-latest.zip'); assert archive.read('coordinator/manifest.json')==(directory/'manifest.json').read_bytes()"
           python -c "import json,os,pathlib,re,subprocess; directory=pathlib.Path(os.environ['RELEASE_DIR']); result=subprocess.run(['git','ls-remote','https://github.com/alanhoff/agent-coordinator.git','refs/tags/v3.0.0','refs/tags/v3.0.0^{}'],check=True,text=True,stdout=subprocess.PIPE,env={**os.environ,'GIT_TERMINAL_PROMPT':'0'}); refs={ref:commit for commit,ref in (line.split('\t',1) for line in result.stdout.splitlines())}; commit=refs.get('refs/tags/v3.0.0^{}') or refs.get('refs/tags/v3.0.0'); manifest=json.loads((directory/'manifest.json').read_text(encoding='utf-8')); assert isinstance(commit,str) and re.fullmatch(r'[0-9a-f]{40}',commit); assert manifest.get('version')=='3.0.0'; assert manifest.get('source_commit')==commit"
       - name: Install and smoke the public release
+        env:
+          HOME: ${{ runner.temp }}/isolated-home
+          USERPROFILE: ${{ runner.temp }}/isolated-home
+          PROJECT_DIR: ${{ runner.temp }}/project
+          RELEASE_DIR: ${{ runner.temp }}/public-release
         run: |
           python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
           python "${{ runner.temp }}/public-release/install.py" ensure-global --source "${{ runner.temp }}/public-release/coordinator-latest.zip" --between-sessions --json
