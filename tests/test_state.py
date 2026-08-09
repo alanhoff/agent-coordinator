@@ -86,10 +86,18 @@ class DurableStateTests(unittest.TestCase):
             "--session-file", str(self.session), "--mutation-id", "init-001",
         )
         self.assertEqual(replayed_init["data"]["workflow_id"], self.workflow_id)
-        first = self.add("a", 1, "add-a")
+        with mock.patch.object(state_owner, "now_iso", return_value="2099-01-01T00:00:00Z"):
+            first = self.add("a", 1, "add-a")
         self.assertEqual(first["data"]["revision"], 2)
-        replay = self.add("a", 1, "add-a")
+        with mock.patch.object(state_owner, "now_iso", return_value="2099-01-01T00:00:01Z"):
+            replay = self.add("a", 1, "add-a")
         self.assertEqual(replay["code"], "mutation_reconciled")
+        self.assertEqual(
+            StateStore().load(self.workflow_id)["nodes"]["a"]["route"]["routed_at"],
+            "2099-01-01T00:00:00Z",
+        )
+        collision = self.add("different", 1, "add-a", expected=20)
+        self.assertEqual(collision["code"], "mutation_conflict")
         self.add("other", 1, "stale-add", expected=20)
         self.add("b", 2, "add-b", "--dependency", "a")
         malformed = json.dumps({"reason": "invalid node id", "operations": [{"op": "remove", "node_id": {}}]})
