@@ -29,12 +29,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.14'
+          python-version: '3.11'
       - name: Install the trusted checkout
         run: |
           python tools/build_release.py --output "${{ runner.temp }}/release" --source-commit "${{ github.sha }}"
-          python tools/verify_release.py --release-dir "${{ runner.temp }}/release" --source-commit "${{ github.sha }}"
-          python "${{ runner.temp }}/release/install.py" ensure-global --source "${{ runner.temp }}/release/coordinator-3.0.0.zip" --between-sessions --json
+          python "${{ runner.temp }}/release/install.py" ensure-global --source "${{ runner.temp }}/release/coordinator-latest.zip" --between-sessions --json
       - name: Record the clean repository boundary
         env:
           BASELINE_DIR: ${{ runner.temp }}/repository-baseline

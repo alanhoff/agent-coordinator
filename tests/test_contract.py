@@ -23,7 +23,7 @@ class PublicContractTests(unittest.TestCase):
         for path in (
             "README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "pyproject.toml",
             "skill/SKILL.md", "skill/README.md", "skill/agents/openai.yaml",
-            "tools/build_release.py", "tools/verify_release.py",
+            "tools/build_release.py",
         ):
             self.assertTrue((ROOT / path).is_file(), path)
         for owner in ("install", "state", "routing", "dashboard", "cli"):
@@ -81,6 +81,33 @@ class PublicContractTests(unittest.TestCase):
                 name,
             )
             self.assertEqual((payload["status"], payload["code"]), ("error", "invalid_invocation"), name)
+
+    def test_installer_exposes_no_update_detection_or_release_digest_option(self) -> None:
+        parser = standalone.build_parser()
+        commands = next(
+            action.choices for action in parser._actions if "ensure-global" in (getattr(action, "choices", None) or {})
+        )
+        self.assertEqual(
+            set(commands),
+            {"ensure-global", "status", "home-probe", "cleanup", "recovery-status", "recover-install"},
+        )
+        ensure_options = {option for action in commands["ensure-global"]._actions for option in action.option_strings}
+        self.assertEqual(
+            ensure_options,
+            {"-h", "--help", "--source", "--source-url", "--between-sessions", "--json"},
+        )
+
+    def test_ci_uses_latest_platforms_with_only_minimum_python(self) -> None:
+        workflows = {path.name: path.read_text(encoding="utf-8") for path in (ROOT / ".github" / "workflows").glob("*.yml")}
+        ci = workflows["ci.yml"]
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
+        self.assertNotIn("matrix.python", ci)
+        for name, text in workflows.items():
+            versions = re.findall(r"python-version:\s*['\"]?([^'\"\s]+)", text)
+            self.assertTrue(versions, name)
+            self.assertEqual(set(versions), {"3.11"}, name)
+            for removed in ("verify_release", "manifest.json", "SHA256SUMS", "check-updates"):
+                self.assertNotIn(removed, text, name)
 
 if __name__ == "__main__":
     unittest.main()

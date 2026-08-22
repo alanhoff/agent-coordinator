@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import pathlib
@@ -14,37 +13,11 @@ import subprocess
 import zipfile
 from typing import Any, Sequence
 
-OWNER = "alanhoff/agent-coordinator"
-ROLES = ("architect", "designer", "documenter", "fixer", "implementer", "researcher", "reviewer", "validator")
-ROLE_PATHS = {role: f"agents/roles/{role}.toml" for role in ROLES}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-SKILL_FILES = {
-    "SKILL.md", "README.md", "agents/openai.yaml",
-    "references/model-routing.md", "references/state-schema.md", "references/workflow-protocol.md", "references/dashboard.md",
-    "scripts/coordinator_state.py", "scripts/doctor.py", "scripts/install.py", "scripts/model_router.py", "scripts/dashboard.py",
-    "scripts/install.sh", "scripts/install.cmd",
-    *ROLE_PATHS.values(),
-}
-RUNTIME_FILES = {
-    "__init__.py",
-    "cli/__init__.py", "cli/state.py", "cli/routing.py", "cli/dashboard.py", "cli/doctor.py", "cli/outcome.py",
-    "dashboard/__init__.py", "dashboard/view.py",
-    "install/__init__.py", "install/standalone.py", "install/doctor.py",
-    "routing/__init__.py", "routing/selector.py",
-    "state/__init__.py", "state/store.py",
-}
-CANONICAL_FILES = {
-    ".coordinator-package.json", "LICENSE", "VERSION", *SKILL_FILES,
-    *("scripts/lib/coordinator/" + path for path in RUNTIME_FILES),
-}
 
 
 def _json(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-
-
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _git(root: pathlib.Path, *arguments: str) -> str:
@@ -69,6 +42,34 @@ def _git_blob(root: pathlib.Path, commit: str, relative: str) -> bytes:
     return result.stdout
 
 
+def _tree_files(root: pathlib.Path, commit: str) -> list[str]:
+    tree = _git(
+        root,
+        "ls-tree", "-r", commit, "--",
+        "skill", "src/coordinator", "LICENSE", "VERSION",
+    )
+    tracked: list[str] = []
+    for entry in tree.splitlines():
+        metadata, separator, relative = entry.partition("\t")
+        fields = metadata.split()
+        parts = pathlib.PurePosixPath(relative).parts
+        if (
+            not separator
+            or len(fields) != 3
+            or fields[0] not in ("100644", "100755")
+            or fields[1] != "blob"
+            or not parts
+            or any(part in ("", ".", "..") for part in parts)
+            or "\\" in relative
+            or pathlib.PurePosixPath(relative).as_posix() != relative
+        ):
+            raise RuntimeError("source commit contains an unsafe release input")
+        tracked.append(relative)
+    if not tracked:
+        raise RuntimeError("source commit contains no release inputs")
+    return tracked
+
+
 def _commit(root: pathlib.Path, supplied: str | None) -> str:
     if pathlib.Path(_git(root, "rev-parse", "--show-toplevel")).resolve() != root:
         raise RuntimeError("release root must be the Git worktree root")
@@ -88,21 +89,7 @@ def _commit(root: pathlib.Path, supplied: str | None) -> str:
     )
     if drift:
         raise RuntimeError("release inputs differ from the checked-out source commit")
-    tracked: set[str] = set()
-    tree = _git(
-        root,
-        "ls-tree", "-r", value, "--",
-        "skill", "src/coordinator", "LICENSE", "VERSION",
-    )
-    for entry in tree.splitlines():
-        metadata, separator, relative = entry.partition("\t")
-        fields = metadata.split()
-        if not separator or len(fields) != 3 or fields[0] not in ("100644", "100755") or fields[1] != "blob":
-            raise RuntimeError("source commit contains an unsafe release input")
-        tracked.add(relative)
-    expected = {"LICENSE", "VERSION", *("skill/" + path for path in SKILL_FILES), *("src/coordinator/" + path for path in RUNTIME_FILES)}
-    if tracked != expected:
-        raise RuntimeError("source commit does not contain the canonical release input inventory")
+    _tree_files(root, value)
     return value
 
 
@@ -110,32 +97,40 @@ def _files(root: pathlib.Path, version: str, source_commit: str) -> tuple[dict[s
     files: dict[str, bytes] = {}
     modes: dict[str, str] = {}
 
-    def add(relative: str, source: str, executable: bool = False) -> None:
+    def add(relative: str, source: str) -> None:
         if relative in files:
             raise RuntimeError(f"duplicate package path: {relative}")
         files[relative] = _git_blob(root, source_commit, source)
-        modes[relative] = "executable" if executable else "file"
+        parts = pathlib.PurePosixPath(relative).parts
+        modes[relative] = "executable" if len(parts) == 2 and parts[0] == "scripts" else "file"
 
-    for relative in sorted(SKILL_FILES):
-        add(relative, "skill/" + relative, relative.startswith("scripts/"))
-    add("LICENSE", "LICENSE")
-    add("VERSION", "VERSION")
-    for relative in sorted(RUNTIME_FILES):
-        add("scripts/lib/coordinator/" + relative, "src/coordinator/" + relative)
+    for source in _tree_files(root, source_commit):
+        if source in ("LICENSE", "VERSION"):
+            relative = source
+        elif source.startswith("skill/"):
+            relative = source.removeprefix("skill/")
+        elif source.startswith("src/coordinator/"):
+            relative = "scripts/lib/coordinator/" + source.removeprefix("src/coordinator/")
+        else:
+            raise RuntimeError("release input is outside the owned source roots")
+        add(relative, source)
     marker = {
         "schema_version": 1,
         "name": "coordinator",
         "version": version,
         "source_commit": source_commit,
     }
+    if ".coordinator-package.json" in files:
+        raise RuntimeError("source files collide with the generated package marker")
     files[".coordinator-package.json"] = _json(marker)
     modes[".coordinator-package.json"] = "file"
-    if set(files) != CANONICAL_FILES:
-        raise RuntimeError("assembled package inventory is not canonical")
+    minimum = {"SKILL.md", "VERSION", "scripts/install.py", "scripts/lib/coordinator/install/standalone.py"}
+    if not minimum <= set(files):
+        raise RuntimeError("assembled package is missing a required entry point")
     return files, modes
 
 
-def build(root: pathlib.Path, output: pathlib.Path, source_commit: str | None = None) -> dict[str, str]:
+def build(root: pathlib.Path, output: pathlib.Path, source_commit: str | None = None) -> dict[str, Any]:
     root = root.resolve()
     output = output.expanduser().absolute()
     if output.is_symlink():
@@ -162,27 +157,13 @@ def build(root: pathlib.Path, output: pathlib.Path, source_commit: str | None = 
     if any(output.iterdir()):
         raise RuntimeError("release output directory must be empty")
     files, modes = _files(root, version, commit)
-    manifest = {
-        "schema_version": 1,
-        "name": "coordinator",
-        "owner": OWNER,
-        "version": version,
-        "source_commit": commit,
-        "files": {
-            relative: {"sha256": _sha(data), "size": len(data), "mode": modes[relative]}
-            for relative, data in sorted(files.items())
-        },
-        "roles": ROLE_PATHS,
-    }
-    manifest_bytes = _json(manifest)
     archive_path = output / f"coordinator-{version}.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, strict_timestamps=True) as archive:
         archive.comment = b""
-        for relative, data in sorted({**files, "manifest.json": manifest_bytes}.items()):
+        for relative, data in sorted(files.items()):
             info = zipfile.ZipInfo("coordinator/" + relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
-            logical = "file" if relative == "manifest.json" else modes[relative]
-            permission = 0o755 if logical == "executable" else 0o644
+            permission = 0o755 if modes[relative] == "executable" else 0o644
             info.external_attr = (stat.S_IFREG | permission) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
@@ -191,19 +172,11 @@ def build(root: pathlib.Path, output: pathlib.Path, source_commit: str | None = 
     latest.write_bytes(zip_bytes)
     standalone = files["scripts/lib/coordinator/install/standalone.py"]
     (output / "install.py").write_bytes(standalone)
-    (output / "manifest.json").write_bytes(manifest_bytes)
-    payloads = {
-        archive_path.name: zip_bytes,
-        latest.name: zip_bytes,
-        "install.py": standalone,
-        "manifest.json": manifest_bytes,
-    }
-    sums = "".join(f"{_sha(payloads[name])}  {name}\n" for name in sorted(payloads))
-    (output / "SHA256SUMS").write_text(sums, encoding="ascii", newline="\n")
-    for asset in (archive_path, latest, output / "manifest.json", output / "SHA256SUMS"):
+    assets = (archive_path, latest, output / "install.py")
+    for asset in (archive_path, latest):
         os.chmod(asset, 0o644)
     os.chmod(output / "install.py", 0o755)
-    return {name: _sha(data) for name, data in payloads.items()}
+    return {"version": version, "source_commit": commit, "assets": [asset.name for asset in assets]}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -213,7 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source-commit")
     args = parser.parse_args(argv)
     result = build(pathlib.Path(args.root), pathlib.Path(args.output), args.source_commit)
-    print(json.dumps({"status": "built", "assets": result}, indent=2, sort_keys=True))
+    print(json.dumps({"status": "built", "data": result}, indent=2, sort_keys=True))
     return 0
 
 

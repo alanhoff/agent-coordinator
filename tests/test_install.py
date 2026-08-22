@@ -20,27 +20,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from coordinator.install import standalone  # noqa: E402
+from tests.support import committed_source  # noqa: E402
 from tools import build_release  # noqa: E402
-
-
-def committed_source(target: pathlib.Path) -> tuple[pathlib.Path, str]:
-    target.mkdir()
-    for name in ("skill", "src"):
-        shutil.copytree(ROOT / name, target / name)
-    for name in ("LICENSE", "VERSION"):
-        shutil.copy2(ROOT / name, target / name)
-    for command in (
-        ("git", "init", "-q"),
-        ("git", "config", "user.name", "Coordinator Tests"),
-        ("git", "config", "user.email", "tests@example.invalid"),
-        ("git", "add", "skill", "src/coordinator", "LICENSE", "VERSION"),
-        ("git", "commit", "-qm", "fixture"),
-    ):
-        subprocess.run(command, cwd=target, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    commit = subprocess.run(
-        ("git", "rev-parse", "HEAD"), cwd=target, check=True, text=True, stdout=subprocess.PIPE
-    ).stdout.strip()
-    return target, commit
 
 
 def recovery_journal(owned: standalone.Paths, phase: str, transaction: str) -> dict:
@@ -99,7 +80,7 @@ class GlobalInstallTests(unittest.TestCase):
         config = self.home / ".codex" / "config.toml"
         config.parent.mkdir()
         config.write_text('# user comment\nmodel = "gpt-user"\n', encoding="utf-8")
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         result = standalone.ensure_global(package, between_sessions=True)
         self.assertTrue(result["changed"])
         self.assertTrue(result["new_session_required"])
@@ -122,7 +103,9 @@ class GlobalInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(standalone.InstallError, "package mode mismatch"):
                 standalone.verify_directory(owned.package)
         with mock.patch.object(standalone.os, "name", "nt"):
-            self.assertEqual(standalone.verify_directory(owned.package).version, "3.0.0")
+            windows_package = standalone.verify_directory(owned.package)
+            self.assertEqual(windows_package.version, "3.0.0")
+            self.assertEqual(windows_package.content_digest, package.content_digest)
         reparse = mock.Mock(
             st_mode=owned.package.lstat().st_mode,
             st_file_attributes=getattr(standalone.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
@@ -175,8 +158,15 @@ class GlobalInstallTests(unittest.TestCase):
         path = self.base / "tampered.zip"
         path.write_bytes(tampered)
         with self.assertRaises(standalone.InstallError):
-            standalone.acquire_source(str(path), None, None)
+            standalone.acquire_source(str(path), None)
         self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_default_source_downloads_only_the_latest_archive(self) -> None:
+        archive = (self.release / "coordinator-latest.zip").read_bytes()
+        with mock.patch.object(standalone, "_download", return_value=archive) as download:
+            package = standalone.acquire_source(None, None)
+        self.assertEqual(package.version, "3.0.0")
+        download.assert_called_once_with(standalone.DEFAULT_RELEASE + "/coordinator-latest.zip")
 
     def test_install_rejects_dangling_owned_leaf_before_transaction(self) -> None:
         owned = standalone.paths()
@@ -203,7 +193,7 @@ class GlobalInstallTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = standalone.main(command)
-        self.assertEqual((code, json.loads(output.getvalue())["code"]), (0, "install_updated"))
+        self.assertEqual((code, json.loads(output.getvalue())["code"]), (0, "install_changed"))
 
     def test_installer_rejects_unlisted_and_unsupported_zip_entries(self) -> None:
         archive = io.BytesIO((self.release / "coordinator-3.0.0.zip").read_bytes())
@@ -241,7 +231,7 @@ class GlobalInstallTests(unittest.TestCase):
                 self.assertEqual(list(self.home.iterdir()), [])
 
     def test_status_reports_symlinked_home_without_writing(self) -> None:
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         standalone.ensure_global(package, between_sessions=True)
         before = {path.relative_to(self.home): path.stat().st_mtime_ns for path in self.home.rglob("*")}
         home_link = self.base / "home-link"
@@ -260,7 +250,7 @@ class GlobalInstallTests(unittest.TestCase):
         config.parent.mkdir()
         original = "[agents]\nenabled = true\n"
         config.write_text(original, encoding="utf-8")
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         with self.assertRaisesRegex(standalone.InstallError, "not Coordinator-owned"):
             standalone.ensure_global(package, between_sessions=True)
         self.assertEqual(config.read_text(encoding="utf-8"), original)
@@ -281,7 +271,7 @@ class GlobalInstallTests(unittest.TestCase):
         config = self.home / ".codex" / "config.toml"
         config.parent.mkdir()
         config.write_text('model = "before"\n', encoding="utf-8")
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         real_lock = standalone._install_lock
 
         @contextlib.contextmanager
@@ -333,8 +323,8 @@ class GlobalInstallTests(unittest.TestCase):
         self.assertTrue(victim.is_file())
         self.assertTrue(cache.is_dir())
 
-    def test_interrupted_update_rolls_back_and_committed_recovery_finalizes(self) -> None:
-        first = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+    def test_interrupted_reinstall_rolls_back_and_committed_recovery_finalizes(self) -> None:
+        first = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         standalone.ensure_global(first, between_sessions=True)
         second_release = self.base / "second-release"
         subprocess.run(
@@ -348,7 +338,7 @@ class GlobalInstallTests(unittest.TestCase):
             ("git", "rev-parse", "HEAD"), cwd=self.source, check=True, text=True, stdout=subprocess.PIPE
         ).stdout.strip()
         build_release.build(self.source, second_release, second_commit)
-        second = standalone.acquire_source(str(second_release / "coordinator-3.0.0.zip"), None, None)
+        second = standalone.acquire_source(str(second_release / "coordinator-3.0.0.zip"), None)
         owned = standalone.paths()
         real_replace = os.replace
 
@@ -377,7 +367,7 @@ class GlobalInstallTests(unittest.TestCase):
         self.assertTrue(standalone.inspect()["current"])
 
     def test_recovery_rejects_missing_and_invalid_required_backups(self) -> None:
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         standalone.ensure_global(package, between_sessions=True)
         owned = standalone.paths()
         transaction = "1" * 24
@@ -401,7 +391,7 @@ class GlobalInstallTests(unittest.TestCase):
         self.assertTrue(owned.journal.exists())
 
     def test_recovery_revalidates_ancestors_after_lock_acquisition(self) -> None:
-        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None, None)
+        package = standalone.acquire_source(str(self.release / "coordinator-3.0.0.zip"), None)
         standalone.ensure_global(package, between_sessions=True)
         owned = standalone.paths()
         transaction = "2" * 24

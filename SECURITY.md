@@ -8,7 +8,7 @@ The latest 3.x release receives security fixes. Version 2 and earlier are unsupp
 
 Use the repository's private GitHub Security Advisory reporting flow. Do not open a public issue for credential exposure, archive/path traversal, install ownership, controller fencing, dashboard authorization, or stored-content execution concerns.
 
-Include the affected version, operating system, reproduction, impact, and whether any bearer or API credential may have been exposed. Do not include live secrets; revoke them first. Maintainers will acknowledge a report, coordinate validation and remediation privately, and publish an advisory when affected users have a safe update path.
+Include the affected version, operating system, reproduction, impact, and whether any bearer or API credential may have been exposed. Do not include live secrets; revoke them first. Maintainers will acknowledge a report, coordinate validation and remediation privately, and publish an advisory when a fixed release is available.
 
 ## Security boundaries
 

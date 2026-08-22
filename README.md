@@ -19,20 +19,18 @@ Coordinator globally for the current user; after success, reopen Codex in a new 
 ### Linux and macOS
 
 ```sh
-d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && curl -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o "$d/install.py" && curl -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/SHA256SUMS -o "$d/SHA256SUMS" && python3 -c 'import hashlib,pathlib,sys; d=pathlib.Path(sys.argv[1]); expected=next((line.split()[0] for line in (d/"SHA256SUMS").read_text(encoding="ascii").splitlines() if line.split()[1:]==["install.py"]), None); actual=hashlib.sha256((d/"install.py").read_bytes()).hexdigest(); sys.exit(0 if expected is not None and actual==expected else 1)' "$d" && python3 "$d/install.py" ensure-global --between-sessions
+d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && curl -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o "$d/install.py" && python3 "$d/install.py" ensure-global --between-sessions
 ```
 
 ### Windows PowerShell
 
 ```powershell
-$d=Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid()); New-Item -ItemType Directory $d | Out-Null; try { curl.exe -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o (Join-Path $d install.py); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; curl.exe -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/SHA256SUMS -o (Join-Path $d SHA256SUMS); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python -c 'import hashlib,pathlib,sys; d=pathlib.Path(sys.argv[1]); expected=next((line.split()[0] for line in (d/"SHA256SUMS").read_text(encoding="ascii").splitlines() if line.split()[1:]==["install.py"]), None); actual=hashlib.sha256((d/"install.py").read_bytes()).hexdigest(); sys.exit(0 if expected is not None and actual==expected else 1)' $d; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python (Join-Path $d install.py) ensure-global --between-sessions; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Remove-Item -Recurse -Force $d }
+$d=Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid()); New-Item -ItemType Directory $d | Out-Null; try { curl.exe -fL https://github.com/alanhoff/agent-coordinator/releases/latest/download/install.py -o (Join-Path $d install.py); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python (Join-Path $d install.py) ensure-global --between-sessions; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Remove-Item -Recurse -Force $d }
 ```
 
-Both commands download only `install.py` and `SHA256SUMS` before verification. The verified
-installer anonymously fetches and validates `manifest.json` and `coordinator-latest.zip`, checks
-their exact inventory and manifest identity, and performs a recoverable current-user transaction.
-To inspect first, download those same two files, compare the `install.py` SHA-256 entry, review the
-script, then run `python3 install.py ensure-global --between-sessions` (`python` on Windows).
+The installer anonymously fetches `coordinator-latest.zip`, rejects unsafe archives or missing
+runtime entry points, and performs a recoverable current-user transaction. To inspect it first, download
+and review `install.py`, then run the same `ensure-global --between-sessions` command.
 
 ## Why Coordinator
 
@@ -47,8 +45,8 @@ script, then run `python3 install.py ensure-global --between-sessions` (`python`
   and workflow state live under current-user global locations, never in the target repository.
 - **Observation cannot steer execution.** The dashboard reads committed snapshots and exposes no
   workflow mutation endpoint.
-- **The release surface is closed.** Deterministic release builds have an exact inventory and an
-  independent verifier. The Python 3.11+ runtime uses only the standard library.
+- **The release surface is small.** Each release contains the standalone installer and canonical
+  package archives. The Python 3.11+ runtime uses only the standard library.
 
 ## Give Codex a controller brief
 
@@ -82,8 +80,8 @@ and validate rollback and forward-migration behavior before finishing.
 **Audit a release without modifying it**
 
 ```text
-$coordinator Perform a read-only release audit. Compare the tag, manifest, checksums, archive
-inventory, and documented install contract. Assign bounded research and validation scopes, make no
+$coordinator Perform a read-only release audit. Compare the tag, package version, archive inventory,
+installer source, and documented install contract. Assign bounded research and validation scopes, make no
 repository changes, and return findings with exact evidence and unresolved limitations.
 ```
 
@@ -135,30 +133,29 @@ python3 ~/.agents/skills/coordinator/scripts/dashboard.py serve --workflow-id WO
 python3 ~/.agents/skills/coordinator/scripts/dashboard.py render --workflow-id WORKFLOW --out /explicit/report.html
 ```
 
-## Global footprint, updates, and migration
+## Global footprint and migration
 
 | Current-user location | Contents |
 |---|---|
-| `~/.agents/skills/coordinator` | Verified package and controller protocol |
+| `~/.agents/skills/coordinator` | Installed package and controller protocol |
 | `~/.codex/agents/coordinator` | Eight role definitions |
 | `~/.codex/config.toml` | Coordinator-owned marked semantic keys; unrelated configuration is preserved |
 | `~/.agent-coordinator` | Private metadata, locks, recovery, sessions, and workflow state |
 
 Coordinator creates no hooks, state, locks, roles, configuration, or package files in repositories it
-orchestrates. Version 3 does **not** automatically adopt, update, or delete a v2 project-local
-installation. Review and remove the old Coordinator-only project commit or files with version control,
-preserving your changes, then install v3 globally and run preflight.
+orchestrates. Version 3 does **not** automatically adopt or delete a v2 project-local installation.
+Review and remove the old Coordinator-only project commit or files with version control, preserving
+your changes, then install v3 globally and run preflight.
 
 Between Codex sessions:
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/install.py status
-python3 ~/.agents/skills/coordinator/scripts/install.py check-updates
 python3 ~/.agents/skills/coordinator/scripts/install.py ensure-global --between-sessions
 ```
 
-`check-updates` exits 1 when an update is available. If installation was interrupted, first run the
-zero-write `install.py recovery-status --json` and use only the exact rollback command it returns.
+If installation was interrupted, first run the zero-write `install.py recovery-status --json` and
+use only the exact rollback command it returns.
 
 ## Project
 

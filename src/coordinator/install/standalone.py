@@ -29,8 +29,6 @@ from typing import Any, Iterator, Mapping, Sequence
 
 NAME = "coordinator"
 VERSION = "3.0.0"
-OWNER = "alanhoff/agent-coordinator"
-MANIFEST_SCHEMA = 1
 INSTALL_SCHEMA = 3
 PACKAGE_MARKER_SCHEMA = 1
 ROLES = (
@@ -50,16 +48,17 @@ REQUIRED_PATHS = {
     "references/model-routing.md", "references/state-schema.md", "references/workflow-protocol.md", "references/dashboard.md",
     "scripts/coordinator_state.py", "scripts/doctor.py", "scripts/install.py", "scripts/model_router.py", "scripts/dashboard.py",
     "scripts/install.sh", "scripts/install.cmd",
-    "scripts/lib/coordinator/__init__.py", "scripts/lib/coordinator/cli/state.py",
+    "scripts/lib/coordinator/__init__.py", "scripts/lib/coordinator/cli/__init__.py",
+    "scripts/lib/coordinator/cli/state.py",
     "scripts/lib/coordinator/cli/routing.py", "scripts/lib/coordinator/cli/dashboard.py",
     "scripts/lib/coordinator/cli/doctor.py", "scripts/lib/coordinator/cli/outcome.py",
-    "scripts/lib/coordinator/install/standalone.py", "scripts/lib/coordinator/install/doctor.py",
-    "scripts/lib/coordinator/state/store.py", "scripts/lib/coordinator/routing/selector.py",
+    "scripts/lib/coordinator/install/__init__.py", "scripts/lib/coordinator/install/standalone.py",
+    "scripts/lib/coordinator/install/doctor.py", "scripts/lib/coordinator/state/__init__.py",
+    "scripts/lib/coordinator/state/store.py", "scripts/lib/coordinator/routing/__init__.py",
+    "scripts/lib/coordinator/routing/selector.py", "scripts/lib/coordinator/dashboard/__init__.py",
     "scripts/lib/coordinator/dashboard/view.py",
     *ROLE_PATHS.values(),
 }
-
-
 class InstallError(RuntimeError):
     def __init__(self, message: str, *, code: str = "install_error", exit_code: int = 20):
         super().__init__(message)
@@ -94,71 +93,32 @@ def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _strict_json(data: bytes, field: str) -> Any:
+def _strict_json(data: bytes, field: str, *, code: str = "invalid_data") -> Any:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in items:
             if key in result:
-                raise InstallError(f"{field} contains duplicate key {key!r}", code="invalid_manifest")
+                raise InstallError(f"{field} contains duplicate key {key!r}", code=code)
             result[key] = value
         return result
 
     try:
         return json.loads(data.decode("utf-8"), object_pairs_hook=pairs)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise InstallError(f"{field} is not valid UTF-8 JSON", code="invalid_manifest") from exc
-
-
-def _safe_relative(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or re.match(r"^[A-Za-z]:", value):
-        raise InstallError(f"{field} contains an unsafe path", code="invalid_manifest")
-    parts = pathlib.PurePosixPath(value).parts
-    if not parts or any(part in ("", ".", "..") for part in parts) or pathlib.PurePosixPath(value).as_posix() != value:
-        raise InstallError(f"{field} contains an unsafe path", code="invalid_manifest")
-    return value
-
-
-def _manifest(data: bytes) -> dict[str, Any]:
-    value = _strict_json(data, "manifest")
-    expected = {"schema_version", "name", "owner", "version", "source_commit", "files", "roles"}
-    if not isinstance(value, dict) or set(value) != expected:
-        raise InstallError("manifest fields are not the closed v3 schema", code="invalid_manifest")
-    if value["schema_version"] != MANIFEST_SCHEMA or value["name"] != NAME or value["owner"] != OWNER:
-        raise InstallError("manifest identity/schema is invalid", code="invalid_manifest")
-    if not isinstance(value["version"], str) or not SEMVER_RE.fullmatch(value["version"]):
-        raise InstallError("manifest version is not SemVer", code="invalid_manifest")
-    if not isinstance(value["source_commit"], str) or not COMMIT_RE.fullmatch(value["source_commit"]):
-        raise InstallError("manifest source_commit is not a full commit digest", code="invalid_manifest")
-    if value["roles"] != ROLE_PATHS:
-        raise InstallError("manifest must define the exact eight-role map", code="invalid_manifest")
-    files = value["files"]
-    if not isinstance(files, dict) or not files or len(files) > MAX_ARCHIVE_ENTRIES:
-        raise InstallError("manifest files must be a bounded non-empty object", code="invalid_manifest")
-    if "manifest.json" in files:
-        raise InstallError("manifest must not inventory itself", code="invalid_manifest")
-    for relative, raw_spec in files.items():
-        _safe_relative(relative, "manifest file")
-        if not isinstance(raw_spec, dict) or set(raw_spec) != {"sha256", "size", "mode"}:
-            raise InstallError(f"manifest entry is invalid: {relative}", code="invalid_manifest")
-        if not isinstance(raw_spec["sha256"], str) or not SHA256_RE.fullmatch(raw_spec["sha256"]):
-            raise InstallError(f"manifest digest is invalid: {relative}", code="invalid_manifest")
-        if not isinstance(raw_spec["size"], int) or isinstance(raw_spec["size"], bool) or not 0 <= raw_spec["size"] <= MAX_FILE_BYTES:
-            raise InstallError(f"manifest size is invalid: {relative}", code="invalid_manifest")
-        if raw_spec["mode"] not in ("file", "executable"):
-            raise InstallError(f"manifest mode is invalid: {relative}", code="invalid_manifest")
-    missing = REQUIRED_PATHS - set(files)
-    if missing:
-        raise InstallError("manifest is missing required paths: " + ", ".join(sorted(missing)), code="invalid_manifest")
-    return value
+        raise InstallError(f"{field} is not valid UTF-8 JSON", code=code) from exc
 
 
 def _marker(data: bytes) -> dict[str, Any]:
-    value = _strict_json(data, "package marker")
+    value = _strict_json(data, "package marker", code="invalid_package")
     expected = {"schema_version", "name", "version", "source_commit"}
     if not isinstance(value, dict) or set(value) != expected:
         raise InstallError("package marker fields are invalid", code="invalid_package")
     if value["schema_version"] != PACKAGE_MARKER_SCHEMA or value["name"] != NAME:
         raise InstallError("package marker identity is invalid", code="invalid_package")
+    if not isinstance(value["version"], str) or not SEMVER_RE.fullmatch(value["version"]):
+        raise InstallError("package marker version is not SemVer", code="invalid_package")
+    if not isinstance(value["source_commit"], str) or not COMMIT_RE.fullmatch(value["source_commit"]):
+        raise InstallError("package marker source commit is invalid", code="invalid_package")
     return value
 
 
@@ -166,54 +126,78 @@ def _logical_mode(mode: int) -> str:
     return "executable" if mode & 0o111 else "file"
 
 
+def _package_mode(relative: str) -> str:
+    parts = pathlib.PurePosixPath(relative).parts
+    return "executable" if len(parts) == 2 and parts[0] == "scripts" else "file"
+
+
 @dataclasses.dataclass(frozen=True)
 class VerifiedPackage:
-    manifest: Mapping[str, Any]
-    manifest_bytes: bytes
     files: Mapping[str, bytes]
+    modes: Mapping[str, str]
     label: str
     package_digest: str
     content_digest: str
-
-    @property
-    def version(self) -> str:
-        return str(self.manifest["version"])
+    version: str
+    source_commit: str
 
 
 def _verify_contents(
-    manifest_bytes: bytes,
     files: Mapping[str, bytes],
     modes: Mapping[str, str],
     *,
     label: str,
-    package_digest: str,
+    package_digest: str | None = None,
     enforce_modes: bool = True,
 ) -> VerifiedPackage:
-    manifest = _manifest(manifest_bytes)
-    expected = set(manifest["files"])
     actual = set(files)
-    if actual != expected:
-        raise InstallError(
-            "package inventory differs: missing=" + ",".join(sorted(expected - actual)) + " extra=" + ",".join(sorted(actual - expected)),
-            code="invalid_package",
-        )
-    for relative, spec in manifest["files"].items():
+    missing = REQUIRED_PATHS - actual
+    if missing:
+        raise InstallError("package is missing required paths: " + ",".join(sorted(missing)), code="invalid_package")
+    if set(modes) != actual:
+        raise InstallError("package modes do not cover the exact inventory", code="invalid_package")
+    canonical_modes = {relative: _package_mode(relative) for relative in files}
+    for relative in sorted(files):
         data = files[relative]
-        if len(data) != spec["size"] or not secrets.compare_digest(_sha256(data), spec["sha256"]):
-            raise InstallError(f"package content mismatch: {relative}", code="checksum_mismatch")
-        if enforce_modes and modes[relative] != spec["mode"]:
+        if len(data) > MAX_FILE_BYTES:
+            raise InstallError(f"package file exceeds the size limit: {relative}", code="capacity_exceeded")
+        if enforce_modes and modes[relative] != canonical_modes[relative]:
             raise InstallError(f"package mode mismatch: {relative}", code="invalid_package")
     try:
         version = files["VERSION"].decode("utf-8").strip()
     except UnicodeDecodeError as exc:
         raise InstallError("VERSION is not UTF-8", code="invalid_package") from exc
     marker = _marker(files[".coordinator-package.json"])
-    if version != manifest["version"] or marker["version"] != version or marker["source_commit"] != manifest["source_commit"]:
-        raise InstallError("VERSION, marker, and manifest do not agree", code="invalid_package")
+    if version != marker["version"] or not SEMVER_RE.fullmatch(version):
+        raise InstallError("VERSION and package marker do not agree", code="invalid_package")
+    for relative in ("scripts/lib/coordinator/__init__.py", "scripts/lib/coordinator/install/standalone.py"):
+        try:
+            source = files[relative].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InstallError(f"{relative} is not UTF-8", code="invalid_package") from exc
+        embedded = re.search(r'^VERSION = "([^"]+)"$', source, re.MULTILINE)
+        if not embedded or embedded.group(1) != version:
+            raise InstallError(f"{relative} version disagrees with VERSION", code="invalid_package")
     content_digest = _sha256(
-        manifest_bytes + b"\0" + b"".join(_sha256(files[name]).encode("ascii") for name in sorted(files))
+        b"".join(
+            name.encode("utf-8")
+            + b"\0"
+            + canonical_modes[name].encode("ascii")
+            + b"\0"
+            + len(files[name]).to_bytes(8, "big")
+            + files[name]
+            for name in sorted(files)
+        )
     )
-    return VerifiedPackage(manifest, manifest_bytes, dict(files), label, package_digest, content_digest)
+    return VerifiedPackage(
+        dict(files),
+        canonical_modes,
+        label,
+        package_digest or content_digest,
+        content_digest,
+        version,
+        str(marker["source_commit"]),
+    )
 
 
 def verify_directory(root: pathlib.Path) -> VerifiedPackage:
@@ -224,16 +208,8 @@ def verify_directory(root: pathlib.Path) -> VerifiedPackage:
         raise InstallError(f"package directory is unavailable: {root}", code="invalid_source") from exc
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info):
         raise InstallError("package source must be a real directory", code="unsafe_path")
-    manifest_path = root / "manifest.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise InstallError("package manifest is missing or unsafe", code="invalid_source")
-    if manifest_path.stat().st_size > 4 * 1024 * 1024:
-        raise InstallError("package manifest exceeds the size limit", code="capacity_exceeded")
-    manifest_bytes = manifest_path.read_bytes()
-    manifest = _manifest(manifest_bytes)
     files: dict[str, bytes] = {}
     modes: dict[str, str] = {}
-    observed: set[str] = set()
     for path in root.rglob("*"):
         relative = path.relative_to(root).as_posix()
         item = path.lstat()
@@ -242,32 +218,22 @@ def verify_directory(root: pathlib.Path) -> VerifiedPackage:
         if stat.S_ISREG(item.st_mode):
             if item.st_nlink != 1:
                 raise InstallError(f"package file has unexpected hard links: {relative}", code="unsafe_path")
-            if relative == "manifest.json":
-                continue
-            observed.add(relative)
-            if relative not in manifest["files"]:
-                raise InstallError(f"package contains unlisted file: {relative}", code="invalid_package")
-            if item.st_size != manifest["files"][relative]["size"]:
-                raise InstallError(f"package file size mismatch: {relative}", code="checksum_mismatch")
+            if item.st_size > MAX_FILE_BYTES:
+                raise InstallError(f"package file exceeds the size limit: {relative}", code="capacity_exceeded")
             files[relative] = path.read_bytes()
             modes[relative] = _logical_mode(item.st_mode)
-    if observed != set(manifest["files"]):
-        raise InstallError("package directory is incomplete", code="invalid_package")
-    digest = _sha256(manifest_bytes + b"\0" + b"".join(_sha256(files[name]).encode() for name in sorted(files)))
+    if len(files) > MAX_ARCHIVE_ENTRIES or sum(len(data) for data in files.values()) > MAX_ARCHIVE_BYTES:
+        raise InstallError("package directory violates entry or size limits", code="capacity_exceeded")
     return _verify_contents(
-        manifest_bytes,
         files,
         modes,
         label=str(root.resolve()),
-        package_digest=digest,
         enforce_modes=os.name != "nt",
     )
 
 
-def verify_zip(data: bytes, *, label: str, exact_sha256: str | None = None, external_manifest: bytes | None = None) -> VerifiedPackage:
+def verify_zip(data: bytes, *, label: str) -> VerifiedPackage:
     digest = _sha256(data)
-    if exact_sha256 is not None and not secrets.compare_digest(digest, exact_sha256.lower()):
-        raise InstallError("ZIP digest does not match the supplied SHA-256", code="checksum_mismatch")
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise InstallError("ZIP exceeds the download size limit", code="capacity_exceeded")
     end = data.rfind(b"PK\x05\x06")
@@ -289,7 +255,6 @@ def verify_zip(data: bytes, *, label: str, exact_sha256: str | None = None, exte
         seen: set[str] = set()
         payloads: dict[str, bytes] = {}
         modes: dict[str, str] = {}
-        manifest_bytes = None
         for item in entries:
             name = item.filename
             if "\\" in name or name.startswith("/") or item.file_size > MAX_FILE_BYTES:
@@ -313,18 +278,9 @@ def verify_zip(data: bytes, *, label: str, exact_sha256: str | None = None, exte
                 raise InstallError("ZIP entry uses unsupported encryption or compression", code="invalid_package") from exc
             if len(content) != item.file_size:
                 raise InstallError(f"ZIP entry was truncated: {relative}", code="invalid_package")
-            if relative == "manifest.json":
-                if _logical_mode(unix_mode) != "file":
-                    raise InstallError("ZIP manifest mode is invalid", code="invalid_package")
-                manifest_bytes = content
-            else:
-                payloads[relative] = content
-                modes[relative] = _logical_mode(unix_mode)
-        if manifest_bytes is None:
-            raise InstallError("ZIP has no root manifest", code="invalid_package")
-        if external_manifest is not None and not secrets.compare_digest(manifest_bytes, external_manifest):
-            raise InstallError("standalone and ZIP-root manifests differ", code="checksum_mismatch")
-        return _verify_contents(manifest_bytes, payloads, modes, label=label, package_digest=digest)
+            payloads[relative] = content
+            modes[relative] = _logical_mode(unix_mode)
+        return _verify_contents(payloads, modes, label=label, package_digest=digest)
 
 
 def _download(url: str, *, maximum: int = MAX_DOWNLOAD_BYTES) -> bytes:
@@ -348,31 +304,9 @@ def _download(url: str, *, maximum: int = MAX_DOWNLOAD_BYTES) -> bytes:
     return data
 
 
-def _checksums(data: bytes) -> dict[str, str]:
-    try:
-        lines = data.decode("ascii").splitlines()
-    except UnicodeDecodeError as exc:
-        raise InstallError("SHA256SUMS is not ASCII", code="invalid_checksums") from exc
-    result: dict[str, str] = {}
-    for line in lines:
-        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
-        if not match or match.group(2) in result:
-            raise InstallError("SHA256SUMS has invalid or duplicate entries", code="invalid_checksums")
-        result[match.group(2)] = match.group(1)
-    stable = {"coordinator-latest.zip", "install.py", "manifest.json"}
-    versioned = [name for name in result if re.fullmatch(r"coordinator-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.zip", name)]
-    if not stable <= set(result) or len(result) != 4 or len(versioned) != 1:
-        raise InstallError("SHA256SUMS must cover the exact four payload assets", code="invalid_checksums")
-    return result
-
-
-def acquire_source(source: str | None, source_url: str | None, source_sha256: str | None) -> VerifiedPackage:
-    if source and (source_url or source_sha256):
+def acquire_source(source: str | None, source_url: str | None) -> VerifiedPackage:
+    if source and source_url:
         raise InstallError("--source cannot be combined with network source arguments", code="invalid_invocation", exit_code=2)
-    if source_url and not source_sha256:
-        raise InstallError("custom --source-url requires --source-sha256", code="invalid_invocation", exit_code=2)
-    if source_sha256 and (not source_url or not SHA256_RE.fullmatch(source_sha256.lower())):
-        raise InstallError("--source-sha256 must be 64 lowercase hexadecimal characters", code="invalid_invocation", exit_code=2)
     if source:
         path = pathlib.Path(source).expanduser()
         if path.is_dir():
@@ -382,16 +316,9 @@ def acquire_source(source: str | None, source_url: str | None, source_sha256: st
         raise InstallError("local source must be a package directory or ZIP", code="invalid_source", exit_code=2)
     if source_url:
         data = _download(source_url)
-        return verify_zip(data, label=source_url, exact_sha256=source_sha256)
-    sums_data = _download(DEFAULT_RELEASE + "/SHA256SUMS", maximum=64 * 1024)
-    sums = _checksums(sums_data)
-    manifest_data = _download(DEFAULT_RELEASE + "/manifest.json", maximum=4 * 1024 * 1024)
+        return verify_zip(data, label=source_url)
     zip_data = _download(DEFAULT_RELEASE + "/coordinator-latest.zip")
-    if not secrets.compare_digest(_sha256(manifest_data), sums["manifest.json"]):
-        raise InstallError("release manifest checksum mismatch", code="checksum_mismatch")
-    if not secrets.compare_digest(_sha256(zip_data), sums["coordinator-latest.zip"]):
-        raise InstallError("release ZIP checksum mismatch", code="checksum_mismatch")
-    return verify_zip(zip_data, label=DEFAULT_RELEASE, external_manifest=manifest_data)
+    return verify_zip(zip_data, label=DEFAULT_RELEASE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,9 +623,7 @@ def _write_package(directory: pathlib.Path, package: VerifiedPackage) -> None:
         target = directory.joinpath(*pathlib.PurePosixPath(relative).parts)
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         target.write_bytes(package.files[relative])
-        os.chmod(target, 0o755 if package.manifest["files"][relative]["mode"] == "executable" else 0o644)
-    (directory / "manifest.json").write_bytes(package.manifest_bytes)
-    os.chmod(directory / "manifest.json", 0o644)
+        os.chmod(target, 0o755 if package.modes[relative] == "executable" else 0o644)
 
 
 def _write_roles(directory: pathlib.Path, package: VerifiedPackage) -> None:
@@ -730,7 +655,7 @@ def _valid_roles(path: pathlib.Path, package: VerifiedPackage | None = None) -> 
                 or (os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077))
             ):
                 return False
-            if package and not secrets.compare_digest(_sha256(item.read_bytes()), package.manifest["files"][relative]["sha256"]):
+            if package and not secrets.compare_digest(item.read_bytes(), package.files[relative]):
                 return False
     except OSError:
         return False
@@ -773,8 +698,8 @@ def _metadata(package: VerifiedPackage, transaction: str) -> dict[str, Any]:
         "schema_version": INSTALL_SCHEMA,
         "name": NAME,
         "version": package.version,
-        "source_commit": package.manifest["source_commit"],
-        "manifest_sha256": _sha256(package.manifest_bytes),
+        "source_commit": package.source_commit,
+        "content_digest": package.content_digest,
         "package_digest": package.package_digest,
         "transaction": transaction,
         "installed_at": _now(),
@@ -794,8 +719,8 @@ def _read_metadata(owned: Paths) -> dict[str, Any] | None:
         or (os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077))
     ):
         raise InstallError("install metadata path is unsafe", code="unsafe_path")
-    value = _strict_json(owned.metadata.read_bytes(), "install metadata")
-    expected = {"schema_version", "name", "version", "source_commit", "manifest_sha256", "package_digest", "transaction", "installed_at"}
+    value = _strict_json(owned.metadata.read_bytes(), "install metadata", code="invalid_metadata")
+    expected = {"schema_version", "name", "version", "source_commit", "content_digest", "package_digest", "transaction", "installed_at"}
     if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != INSTALL_SCHEMA or value["name"] != NAME:
         raise InstallError("install metadata is invalid", code="invalid_metadata")
     return value
@@ -835,7 +760,11 @@ def inspect(owned: Paths | None = None) -> dict[str, Any]:
     except InstallError as exc:
         mismatches.append("metadata:" + exc.code)
     if package and metadata:
-        if metadata["version"] != package.version or metadata["source_commit"] != package.manifest["source_commit"] or metadata["manifest_sha256"] != _sha256(package.manifest_bytes):
+        if (
+            metadata["version"] != package.version
+            or metadata["source_commit"] != package.source_commit
+            or metadata["content_digest"] != package.content_digest
+        ):
             mismatches.append("metadata:drift")
     elif package or metadata:
         mismatches.append("ownership:incomplete")
@@ -849,7 +778,7 @@ def inspect(owned: Paths | None = None) -> dict[str, Any]:
         "installed": package is not None and metadata is not None,
         "current": not mismatches,
         "version": package.version if package else None,
-        "source_commit": package.manifest["source_commit"] if package else None,
+        "source_commit": package.source_commit if package else None,
         "mismatches": mismatches,
         "new_session_required": False,
     }
@@ -948,7 +877,7 @@ def _journal(owned: Paths) -> dict[str, Any] | None:
     raw = _safe_file_bytes(owned.journal, maximum=16 * 1024 * 1024, private=True)
     if raw is None:
         return None
-    value = _strict_json(raw, "recovery journal")
+    value = _strict_json(raw, "recovery journal", code="invalid_recovery")
     expected = {
         "schema_version", "transaction", "package_digest", "package_content_digest", "roles_content_digest",
         "config_digest", "metadata_digest", "phase", "package_backup", "roles_backup",
@@ -1150,8 +1079,8 @@ def _finalize_converged(owned: Paths, journal: Mapping[str, Any]) -> bool:
             and secrets.compare_digest(_sha256(metadata_bytes), journal["metadata_digest"])
             and metadata["package_digest"] == journal["package_digest"]
             and metadata["version"] == package.version
-            and metadata["source_commit"] == package.manifest["source_commit"]
-            and metadata["manifest_sha256"] == _sha256(package.manifest_bytes)
+            and metadata["source_commit"] == package.source_commit
+            and metadata["content_digest"] == package.content_digest
             and _config_current(owned.config)
         )
     except InstallError:
@@ -1173,7 +1102,7 @@ def ensure_global(package: VerifiedPackage, *, between_sessions: bool) -> dict[s
         journal_info = _safe_leaf(owned.journal, directory=False, private=True, error_code="unsafe_path")
         if installed["version"] and tuple(map(int, package.version.split("."))) < tuple(map(int, installed["version"].split("."))):
             raise InstallError("downgrade is not supported", code="downgrade_rejected", exit_code=2)
-        if installed["current"] and installed["version"] == package.version and installed["source_commit"] == package.manifest["source_commit"]:
+        if installed["current"] and installed["version"] == package.version and installed["source_commit"] == package.source_commit:
             return {**installed, "changed": False, "new_session_required": False}
         if journal_info is not None:
             raise InstallError("an install recovery journal is pending", code="recovery_required")
@@ -1191,8 +1120,8 @@ def ensure_global(package: VerifiedPackage, *, between_sessions: bool) -> dict[s
             if (
                 prior_metadata is None
                 or prior_metadata["version"] != prior_package.version
-                or prior_metadata["source_commit"] != prior_package.manifest["source_commit"]
-                or prior_metadata["manifest_sha256"] != _sha256(prior_package.manifest_bytes)
+                or prior_metadata["source_commit"] != prior_package.source_commit
+                or prior_metadata["content_digest"] != prior_package.content_digest
             ):
                 raise InstallError("existing package ownership evidence differs", code="ambiguous_target")
         elif prior_metadata is not None:
@@ -1365,7 +1294,6 @@ def _emit(command: str, code: str, data: Any, *, exit_code: int = 0, as_json: bo
 def _source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source")
     parser.add_argument("--source-url")
-    parser.add_argument("--source-sha256")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1377,9 +1305,6 @@ def build_parser() -> argparse.ArgumentParser:
     ensure.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     status.add_argument("--json", action="store_true")
-    check = sub.add_parser("check-updates")
-    _source_arguments(check)
-    check.add_argument("--json", action="store_true")
     probe = sub.add_parser("home-probe")
     probe.add_argument("--json", action="store_true")
     cleanup = sub.add_parser("cleanup")
@@ -1412,18 +1337,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if sys.version_info < (3, 11):
             raise InstallError("Python 3.11 or newer is required", code="unsupported_python")
         if args.command == "ensure-global":
-            package = acquire_source(args.source, args.source_url, args.source_sha256)
+            package = acquire_source(args.source, args.source_url)
             result = ensure_global(package, between_sessions=args.between_sessions)
-            return _emit(args.command, "install_current" if not result["changed"] else "install_updated", result, as_json=args.json, new_session=result["new_session_required"])
+            return _emit(args.command, "install_current" if not result["changed"] else "install_changed", result, as_json=args.json, new_session=result["new_session_required"])
         if args.command == "status":
             result = inspect()
             return _emit(args.command, "install_current" if result["current"] else "install_drift", result, exit_code=0 if result["current"] else 1, as_json=args.json)
-        if args.command == "check-updates":
-            installed = inspect()
-            package = acquire_source(args.source, args.source_url, args.source_sha256)
-            available = installed["version"] is None or tuple(map(int, package.version.split("."))) > tuple(map(int, installed["version"].split(".")))
-            result = {"installed_version": installed["version"], "available_version": package.version, "update_available": available}
-            return _emit(args.command, "update_available" if available else "up_to_date", result, exit_code=1 if available else 0, as_json=args.json)
         if args.command == "home-probe":
             owned = paths()
             data = {"home": str(owned.home), "package": str(owned.package), "roles": str(owned.roles), "config": str(owned.config), "control": str(owned.control)}

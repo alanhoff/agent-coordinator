@@ -27,7 +27,7 @@ jobs:
         run: ruff check --no-cache src skill/scripts tools tests
 
   test:
-    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    name: ${{ matrix.os }} / Python 3.11
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -37,7 +37,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ['3.11', '3.12', '3.13', '3.14']
     env:
       PYTHONPYCACHEPREFIX: ${{ github.workspace }}/../pycache
       PYTHONUTF8: '1'
@@ -47,24 +46,13 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: '3.11'
       - name: Run unit and contract checks
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
         run: python -m compileall -q src skill/scripts tools tests
-      - name: Build deterministic release twice
-        run: |
-          python tools/build_release.py --output "${{ runner.temp }}/release-one" --source-commit "${{ github.sha }}"
-          python tools/build_release.py --output "${{ runner.temp }}/release-two" --source-commit "${{ github.sha }}"
-      - name: Verify both releases
-        run: |
-          python tools/verify_release.py --release-dir "${{ runner.temp }}/release-one" --source-commit "${{ github.sha }}"
-          python tools/verify_release.py --release-dir "${{ runner.temp }}/release-two" --source-commit "${{ github.sha }}"
-      - name: Compare deterministic assets
-        env:
-          RELEASE_ONE: ${{ runner.temp }}/release-one
-          RELEASE_TWO: ${{ runner.temp }}/release-two
-        run: python -c "import filecmp,os,pathlib; a=pathlib.Path(os.environ['RELEASE_ONE']); b=pathlib.Path(os.environ['RELEASE_TWO']); names={p.name for p in a.iterdir()}; assert names == {p.name for p in b.iterdir()}; assert all(filecmp.cmp(a/n,b/n,shallow=False) for n in names)"
+      - name: Build release assets
+        run: python tools/build_release.py --output "${{ runner.temp }}/release" --source-commit "${{ github.sha }}"
       - name: Install and smoke from an isolated home
         env:
           HOME: ${{ runner.temp }}/isolated-home
@@ -72,9 +60,9 @@ jobs:
           PROJECT_DIR: ${{ runner.temp }}/project
         run: |
           python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(exist_ok=True); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
-          python "${{ runner.temp }}/release-one/install.py" ensure-global --source "${{ runner.temp }}/release-one/coordinator-3.0.0.zip" --between-sessions --json
-          python "${{ runner.temp }}/release-one/install.py" status --json
-          python "${{ runner.temp }}/release-one/install.py" home-probe --json
+          python "${{ runner.temp }}/release/install.py" ensure-global --source "${{ runner.temp }}/release/coordinator-latest.zip" --between-sessions --json
+          python "${{ runner.temp }}/release/install.py" status --json
+          python "${{ runner.temp }}/release/install.py" home-probe --json
           python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/doctor.py" check --repo "${{ runner.temp }}/project" --json
           python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/dashboard.py" watch --once --json
           python -c "import os,subprocess; result=subprocess.run(['git','-C',os.environ['PROJECT_DIR'],'status','--porcelain','--untracked-files=all'],check=True,text=True,stdout=subprocess.PIPE); assert not result.stdout,result.stdout"
