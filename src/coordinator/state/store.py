@@ -16,8 +16,6 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
-from coordinator import VERSION
-
 SCHEMA_VERSION = 3
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_NODES = 128
@@ -355,14 +353,14 @@ def validate_state(state: Any) -> dict[str, Any]:
     top = _keys(
         state,
         {
-            "schema_version", "workflow_id", "repository", "task", "status", "phase", "version",
+            "schema_version", "workflow_id", "repository", "task", "status", "phase",
             "revision", "created_at", "updated_at", "conventions", "nodes", "requirements",
             "decisions", "blockers", "events", "git", "controller", "receipts",
         },
         "state",
     )
-    if top["schema_version"] != SCHEMA_VERSION or top["version"] != VERSION:
-        raise StateError("unsupported state schema or Coordinator version", code="unsupported_state")
+    if top["schema_version"] != SCHEMA_VERSION:
+        raise StateError("unsupported state schema", code="unsupported_state")
     _identifier(top["workflow_id"], "workflow_id")
     repository = _keys(top["repository"], {"path", "identity"}, "repository")
     _text(repository["path"], "repository.path", maximum=4096)
@@ -666,7 +664,6 @@ def new_state(repository: Mapping[str, str], task: str, session_id: str, convent
         "task": _text(task, "task"),
         "status": "planning",
         "phase": "planning",
-        "version": VERSION,
         "revision": 0,
         "created_at": created,
         "updated_at": created,

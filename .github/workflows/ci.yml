@@ -24,7 +24,7 @@ jobs:
       - name: Install pinned development linter
         run: python -m pip install --disable-pip-version-check --no-cache-dir ruff==0.16.2
       - name: Lint
-        run: ruff check --no-cache src skill/scripts tools tests
+        run: ruff check --no-cache src skill/scripts tests
 
   test:
     name: ${{ matrix.os }} / Python 3.11
@@ -50,21 +50,6 @@ jobs:
       - name: Run unit and contract checks
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
-        run: python -m compileall -q src skill/scripts tools tests
-      - name: Build release assets
-        run: python tools/build_release.py --output "${{ runner.temp }}/release" --source-commit "${{ github.sha }}"
-      - name: Install and smoke from an isolated home
-        env:
-          HOME: ${{ runner.temp }}/isolated-home
-          USERPROFILE: ${{ runner.temp }}/isolated-home
-          PROJECT_DIR: ${{ runner.temp }}/project
-        run: |
-          python -c "import os,pathlib,subprocess; home=pathlib.Path(os.environ['HOME']); project=pathlib.Path(os.environ['PROJECT_DIR']); home.mkdir(exist_ok=True); project.mkdir(); (project/'sentinel.txt').write_text('unchanged\n',encoding='utf-8'); subprocess.run(['git','init',str(project)],check=True); subprocess.run(['git','-C',str(project),'add','sentinel.txt'],check=True); subprocess.run(['git','-C',str(project),'-c','user.name=CI','-c','user.email=ci@example.invalid','commit','-m','baseline'],check=True)"
-          python "${{ runner.temp }}/release/install.py" ensure-global --source "${{ runner.temp }}/release/coordinator-latest.zip" --between-sessions --json
-          python "${{ runner.temp }}/release/install.py" status --json
-          python "${{ runner.temp }}/release/install.py" home-probe --json
-          python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/doctor.py" check --repo "${{ runner.temp }}/project" --json
-          python "${{ runner.temp }}/isolated-home/.agents/skills/coordinator/scripts/dashboard.py" watch --once --json
-          python -c "import os,subprocess; result=subprocess.run(['git','-C',os.environ['PROJECT_DIR'],'status','--porcelain','--untracked-files=all'],check=True,text=True,stdout=subprocess.PIPE); assert not result.stdout,result.stdout"
+        run: python -m compileall -q src skill/scripts tests
       - name: Confirm the checkout stayed clean
         run: python -c "import subprocess; result=subprocess.run(['git','status','--porcelain','--untracked-files=all'],check=True,text=True,stdout=subprocess.PIPE); assert not result.stdout,result.stdout"

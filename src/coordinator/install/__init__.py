@@ -1,1 +1,0 @@
-"""Current-user installation ownership."""

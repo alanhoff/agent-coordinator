@@ -5,65 +5,96 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import tomllib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from coordinator import VERSION  # noqa: E402
-from coordinator.install import standalone  # noqa: E402
+from coordinator.state.store import new_state  # noqa: E402
+
+EXPECTED_ROLES = {
+    "architect",
+    "designer",
+    "documenter",
+    "fixer",
+    "implementer",
+    "researcher",
+    "reviewer",
+    "validator",
+}
 
 
 class PublicContractTests(unittest.TestCase):
-    def test_v3_source_and_public_metadata_are_complete(self) -> None:
-        self.assertEqual(VERSION, "3.0.0")
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), VERSION)
-        for path in (
-            "README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "pyproject.toml",
-            "skill/SKILL.md", "skill/README.md", "skill/agents/openai.yaml",
-            "tools/build_release.py",
+    def test_surviving_source_and_metadata_are_complete(self) -> None:
+        for relative in (
+            "README.md",
+            "INSTALL.md",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "LICENSE",
+            "pyproject.toml",
+            "skill/SKILL.md",
+            "skill/README.md",
+            "skill/agents/openai.yaml",
+            "skill/scripts/coordinator_state.py",
+            "skill/scripts/model_router.py",
         ):
-            self.assertTrue((ROOT / path).is_file(), path)
-        for owner in ("install", "state", "routing", "dashboard", "cli"):
-            self.assertTrue((ROOT / "src" / "coordinator" / owner).is_dir(), owner)
+            self.assertTrue((ROOT / relative).is_file(), relative)
+
+        owners = {
+            path.name
+            for path in (ROOT / "src" / "coordinator").iterdir()
+            if path.is_dir() and path.name != "__pycache__"
+        }
+        self.assertEqual(owners, {"cli", "routing", "state"})
+        configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertNotIn("project", configuration)
+        self.assertEqual(configuration["tool"]["ruff"]["target-version"], "py311")
+        self.assertNotIn("VER" + "SION", (ROOT / "src" / "coordinator" / "__init__.py").read_text(encoding="utf-8"))
+        state = new_state({"path": "/repository", "identity": "0" * 64}, "task", "session")
+        self.assertNotIn("version", state)
 
     def test_exact_roles_and_thin_entry_scripts(self) -> None:
         roles = ROOT / "skill" / "agents" / "roles"
-        self.assertEqual({path.stem for path in roles.glob("*.toml")}, set(standalone.ROLES))
+        self.assertEqual({path.stem for path in roles.glob("*.toml")}, EXPECTED_ROLES)
         for path in roles.glob("*.toml"):
             text = path.read_text(encoding="utf-8")
-            self.assertRegex(text, r"(?m)^name = ")
-            self.assertRegex(text, r"(?m)^description = ")
-            self.assertRegex(text, r"(?m)^developer_instructions = ")
+            role = tomllib.loads(text)
+            self.assertEqual(set(role), {"name", "description", "developer_instructions"})
+            self.assertEqual(role["name"], path.stem)
             self.assertIsNone(re.search(r"(?m)^\s*(model|model_reasoning_effort)\s*=", text))
+
         scripts = ROOT / "skill" / "scripts"
-        for name in ("install.py", "doctor.py", "coordinator_state.py", "model_router.py", "dashboard.py"):
-            source = (scripts / name).read_text(encoding="utf-8")
-            self.assertLessEqual(len(source.splitlines()), 10, name)
+        self.assertEqual({path.name for path in scripts.iterdir() if path.is_file()}, {
+            "coordinator_state.py",
+            "model_router.py",
+        })
+        for path in scripts.glob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            self.assertLessEqual(len(source.splitlines()), 10, path.name)
             self.assertIn("from coordinator", source)
-        self.assertTrue((scripts / "install.sh").is_file())
-        self.assertTrue((scripts / "install.cmd").is_file())
 
     def test_runtime_imports_only_standard_library_and_coordinator(self) -> None:
         standard = set(sys.stdlib_module_names)
         for path in (ROOT / "src" / "coordinator").rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
-                names = []
+                names: list[str] = []
                 if isinstance(node, ast.Import):
                     names = [alias.name.split(".")[0] for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.level:
-                    names = []
-                elif isinstance(node, ast.ImportFrom) and node.module:
+                elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
                     names = [node.module.split(".")[0]]
                 for name in names:
                     self.assertTrue(name == "coordinator" or name in standard, f"{path}: {name}")
 
     def test_all_python_adapters_emit_json_for_invalid_invocations(self) -> None:
         environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
-        for name in ("install.py", "doctor.py", "coordinator_state.py", "model_router.py", "dashboard.py"):
+        for name in ("coordinator_state.py", "model_router.py"):
             result = subprocess.run(
                 [sys.executable, str(ROOT / "skill" / "scripts" / name), "invalid", "--json"],
                 text=True,
@@ -75,39 +106,134 @@ class PublicContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, name)
             self.assertEqual(result.stderr, "", name)
             payload = json.loads(result.stdout)
-            self.assertEqual(
-                set(payload),
-                {"command", "status", "code", "data", "warnings", "new_session_required"},
-                name,
-            )
+            self.assertEqual(set(payload), {"command", "status", "code", "data", "warnings"}, name)
             self.assertEqual((payload["status"], payload["code"]), ("error", "invalid_invocation"), name)
 
-    def test_installer_exposes_no_update_detection_or_release_digest_option(self) -> None:
-        parser = standalone.build_parser()
-        commands = next(
-            action.choices for action in parser._actions if "ensure-global" in (getattr(action, "choices", None) or {})
-        )
+    def test_end_user_install_surface_is_exact_prose(self) -> None:
+        prompt = "Install https://github.com/alanhoff/agent-coordinator by following INSTALL.md"
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## Install\n", 1)[1].split("\n## ", 1)[0]
         self.assertEqual(
-            set(commands),
-            {"ensure-global", "status", "home-probe", "cleanup", "recovery-status", "recover-install"},
+            section,
+            "\nAsk your agent exactly:\n\n"
+            f"> `{prompt}`\n\n"
+            "The agent-facing procedure is documented in [INSTALL.md](INSTALL.md). It verifies Python 3.11 or newer,\n"
+            "places the skill and specialist roles in current-user locations, preserves unrelated configuration, and\n"
+            "checks the installed entry points before reporting success.\n",
         )
-        ensure_options = {option for action in commands["ensure-global"]._actions for option in action.option_strings}
-        self.assertEqual(
-            ensure_options,
-            {"-h", "--help", "--source", "--source-url", "--between-sessions", "--json"},
+        self.assertEqual(readme.count(prompt), 1)
+        self.assertTrue((ROOT / "INSTALL.md").is_file())
+        self.assertFalse(list((ROOT / "skill" / "scripts").glob("install.*")))
+        self.assertNotIn("project", tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8")))
+
+    def test_agent_procedure_builds_a_complete_runnable_layout(self) -> None:
+        instructions = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for required in (
+            "skill/",
+            "src/coordinator/",
+            "scripts/lib/coordinator/",
+            "~/.agents/skills/coordinator",
+            "~/.codex/agents/coordinator-architect.toml",
+            "coordinator-validator.toml",
+            "~/.codex/config.toml",
+            "max_concurrent_threads_per_session = 8",
+            "multi_agent = true",
+        ):
+            self.assertIn(required, instructions)
+        for role in EXPECTED_ROLES:
+            self.assertIn(f"coordinator-{role}.toml", instructions)
+        self.assertIn("~/.codex/agents/coordinator-*.toml", readme)
+        self.assertNotIn("~/.codex/agents/coordinator`", readme)
+        self.assertNotIn("~/.codex/agents/coordinator`", instructions)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = pathlib.Path(temporary) / "coordinator"
+            shutil.copytree(ROOT / "skill", destination)
+            shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
+            shutil.copytree(ROOT / "src" / "coordinator", destination / "scripts" / "lib" / "coordinator")
+            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            for name in ("coordinator_state.py", "model_router.py"):
+                result = subprocess.run(
+                    [sys.executable, str(destination / "scripts" / name), "invalid", "--json"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    check=False,
+                )
+                self.assertEqual((result.returncode, json.loads(result.stdout)["code"]), (2, "invalid_invocation"))
+                self.assertEqual(result.stderr, "")
+            self.assertFalse(list(destination.rglob("*.pyc")))
+            self.assertFalse(list(destination.rglob("__pycache__")))
+
+    def test_retired_surfaces_cannot_reappear(self) -> None:
+        absent_paths = (
+            ROOT / ".github" / "workflows" / ("re" + "lease.yml"),
+            ROOT / ".github" / "workflows" / ("trusted-agentic-" + "e2e.yml"),
+            ROOT / ("CHANGE" + "LOG.md"),
+            ROOT / ("VER" + "SION"),
+            ROOT / "docs" / "assets",
+            ROOT / "skill" / "references" / ("dash" + "board.md"),
+            ROOT / "skill" / "scripts" / ("dash" + "board.py"),
+            ROOT / "skill" / "scripts" / ("doc" + "tor.py"),
+            ROOT / "src" / "coordinator" / ("dash" + "board"),
+            ROOT / "src" / "coordinator" / ("in" + "stall"),
+            ROOT / "tests" / ("test_" + "dash" + "board.py"),
+            ROOT / "tests" / ("test_" + "in" + "stall.py"),
+            ROOT / "tests" / ("test_package.py"),
+            ROOT / "tools" / ("build_" + "re" + "lease.py"),
         )
+        self.assertFalse([str(path.relative_to(ROOT)) for path in absent_paths if path.exists()])
+        self.assertEqual({path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")}, {"ci.yml"})
+        for suffix in (".png", ".svg", ".html", ".zip"):
+            self.assertFalse(list(ROOT.rglob(f"*{suffix}")), suffix)
+
+        banned = (
+            "dash" + "board",
+            "doc" + "tor",
+            "re" + "lease",
+            "web" + "browser",
+            "http" + ".server",
+            "--between" + "-sessions",
+            "new_session" + "_required",
+            "git-path" + " hooks",
+            "re" + "start",
+            "mer" + "maid",
+            "web" + "server",
+            "codex_" + "hooks",
+            "features." + "hooks",
+            "hooks." + "json",
+        )
+        hits: list[str] = []
+        for path in ROOT.rglob("*"):
+            if (
+                not path.is_file()
+                or ".git" in path.parts
+                or path.name in {"GATES.md", ".env"}
+                or "__pycache__" in path.parts
+            ):
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore").casefold()
+            hits.extend(f"{path.relative_to(ROOT)}:{term}" for term in banned if term in text)
+            if path.suffix == ".md" and ("![" in text or "<svg" in text):
+                hits.append(f"{path.relative_to(ROOT)}:embedded-image")
+        self.assertEqual(hits, [])
 
     def test_ci_uses_latest_platforms_with_only_minimum_python(self) -> None:
-        workflows = {path.name: path.read_text(encoding="utf-8") for path in (ROOT / ".github" / "workflows").glob("*.yml")}
+        workflows = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in (ROOT / ".github" / "workflows").glob("*.yml")
+        }
+        self.assertEqual(set(workflows), {"ci.yml"})
         ci = workflows["ci.yml"]
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
         self.assertNotIn("matrix.python", ci)
-        for name, text in workflows.items():
-            versions = re.findall(r"python-version:\s*['\"]?([^'\"\s]+)", text)
-            self.assertTrue(versions, name)
-            self.assertEqual(set(versions), {"3.11"}, name)
-            for removed in ("verify_release", "manifest.json", "SHA256SUMS", "check-updates"):
-                self.assertNotIn(removed, text, name)
+        versions = re.findall(r"python-version:\s*['\"]?([^'\"\s]+)", ci)
+        self.assertEqual(set(versions), {"3.11"})
+        self.assertIn("ruff check --no-cache src skill/scripts tests", ci)
+        self.assertIn("python -m compileall -q src skill/scripts tests", ci)
+
 
 if __name__ == "__main__":
     unittest.main()

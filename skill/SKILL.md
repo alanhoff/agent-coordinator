@@ -1,23 +1,23 @@
 ---
 name: coordinator
-description: Coordinate complex work through durable, routed specialist-agent workflows with resumable state and a read-only dashboard.
+description: Coordinate complex work through durable, routed specialist-agent workflows with resumable state.
 ---
 
 # Coordinator
 
-Use Coordinator when a task benefits from multiple bounded specialist agents, durable recovery, or explicit dependency and write-scope control. The parent session is the sole controller: it owns requirements, graph mutations, integration, reconciliation, and completion. Specialists own only their assigned nodes.
+Use Coordinator when a task benefits from multiple bounded specialist agents, durable recovery, or
+explicit dependency and write-scope control. The parent task is the sole controller: it owns
+requirements, graph mutations, integration, reconciliation, and completion. Specialists own only their
+assigned nodes.
 
 ## Start safely
 
-Coordinator is globally installed. Never copy its package, roles, configuration, locks, or workflow state into the repository being orchestrated.
+Coordinator is installed in a current-user skill directory. Never copy its files, roles, configuration,
+locks, or workflow state into the repository being orchestrated.
 
-Resolve this file's directory as `SKILL_DIR`. Before orchestration:
-
-```sh
-python3 "$SKILL_DIR/scripts/doctor.py" preflight --repo /absolute/repository --json
-```
-
-Create a private session file outside the repository, then open a controller session:
+Resolve this file's directory as `SKILL_DIR`. Inspect the target repository's instructions, confirm it is
+a readable Git worktree, and use Python 3.11 or newer. Create a private session file outside the
+repository, then open a controller session:
 
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" session-open \
@@ -32,11 +32,14 @@ python3 "$SKILL_DIR/scripts/coordinator_state.py" init \
   --session-file /private/path/session.json --mutation-id init-001 --json
 ```
 
-Keep the returned workflow ID and revision. Every ordinary mutation requires the session file, a never-reused mutation ID, and the exact observed prior revision. If a commit outcome is uncertain, run `reconcile-commit` with that same mutation ID before deciding whether to retry.
+Keep the returned workflow ID and revision. Every ordinary mutation requires the session file, a
+never-reused mutation ID, and the exact observed prior revision. If a commit outcome is uncertain, run
+`reconcile-commit` with that same mutation ID before deciding whether to retry.
 
 ## Build and route the graph
 
-Create the smallest useful dependency DAG. Each node must have one role, route, acceptance list, and repository-relative write scope. Independent nodes may not overlap write scopes.
+Create the smallest useful dependency graph. Each node must have one role, route, acceptance list, and
+repository-relative write scope. Independent nodes may not overlap write scopes.
 
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" node-add \
@@ -53,7 +56,8 @@ For evidence-based routing, write the task packet described in `references/model
 python3 "$SKILL_DIR/scripts/model_router.py" choose --task-file /private/path/route.json --json
 ```
 
-Persist a fresh route with `node-route` before launch. Route files define no default model or effort; the controller supplies both per attempt.
+Persist a fresh route with `node-route` before launch. Route files define no default model or effort;
+the controller supplies both per attempt.
 
 ## Launch without duplication
 
@@ -66,26 +70,30 @@ python3 "$SKILL_DIR/scripts/coordinator_state.py" node-update \
   --launch-state claimed --request-id request-api-001 --json
 ```
 
-After the provider returns, bind the child with `--launch-state bound --child-id ID`, then mark the node running. If the provider response is uncertain, persist `reconcile_required`. Inspect the provider edge before either binding the existing child or returning to `unclaimed` with explicit reconciliation evidence. Never blindly launch a second child.
+After the provider returns, bind the child with `--launch-state bound --child-id ID`, then mark the node
+running. If the provider response is uncertain, persist `reconcile_required`. Inspect the provider edge
+before either binding the existing child or returning to `unclaimed` with explicit reconciliation
+evidence. Never blindly launch a second child.
 
-Monitor agents according to expected work duration. Validate their actual outputs, persist results and evidence, and change the future graph when evidence invalidates the plan. `graph-replan` accepts a file-backed atomic plan for dependency, priority, removal, and supersession operations.
+Monitor agents according to expected work duration. Validate their actual outputs, persist results and
+evidence, and change the future graph when evidence invalidates the plan. `graph-replan` accepts a
+file-backed atomic plan for dependency, priority, removal, and supersession operations.
 
 ## Requirements, blockers, and completion
 
-Persist user and mandatory requirements with `requirement-set`. A satisfied or superseded requirement needs concrete evidence. Use node-scoped blockers when independent work can continue. Record decisions and material events, not routine narration.
+Persist user and mandatory requirements with `requirement-set`. A satisfied or superseded requirement
+needs concrete evidence. Use node-scoped blockers when independent work can continue. Record decisions
+and material events, not routine narration.
 
-Mark a node done only with a result and validation evidence. `finish` succeeds only after all visible nodes are terminal-successful, all requirements are resolved, all blockers are resolved, and a verified commit is supplied.
+Mark a node done only with a result and validation evidence. `finish` succeeds only after all visible
+nodes are terminal-successful, all requirements are resolved, all blockers are resolved, and a verified
+commit is supplied.
 
-If a new controller takes over, `controller-takeover` fences the prior epoch. The new controller must then run `resume` before ordinary mutation. Close the private session file with `session-close` after completion.
+If a new controller takes over, `controller-takeover` fences the prior epoch. The new controller must
+then run `resume` before ordinary mutation. Close the private session file with `session-close` after
+completion.
 
-## Observe without mutation
+Read-only `list`, `status`, and `context` commands inspect committed state without mutation.
 
-The dashboard reads committed snapshots only:
-
-```sh
-python3 "$SKILL_DIR/scripts/dashboard.py" watch --workflow-id WORKFLOW --once
-python3 "$SKILL_DIR/scripts/dashboard.py" serve --workflow-id WORKFLOW --open
-python3 "$SKILL_DIR/scripts/dashboard.py" render --workflow-id WORKFLOW --out /explicit/report.html
-```
-
-See `references/workflow-protocol.md`, `state-schema.md`, `model-routing.md`, and `dashboard.md` for the stable contracts.
+See `references/workflow-protocol.md`, `references/state-schema.md`, and
+`references/model-routing.md` for the stable contracts.

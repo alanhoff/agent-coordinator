@@ -4,7 +4,3 @@ tmp/
 __pycache__/
 *.py[cod]
 .ruff_cache/
-
-/build/
-/dist/
-/release/
