@@ -1,14 +1,22 @@
 # Workflow protocol
 
-The parent session is the only controller. It owns repository reconciliation, requirements, the dependency graph, write scopes, routing, launch claims, integration, and final completion. Each specialist receives one bounded node and returns evidence; specialists do not mutate the workflow graph.
+The parent session is the only controller. It owns repository reconciliation, requirements, the
+dependency graph, write scopes, routing, execution claims, integration, and completion. Each
+specialist receives one bounded node and returns evidence; specialists never mutate the graph.
 
-1. Inspect repository instructions and confirm the target is a readable Git worktree.
-2. Open a private controller session outside the repository and initialize the task.
-3. Record explicit requirements and build the smallest useful DAG.
-4. Route ready nodes from current evidence. Keep reserve capacity for correction and integration.
-5. Persist each launch claim before calling the provider. Bind, run, and complete from observed outcomes.
-6. Inspect actual artifacts and tests. Replan only future unclaimed work; serialize overlapping write ownership.
-7. Reconcile uncertain provider or state commits before retrying.
-8. Resolve blockers and requirements with evidence, validate the integrated result, then finish and close the session.
+1. Inspect repository instructions and open private workflow state outside the repository.
+2. Record requirements and build the smallest useful DAG.
+3. Select a role for every node. Rank only model/effort candidates advertised by the current runtime;
+   inherit the parent route when none are available.
+4. Read the selected role TOML from the skill and include its description and instructions in the task
+   packet.
+5. Commit a claim, then use a callable delegation tool or bind and run the same packet inline. An
+   ambiguous delegation must be reconciled before inline fallback or retry.
+6. Inspect artifacts and acceptance evidence. Replan only future unclaimed work and serialize
+   overlapping write scopes.
+7. Resolve blockers and requirements, validate the integrated result, finish at a verified commit, and
+   close the private session.
 
-Use file-backed task and plan inputs for multiline or shell-sensitive content. Mutation IDs are operation identities, not labels to reuse. A revision conflict requires a fresh read and decision; it is never solved by overwriting newer state.
+Use file-backed inputs for multiline or shell-sensitive content. Mutation IDs are operation identities,
+not labels to reuse. A revision conflict requires a fresh read and decision; it is never solved by
+overwriting newer state.

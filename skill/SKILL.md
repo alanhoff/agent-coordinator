@@ -1,99 +1,91 @@
 ---
 name: coordinator
-description: Coordinate complex work through durable, routed specialist-agent workflows with resumable state.
+description: Coordinate complex work through durable specialist workflows that delegate when available and execute inline otherwise.
 ---
 
 # Coordinator
 
-Use Coordinator when a task benefits from multiple bounded specialist agents, durable recovery, or
-explicit dependency and write-scope control. The parent task is the sole controller: it owns
-requirements, graph mutations, integration, reconciliation, and completion. Specialists own only their
-assigned nodes.
+Use Coordinator when a task benefits from bounded specialist passes, durable recovery, or explicit
+dependency and write-scope control. The parent task remains the sole controller: it owns requirements,
+graph mutations, integration, reconciliation, and completion. A specialist owns only its assigned node.
 
-## Start safely
+## Start
 
-Coordinator is installed in a current-user skill directory. Never copy its files, roles, configuration,
-locks, or workflow state into the repository being orchestrated.
+Resolve this file's directory as `SKILL_DIR`. Keep Coordinator code and role profiles inside that
+directory. Never copy them into the target repository, edit Codex settings, or register custom agents.
+The only external Coordinator-owned data is private runtime state under `~/.agent-coordinator`.
 
-Resolve this file's directory as `SKILL_DIR`. Inspect the target repository's instructions, confirm it is
-a readable Git worktree, and use Python 3.11 or newer. Create a private session file outside the
-repository, then open a controller session:
+Inspect repository instructions, confirm the target is a readable Git worktree, and open a controller
+session with Python 3.11 or newer:
 
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" session-open \
   --repo /absolute/repository --session-file /private/path/session.json --json
-```
-
-Initialize a workflow with a file-backed task and a unique mutation identifier:
-
-```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" init \
   --repo /absolute/repository --task-file /private/path/task.txt \
   --session-file /private/path/session.json --mutation-id init-001 --json
 ```
 
-Keep the returned workflow ID and revision. Every ordinary mutation requires the session file, a
-never-reused mutation ID, and the exact observed prior revision. If a commit outcome is uncertain, run
-`reconcile-commit` with that same mutation ID before deciding whether to retry.
+Keep the returned workflow ID and revision. Every ordinary mutation requires the private session file,
+a never-reused mutation ID, and the exact observed prior revision. If a commit outcome is uncertain,
+run `reconcile-commit` with the same mutation ID before deciding whether to retry.
 
 ## Build and route the graph
 
-Create the smallest useful dependency graph. Each node must have one role, route, acceptance list, and
-repository-relative write scope. Independent nodes may not overlap write scopes.
+Create the smallest useful dependency graph. Each node has one role, an optional model/effort route,
+acceptance criteria, and repository-relative write scopes. Independent nodes may not overlap scopes.
 
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" node-add \
   --workflow-id WORKFLOW --session-file /private/path/session.json \
   --mutation-id add-api-001 --expected-revision REVISION \
   --node-id api --title "Implement API" --stage implementation --priority 70 \
-  --write-scope src/api --role implementer --model gpt-5.6-terra --effort high \
+  --write-scope src/api --role implementer \
   --acceptance "Focused API tests pass" --rationale "Bounded owner-layer change" --json
 ```
 
-For evidence-based routing, write the task packet described in `references/model-routing.md` and run:
+Use `model_router.py choose` only with model/effort candidates the active runtime currently advertises;
+never invent a catalog or probe models. The profile format is in `references/model-routing.md`. If the
+runtime exposes no catalog or route selection is unavailable or fails, keep model and effort unset so
+the executor inherits the parent route. Persist the selected role and any available route with
+`node-route` immediately before each attempt.
 
-```sh
-python3 "$SKILL_DIR/scripts/model_router.py" choose --task-file /private/path/route.json --json
-```
+## Execute adaptively
 
-Persist a fresh route with `node-route` before launch. Route files define no default model or effort;
-the controller supplies both per attempt.
+For every ready node:
 
-## Launch without duplication
+1. Read `agents/roles/ROLE.toml` from `SKILL_DIR`. Build one task packet containing its `description`
+   and `developer_instructions` verbatim, plus the repository, node objective, dependencies, write
+   scopes, acceptance criteria, required evidence, and a ban on graph mutation. This packet is the
+   specialist profile; do not depend on a globally registered agent.
+2. Inspect the current tool surface. Treat delegation as enabled only when a subagent creation or
+   delegation tool is callable. Do not infer it from a settings file.
+3. Commit a unique launch claim before execution. If delegation is enabled, pass the task packet in the
+   tool's task/message argument. Pass the routed `model` and map `effort` to the tool's reasoning-effort
+   argument only when each value is set and the tool schema accepts it; otherwise omit it so the child
+   inherits its parent.
+4. Bind the returned child ID. If no delegation tool is callable, or a call definitively creates no
+   child, bind `inline-` followed by the lowercase SHA-256 digest of the request ID, then execute the
+   same packet in the parent under the same role instructions. Inline execution is a full node attempt,
+   not weaker acceptance.
+5. If a delegation result could have created a child, persist `reconcile_required` and inspect the
+   provider edge. Bind the existing child if found; bind the inline executor only after proving no
+   child exists. Never duplicate uncertain work.
+6. Mark the bound executor running, inspect its actual outputs, run the node's acceptance checks, and
+   persist result and evidence. Replan only future unclaimed work.
 
-Before calling an agent provider, commit a unique request identity:
+Monitor delegated work according to expected duration. Inline nodes run sequentially in the parent;
+do not pretend they are parallel. Serialize overlapping write ownership in both modes.
 
-```sh
-python3 "$SKILL_DIR/scripts/coordinator_state.py" node-update \
-  --workflow-id WORKFLOW --session-file /private/path/session.json \
-  --mutation-id claim-api-001 --expected-revision REVISION --node-id api \
-  --launch-state claimed --request-id request-api-001 --json
-```
+## Complete or recover
 
-After the provider returns, bind the child with `--launch-state bound --child-id ID`, then mark the node
-running. If the provider response is uncertain, persist `reconcile_required`. Inspect the provider edge
-before either binding the existing child or returning to `unclaimed` with explicit reconciliation
-evidence. Never blindly launch a second child.
+Use node-scoped blockers when independent work can continue. A satisfied or superseded requirement
+needs concrete evidence. `finish` succeeds only after all visible nodes are terminal-successful, all
+requirements and blockers are resolved, validation is recorded, and a full verified commit is supplied.
 
-Monitor agents according to expected work duration. Validate their actual outputs, persist results and
-evidence, and change the future graph when evidence invalidates the plan. `graph-replan` accepts a
-file-backed atomic plan for dependency, priority, removal, and supersession operations.
-
-## Requirements, blockers, and completion
-
-Persist user and mandatory requirements with `requirement-set`. A satisfied or superseded requirement
-needs concrete evidence. Use node-scoped blockers when independent work can continue. Record decisions
-and material events, not routine narration.
-
-Mark a node done only with a result and validation evidence. `finish` succeeds only after all visible
-nodes are terminal-successful, all requirements are resolved, all blockers are resolved, and a verified
-commit is supplied.
-
-If a new controller takes over, `controller-takeover` fences the prior epoch. The new controller must
-then run `resume` before ordinary mutation. Close the private session file with `session-close` after
-completion.
-
-Read-only `list`, `status`, and `context` commands inspect committed state without mutation.
+A replacement controller uses `controller-takeover`, then `resume`, before ordinary mutation. Close the
+private session file with `session-close` after completion. Read-only `list`, `status`, and `context`
+commands inspect committed state without mutation.
 
 See `references/workflow-protocol.md`, `references/state-schema.md`, and
 `references/model-routing.md` for the stable contracts.

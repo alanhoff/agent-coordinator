@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Installed adapter for Coordinator task routing."""
+"""Coordinator task-routing adapter."""
 import pathlib
 import sys
 

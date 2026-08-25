@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -74,7 +75,6 @@ class DurableStateTests(unittest.TestCase):
             "node-add", revision, mutation,
             "--node-id", node_id, "--title", node_id, "--stage", "implementation",
             "--write-scope", scope or f"src/{node_id}", "--role", "implementer",
-            "--model", "gpt-5.6-terra", "--effort", "high",
             "--acceptance", "focused test passes", "--rationale", "bounded implementation",
             *extra,
             expected=expected,
@@ -96,6 +96,8 @@ class DurableStateTests(unittest.TestCase):
             StateStore().load(self.workflow_id)["nodes"]["a"]["route"]["routed_at"],
             "2099-01-01T00:00:00Z",
         )
+        inherited = StateStore().load(self.workflow_id)["nodes"]["a"]
+        self.assertEqual((inherited["model"], inherited["effort"]), (None, None))
         collision = self.add("different", 1, "add-a", expected=20)
         self.assertEqual(collision["code"], "mutation_conflict")
         self.add("other", 1, "stale-add", expected=20)
@@ -142,6 +144,28 @@ class DurableStateTests(unittest.TestCase):
         state["status"] = "blocked"
         self.assertEqual(ready_nodes(state), [])
 
+    def test_inline_fallback_binds_a_maximum_length_request_identifier(self) -> None:
+        self.add("work", 1, "add-work")
+        self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
+        request_id = "r" * 128
+        self.mutation(
+            "node-update", 3, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", request_id,
+        )
+        inline_id = "inline-" + hashlib.sha256(request_id.encode()).hexdigest()
+        self.mutation(
+            "node-update", 4, "bind-inline", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", inline_id,
+        )
+        self.mutation("node-update", 5, "run-inline", "--node-id", "work", "--status", "running")
+        self.mutation(
+            "node-update", 6, "finish-inline", "--node-id", "work", "--status", "done",
+            "--result", "implemented inline", "--evidence", "focused test passed",
+        )
+        node = StateStore().load(self.workflow_id)["nodes"]["work"]
+        self.assertEqual((node["status"], node["launch"]["state"]), ("done", "terminal"))
+        self.assertEqual(node["launch"]["child_id"], inline_id)
+
     def test_takeover_fences_old_controller_and_launch_reconciliation_is_explicit(self) -> None:
         self.add("work", 1, "add-work")
         second_session = self.base / "private" / "second.json"
@@ -177,14 +201,15 @@ class DurableStateTests(unittest.TestCase):
             "--status", "failed", "--attempt-outcome", "tests failed",
         )
         route = (
-            "--node-id", "work", "--role", "fixer", "--model", "gpt-5.6-terra",
-            "--effort", "high", "--rationale", "fix the failed attempt",
+            "--node-id", "work", "--role", "fixer", "--model", "vendor/future-model@next",
+            "--effort", "adaptive-depth", "--rationale", "fix the failed attempt",
         )
         self.mutation("node-route", 7, "reroute-work", *route)
         replay = self.mutation("node-route", 7, "reroute-work", *route)
         self.assertEqual(replay["code"], "mutation_reconciled")
         node = StateStore().load(self.workflow_id)["nodes"]["work"]
         self.assertEqual((node["status"], node["launch"]["state"], node["route"]["attempt"]), ("pending", "unclaimed", 2))
+        self.assertEqual((node["model"], node["effort"]), ("vendor/future-model@next", "adaptive-depth"))
         self.assertEqual((node["attempts"][0]["number"], node["attempts"][0]["outcome"]), (1, "tests failed"))
         self.assertIsNotNone(node["attempts"][0]["finished_at"])
 

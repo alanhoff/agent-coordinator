@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Installed adapter for Coordinator workflow state."""
+"""Coordinator workflow-state adapter."""
 import pathlib
 import sys
 

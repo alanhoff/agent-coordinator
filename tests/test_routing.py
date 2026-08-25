@@ -31,16 +31,37 @@ def task(**overrides):
 
 
 class RoutingTests(unittest.TestCase):
-    def test_stage_selects_role_and_profile_limits_route(self) -> None:
-        result = choose(task(stage="review"), {"allowed_models": ["gpt-5.6-terra"], "allowed_efforts": ["high"], "budget": "quality"})
-        self.assertEqual(result["route"], {"role": "reviewer", "model": "gpt-5.6-terra", "effort": "high"})
+    def test_stage_selects_role_and_ranks_arbitrary_runtime_candidates(self) -> None:
+        profile = {
+            "candidates": [
+                {"model": "vendor/economy@next", "effort": None, "capacity": 3.4, "relative_cost": 1},
+                {"model": "vendor/reasoner@next", "effort": "custom-depth", "capacity": 4, "relative_cost": 2},
+            ],
+            "budget": "quality",
+        }
+        result = choose(task(stage="review"), profile)
+        self.assertEqual(
+            result["route"],
+            {"role": "reviewer", "model": "vendor/reasoner@next", "effort": "custom-depth"},
+        )
         self.assertEqual(len(result["task_digest"]), 64)
         fallback = choose(
             task(stage="architecture", complexity=5, ambiguity=5, criticality=5, coupling=5, novelty=5, determinism=1),
-            {"allowed_models": ["gpt-5.6-luna"], "allowed_efforts": ["none"], "budget": "value"},
+            {
+                "candidates": [
+                    {"model": "small-runtime-model", "effort": "quick", "capacity": 1, "relative_cost": 0.1}
+                ],
+                "budget": "value",
+            },
         )
         self.assertFalse(fallback["alternatives"][0]["viable"])
-        self.assertIn("fallback because no allowed route met required capacity", fallback["rationale"])
+        self.assertIn("fallback because no candidate met required capacity", fallback["rationale"])
+
+    def test_missing_runtime_catalog_inherits_parent_route(self) -> None:
+        result = choose(task(stage="validation"))
+        self.assertEqual(result["route"], {"role": "validator", "model": None, "effort": None})
+        self.assertEqual(result["alternatives"], [])
+        self.assertIn("inherit the parent model and effort", result["rationale"])
 
     def test_unknown_and_out_of_range_input_is_rejected(self) -> None:
         with self.assertRaises(RoutingError):
@@ -54,7 +75,7 @@ class RoutingTests(unittest.TestCase):
             task_path = base / "task.json"
             profile_path = base / "profile.json"
             cases = (
-                (task(), {"allowed_models": [{}], "allowed_efforts": ["high"], "budget": "balanced"}),
+                (task(), {"candidates": [{}], "budget": "balanced"}),
                 (task(summary="\ud800"), None),
                 (task(stage={}), None),
             )

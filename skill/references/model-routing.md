@@ -1,13 +1,30 @@
 # Model routing contract
 
-`model_router.py choose` accepts one UTF-8 JSON object through `--task-file PATH` or `-`. Unknown fields are rejected.
+`model_router.py choose` accepts one UTF-8 JSON object through `--task-file PATH` or `-`. Unknown fields
+are rejected.
 
-Required fields:
+Required fields are `summary`; a `stage` of `architecture`, `design`, `documentation`, `fix`,
+`implementation`, `integration`, `research`, `review`, or `validation`; and numeric `complexity`,
+`ambiguity`, `criticality`, `coupling`, `novelty`, and `determinism` scores from 1 through 5.
 
-- `summary`: non-blank task summary;
-- `stage`: `architecture`, `design`, `documentation`, `fix`, `implementation`, `integration`, `research`, `review`, or `validation`;
-- `complexity`, `ambiguity`, `criticality`, `coupling`, `novelty`, and `determinism`: numbers from 1 through 5.
+An optional profile contains `budget` (`value`, `balanced`, or `quality`) and up to 128 `candidates`.
+Each candidate is one combination currently advertised by the runtime:
 
-Optional non-negative integers `input_tokens` and `expected_output_tokens` default to 25,000 and 2,000. An optional profile file may contain only `allowed_models`, `allowed_efforts`, and `budget` (`value`, `balanced`, or `quality`).
+```json
+{
+  "model": "runtime-model-id",
+  "effort": "runtime-effort-id",
+  "capacity": 4.2,
+  "relative_cost": 1.0
+}
+```
 
-The output selects one of the installed roles and an allowed model/effort pair. Capacity and relative-cost scores are deterministic planning heuristics, not price or quality guarantees. The controller must inspect current evidence, record a rationale, and persist a fresh route immediately before launch.
+`model` accepts any non-blank runtime identifier. `effort` may be `null` when the model's default should
+apply. Capacity and relative cost are non-negative caller-supplied planning heuristics, not model
+allowlists, prices, or quality guarantees.
+
+The router selects the stage's specialist role and ranks supplied candidates against task demand and
+budget. With no profile or an empty candidate list, it returns `null` model and effort so a delegated
+or inline executor inherits the parent route. If optional route selection cannot complete, the
+controller uses the same inherited route instead of blocking the node. It persists a fresh route
+immediately before each attempt and omits unset model/effort arguments from delegated invocations.
