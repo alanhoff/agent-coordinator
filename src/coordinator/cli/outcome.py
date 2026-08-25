@@ -29,7 +29,6 @@ def emit(
     code: str,
     data: Any = None,
     warnings: list[str] | None = None,
-    new_session_required: bool = False,
     exit_code: int = 0,
     as_json: bool = False,
 ) -> int:
@@ -39,7 +38,6 @@ def emit(
         "code": code,
         "data": data if data is not None else {},
         "warnings": warnings or [],
-        "new_session_required": new_session_required,
     }
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))

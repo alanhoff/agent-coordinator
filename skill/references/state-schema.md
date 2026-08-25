@@ -8,4 +8,4 @@ One controller session owns an epoch. Session bearer values exist only in the ca
 
 Launch states distinguish `unclaimed`, `claimed`, `reconcile_required`, `bound`, `running`, and `terminal`. Commit `claimed` with a request ID before an external call. An uncertain response becomes `reconcile_required`; return to `unclaimed` only with evidence that no child exists, or bind the child found at the provider edge.
 
-Read-only list, status, context, and dashboard operations never create, lock, repair, normalize, cache, or clean state.
+Read-only `list`, `status`, and `context` operations never create, lock, repair, normalize, cache, or clean state.

@@ -1,10 +1,71 @@
-tmp/
+# Local task state and secrets
 .env
+.env.*
+!.env.example
+!.env.sample
+/GATES.md
 
+# Python bytecode and native extensions
 __pycache__/
 *.py[cod]
-.ruff_cache/
+*$py.class
+*.so
+*.pyd
 
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+# Python tooling, tests, and coverage
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+.python_history
+
+# Python build and package artifacts
 /build/
 /dist/
-/release/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+*.whl
+
+# Editors
+.idea/
+.vscode/
+.fleet/
+*.iml
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Logs, temporary files, and failed patches
+tmp/
+temp/
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej

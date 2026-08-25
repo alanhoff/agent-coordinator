@@ -2,7 +2,7 @@
 
 The parent session is the only controller. It owns repository reconciliation, requirements, the dependency graph, write scopes, routing, launch claims, integration, and final completion. Each specialist receives one bounded node and returns evidence; specialists do not mutate the workflow graph.
 
-1. Run doctor preflight and inspect repository instructions.
+1. Inspect repository instructions and confirm the target is a readable Git worktree.
 2. Open a private controller session outside the repository and initialize the task.
 3. Record explicit requirements and build the smallest useful DAG.
 4. Route ready nodes from current evidence. Keep reserve capacity for correction and integration.
