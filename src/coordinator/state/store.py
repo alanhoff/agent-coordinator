@@ -32,8 +32,6 @@ ROLES = (
     "reviewer",
     "validator",
 )
-MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
-EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 NODE_STATUSES = ("pending", "ready", "running", "blocked", "done", "failed", "skipped", "cancelled")
 TERMINAL_NODE_STATUSES = frozenset(("done", "failed", "skipped", "cancelled"))
 SUCCESS_NODE_STATUSES = frozenset(("done", "skipped", "cancelled"))
@@ -423,8 +421,11 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError(f"nodes.{node_id}.write_scopes must contain 1..32 paths")
         for scope in node["write_scopes"]:
             _scope(scope, f"nodes.{node_id}.write_scope", case_sensitive=conventions["write_scope_case_sensitive"])
-        if node["role"] not in ROLES or node["model"] not in MODELS or node["effort"] not in EFFORTS:
-            raise StateError(f"nodes.{node_id} has an invalid route")
+        if node["role"] not in ROLES:
+            raise StateError(f"nodes.{node_id} has an invalid role")
+        for field in ("model", "effort"):
+            if node[field] is not None:
+                _text(node[field], f"nodes.{node_id}.{field}", maximum=256)
         if not isinstance(node["acceptance"], list) or not node["acceptance"]:
             raise StateError(f"nodes.{node_id}.acceptance must be non-empty")
         for item in node["acceptance"]:

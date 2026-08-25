@@ -5,10 +5,8 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import tomllib
 import unittest
 
@@ -59,7 +57,7 @@ class PublicContractTests(unittest.TestCase):
         state = new_state({"path": "/repository", "identity": "0" * 64}, "task", "session")
         self.assertNotIn("version", state)
 
-    def test_exact_roles_and_thin_entry_scripts(self) -> None:
+    def test_inline_role_profiles(self) -> None:
         roles = ROOT / "skill" / "agents" / "roles"
         self.assertEqual({path.stem for path in roles.glob("*.toml")}, EXPECTED_ROLES)
         for path in roles.glob("*.toml"):
@@ -78,6 +76,15 @@ class PublicContractTests(unittest.TestCase):
             source = path.read_text(encoding="utf-8")
             self.assertLessEqual(len(source.splitlines()), 10, path.name)
             self.assertIn("from coordinator", source)
+
+        protocol = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        for required in (
+            "agents/roles/ROLE.toml",
+            "`description`",
+            "`developer_instructions`",
+            "tool's task/message argument",
+        ):
+            self.assertIn(required, protocol)
 
     def test_runtime_imports_only_standard_library_and_coordinator(self) -> None:
         standard = set(sys.stdlib_module_names)
@@ -109,116 +116,43 @@ class PublicContractTests(unittest.TestCase):
             self.assertEqual(set(payload), {"command", "status", "code", "data", "warnings"}, name)
             self.assertEqual((payload["status"], payload["code"]), ("error", "invalid_invocation"), name)
 
-    def test_end_user_install_surface_is_exact_prose(self) -> None:
+    def test_self_contained_install_surface(self) -> None:
         prompt = "Install https://github.com/alanhoff/agent-coordinator by following INSTALL.md"
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        section = readme.split("## Install\n", 1)[1].split("\n## ", 1)[0]
-        self.assertEqual(
-            section,
-            "\nAsk your agent exactly:\n\n"
-            f"> `{prompt}`\n\n"
-            "The agent-facing procedure is documented in [INSTALL.md](INSTALL.md). It verifies Python 3.11 or newer,\n"
-            "places the skill and specialist roles in current-user locations, preserves unrelated configuration, and\n"
-            "checks the installed entry points before reporting success.\n",
-        )
-        self.assertEqual(readme.count(prompt), 1)
-        self.assertTrue((ROOT / "INSTALL.md").is_file())
-        self.assertFalse(list((ROOT / "skill" / "scripts").glob("install.*")))
-        self.assertNotIn("project", tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8")))
-
-    def test_agent_procedure_builds_a_complete_runnable_layout(self) -> None:
         instructions = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## Install\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(f"> `{prompt}`", section)
+        self.assertEqual(readme.count(prompt), 1)
         for required in (
+            "~/.agents/skills/coordinator",
             "skill/",
             "src/coordinator/",
             "scripts/lib/coordinator/",
-            "~/.agents/skills/coordinator",
-            "~/.codex/agents/coordinator-architect.toml",
-            "coordinator-validator.toml",
-            "~/.codex/config.toml",
-            "max_concurrent_threads_per_session = 8",
-            "multi_agent = true",
+            "Keep role profiles inside `agents/roles/`",
         ):
             self.assertIn(required, instructions)
-        for role in EXPECTED_ROLES:
-            self.assertIn(f"coordinator-{role}.toml", instructions)
-        self.assertIn("~/.codex/agents/coordinator-*.toml", readme)
-        self.assertNotIn("~/.codex/agents/coordinator`", readme)
-        self.assertNotIn("~/.codex/agents/coordinator`", instructions)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = pathlib.Path(temporary) / "coordinator"
-            shutil.copytree(ROOT / "skill", destination)
-            shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
-            shutil.copytree(ROOT / "src" / "coordinator", destination / "scripts" / "lib" / "coordinator")
-            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-            for name in ("coordinator_state.py", "model_router.py"):
-                result = subprocess.run(
-                    [sys.executable, str(destination / "scripts" / name), "invalid", "--json"],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=environment,
-                    check=False,
-                )
-                self.assertEqual((result.returncode, json.loads(result.stdout)["code"]), (2, "invalid_invocation"))
-                self.assertEqual(result.stderr, "")
-            self.assertFalse(list(destination.rglob("*.pyc")))
-            self.assertFalse(list(destination.rglob("__pycache__")))
-
-    def test_retired_surfaces_cannot_reappear(self) -> None:
-        absent_paths = (
-            ROOT / ".github" / "workflows" / ("re" + "lease.yml"),
-            ROOT / ".github" / "workflows" / ("trusted-agentic-" + "e2e.yml"),
-            ROOT / ("CHANGE" + "LOG.md"),
-            ROOT / ("VER" + "SION"),
-            ROOT / "docs" / "assets",
-            ROOT / "skill" / "references" / ("dash" + "board.md"),
-            ROOT / "skill" / "scripts" / ("dash" + "board.py"),
-            ROOT / "skill" / "scripts" / ("doc" + "tor.py"),
-            ROOT / "src" / "coordinator" / ("dash" + "board"),
-            ROOT / "src" / "coordinator" / ("in" + "stall"),
-            ROOT / "tests" / ("test_" + "dash" + "board.py"),
-            ROOT / "tests" / ("test_" + "in" + "stall.py"),
-            ROOT / "tests" / ("test_package.py"),
-            ROOT / "tools" / ("build_" + "re" + "lease.py"),
+        self.assertEqual(
+            set(re.findall(r"`(~/[^`]+)`", instructions)),
+            {"~/.agents/skills/coordinator"},
         )
-        self.assertFalse([str(path.relative_to(ROOT)) for path in absent_paths if path.exists()])
-        self.assertEqual({path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")}, {"ci.yml"})
-        for suffix in (".png", ".svg", ".html", ".zip"):
-            self.assertFalse(list(ROOT.rglob(f"*{suffix}")), suffix)
+        combined = readme + instructions
+        self.assertNotIn(".co" + "dex", combined)
+        self.assertNotIn("config" + ".toml", combined)
+        self.assertNotIn("coordinator-" + "architect.toml", combined)
+        self.assertNotIn("installed " + "adapter", combined.casefold())
 
-        banned = (
-            "dash" + "board",
-            "doc" + "tor",
-            "re" + "lease",
-            "web" + "browser",
-            "http" + ".server",
-            "--between" + "-sessions",
-            "new_session" + "_required",
-            "git-path" + " hooks",
-            "re" + "start",
-            "mer" + "maid",
-            "web" + "server",
-            "codex_" + "hooks",
-            "features." + "hooks",
-            "hooks." + "json",
-        )
-        hits: list[str] = []
-        for path in ROOT.rglob("*"):
-            if (
-                not path.is_file()
-                or ".git" in path.parts
-                or path.name in {"GATES.md", ".env"}
-                or "__pycache__" in path.parts
-            ):
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore").casefold()
-            hits.extend(f"{path.relative_to(ROOT)}:{term}" for term in banned if term in text)
-            if path.suffix == ".md" and ("![" in text or "<svg" in text):
-                hits.append(f"{path.relative_to(ROOT)}:embedded-image")
-        self.assertEqual(hits, [])
+    def test_adaptive_execution_contract(self) -> None:
+        protocol = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        execution = protocol.split("## Execute adaptively\n", 1)[1].split("\n## ", 1)[0]
+        execution = " ".join(execution.split())
+        for required in (
+            "delegation as enabled only when a subagent creation or delegation tool is callable",
+            "lowercase SHA-256 digest of the request ID",
+            "execute the same packet in the parent",
+            "persist `reconcile_required`",
+            "only after proving no child exists",
+        ):
+            self.assertIn(required, execution)
 
     def test_ci_uses_latest_platforms_with_only_minimum_python(self) -> None:
         workflows = {

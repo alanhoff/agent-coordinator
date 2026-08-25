@@ -6,7 +6,7 @@ import argparse
 from typing import Any, Sequence
 
 from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocation
-from coordinator.state.store import EFFORTS, LAUNCH_STATES, MODELS, NODE_STATUSES, ROLES, StateError, StateStore, execute_command
+from coordinator.state.store import LAUNCH_STATES, NODE_STATUSES, ROLES, StateError, StateStore, execute_command
 
 
 def _add_mutation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -61,16 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--dependency", action="append", default=[])
     add.add_argument("--write-scope", action="append", required=True)
     add.add_argument("--role", choices=ROLES, required=True)
-    add.add_argument("--model", choices=MODELS, required=True)
-    add.add_argument("--effort", choices=EFFORTS, required=True)
+    add.add_argument("--model")
+    add.add_argument("--effort")
     add.add_argument("--acceptance", action="append", required=True)
     add.add_argument("--rationale", required=True)
     add.add_argument("--estimated-cost", type=float)
     route = _subcommand(sub, "node-route", mutate=True)
     route.add_argument("--node-id", required=True)
     route.add_argument("--role", choices=ROLES, required=True)
-    route.add_argument("--model", choices=MODELS, required=True)
-    route.add_argument("--effort", choices=EFFORTS, required=True)
+    route.add_argument("--model")
+    route.add_argument("--effort")
     route.add_argument("--rationale", required=True)
     update = _subcommand(sub, "node-update", mutate=True)
     update.add_argument("--node-id", required=True)
