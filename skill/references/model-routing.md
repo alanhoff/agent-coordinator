@@ -26,5 +26,21 @@ allowlists, prices, or quality guarantees.
 The router selects the stage's specialist role and ranks supplied candidates against task demand and
 budget. With no profile or an empty candidate list, it returns `null` model and effort so a delegated
 or inline executor inherits the parent route. If optional route selection cannot complete, the
-controller uses the same inherited route instead of blocking the node. It persists a fresh route
-immediately before each attempt and omits unset model/effort arguments from delegated invocations.
+controller uses the same inherited route instead of blocking the node. Node add, split, and refine
+leave a provisional route whose attempt is invalid for claim. After the latest assessment and global
+planning fixed point, the controller persists a fresh explicit `node-route` immediately before each
+attempt and omits unset model/effort arguments from delegated invocations.
+
+Route only a non-blocked assessable leaf whose persisted assessment is current and `executable`, and
+only when every other non-blocked assessable leaf is also current and executable. Keep the router API
+unchanged and adapt schema-v4 assessment values to its existing 1–5 request fields as follows:
+
+- `complexity = clamp(1, 5, ceil(assessment.total / 4))`
+- `ambiguity = assessment.ambiguity + 1`
+- `coupling = assessment.dimensions.coupling + 1`
+- `novelty = assessment.dimensions.novelty + 1`
+
+Use the node objective for `summary` and its stage for `stage`. Assess `criticality` and `determinism`
+separately from current execution evidence because they are routing demand, not decomposition
+complexity. Never author a second complexity, ambiguity, coupling, or novelty estimate during routing.
+If evidence changes the assessment digest, reassess the node before constructing another request.

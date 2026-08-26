@@ -18,7 +18,11 @@ the current-user skill directory. It does not change Codex settings or register 
 - **Recovery is part of the protocol.** Atomic, revisioned snapshots record an execution claim before
   work starts, require reconciliation after uncertain delegation, and fence replaced controllers.
 - **Ownership is explicit.** Every dependency node carries acceptance criteria, one specialist role,
-  and a repository-relative write scope; overlapping work is serialized.
+  and a repository-relative write scope; split coverage persists as lineage obligations, and
+  overlapping work is serialized.
+- **Work is bounded before launch.** A versioned complexity and ambiguity assessment forces future
+  work through refinement or coverage-checked decomposition without exhausting split depth or state
+  capacity before it can be routed or claimed.
 - **Routing follows current evidence.** The router ranks arbitrary model/effort candidates advertised
   by the runtime. Without a current catalog, execution inherits the parent model and effort.
 - **Delegation is optional.** Role profiles ship inside the skill and travel in each delegated task.
@@ -56,15 +60,22 @@ implementing either option.
 
 ## Operate
 
-The installed `SKILL.md` is the controller protocol. In compact form, each node moves through
-**route → claim → execute → validate → finish**:
+The installed `SKILL.md` is the controller protocol. In compact form, future work moves through
+**assess → refine or split → route → claim → execute → validate → reassess** before the
+workflow can finish:
 
-1. The controller creates dependency-safe work with a specialist role, acceptance criteria, and write
-   scope. A model route is optional.
-2. It reads the role profile from its own skill folder and either passes it in a subagent invocation or
-   applies it to inline execution.
-3. It inspects artifacts and validation evidence, reconciling an uncertain delegation before retrying.
-4. Workflow completion requires resolved requirements and blockers, successful visible nodes, and a
+1. The controller scores five 0–4 complexity dimensions and ambiguity. It automatically refines or
+   splits every non-blocked assessable leaf until all are current and executable. Node-scoped blocked
+   leaves remain diagnosed without fencing independent dispatch.
+2. Node addition, refinement, and splitting leave routing provisional. Only after the latest assessment
+   does the controller persist an explicit route, read the role profile, and delegate or execute inline.
+   Active work is never rewritten.
+3. It fills genuine available capacity with dependency- and write-scope-safe leaves, ordered by
+   remaining-work critical-path load. Terminal-success bridges no longer serialize runnable downstream
+   work; repairable failures retain their load. Inline work remains sequential.
+4. It inspects artifacts and validation evidence, reconciles uncertain delegation before retrying, and
+   reassesses work staled by effective dependency outputs, terminal disposition, results, or evidence.
+5. Workflow completion requires resolved requirements and blockers, successful visible nodes, and a
    full verified Git checkpoint.
 
 Read-only state inspection is available through the state adapter:

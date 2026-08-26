@@ -16,7 +16,7 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_NODES = 128
 MAX_EVENTS = 512
@@ -37,6 +37,14 @@ TERMINAL_NODE_STATUSES = frozenset(("done", "failed", "skipped", "cancelled"))
 SUCCESS_NODE_STATUSES = frozenset(("done", "skipped", "cancelled"))
 WORKFLOW_STATUSES = ("planning", "running", "blocked", "completed", "aborted")
 LAUNCH_STATES = ("unclaimed", "claimed", "reconcile_required", "bound", "running", "terminal")
+COMPLEXITY_DIMENSIONS = ("breadth", "change_surface", "coupling", "novelty", "verification")
+ASSESSMENT_STATES = ("executable", "split_required", "refinement_required", "stale", "decomposed")
+ASSESSMENT_RUBRIC_VERSION = 1
+OBLIGATION_FIELDS = ("requirements", "outputs", "acceptance")
+PLANNING_FIXED_POINT_ERROR = (
+    "workflow planning fixed point requires every non-blocked assessable leaf "
+    "to have a current executable assessment"
+)
 ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -256,16 +264,287 @@ def scopes_overlap(left: str, right: str, *, case_sensitive: bool | None = None)
     return a == b or a.startswith(b + "/") or b.startswith(a + "/") or a == "." or b == "."
 
 
-def _depends(nodes: Mapping[str, Mapping[str, Any]], node_id: str, possible_parent: str) -> bool:
+def _text_list(
+    value: Any,
+    field: str,
+    *,
+    required: bool = False,
+    identifiers: bool = False,
+    maximum: int = 128,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum or (required and not value):
+        qualifier = "1.." if required else "0.."
+        raise StateError(f"{field} must be a list with {qualifier}{maximum} entries")
+    result: list[str] = []
+    for index, item in enumerate(value):
+        result.append(
+            _identifier(item, f"{field}[{index}]")
+            if identifiers
+            else _text(item, f"{field}[{index}]", maximum=2048)
+        )
+    if len(set(result)) != len(result):
+        raise StateError(f"{field} must not contain duplicates")
+    return result
+
+
+def _validate_spec(value: Any, field: str = "spec") -> Mapping[str, Any]:
+    spec = _keys(
+        value,
+        {"objective", "inputs", "outputs", "constraints", "non_goals", "requirement_ids", "open_questions"},
+        field,
+    )
+    _text(spec["objective"], f"{field}.objective")
+    _text_list(spec["inputs"], f"{field}.inputs")
+    _text_list(spec["outputs"], f"{field}.outputs", required=True)
+    _text_list(spec["constraints"], f"{field}.constraints")
+    _text_list(spec["non_goals"], f"{field}.non_goals")
+    _text_list(spec["requirement_ids"], f"{field}.requirement_ids", identifiers=True)
+    _text_list(spec["open_questions"], f"{field}.open_questions")
+    return spec
+
+
+def _validate_dimensions(value: Any, field: str) -> dict[str, int]:
+    dimensions = _keys(value, set(COMPLEXITY_DIMENSIONS), field)
+    for name in COMPLEXITY_DIMENSIONS:
+        score = dimensions[name]
+        if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 4:
+            raise StateError(f"{field}.{name} must be an integer from 0 through 4")
+    return {name: dimensions[name] for name in COMPLEXITY_DIMENSIONS}
+
+
+def _validate_assessment_inputs(value: Any, field: str = "assessment") -> Mapping[str, Any]:
+    assessment = _keys(value, {"dimensions", "ambiguity", "rationale"}, field)
+    _validate_dimensions(assessment["dimensions"], f"{field}.dimensions")
+    if (
+        not isinstance(assessment["ambiguity"], int)
+        or isinstance(assessment["ambiguity"], bool)
+        or not 0 <= assessment["ambiguity"] <= 4
+    ):
+        raise StateError(f"{field}.ambiguity must be an integer from 0 through 4")
+    _text(assessment["rationale"], f"{field}.rationale", maximum=4096)
+    return assessment
+
+
+def _planning_policy(state: Mapping[str, Any]) -> dict[str, int]:
+    conventions = state["conventions"]
+    return {
+        "max_node_complexity": conventions["max_node_complexity"],
+        "max_dimension_complexity": conventions["max_dimension_complexity"],
+        "max_node_ambiguity": conventions["max_node_ambiguity"],
+        "max_refinement_depth": conventions["max_refinement_depth"],
+    }
+
+
+def _ordered_union(*values: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for value in values for item in value))
+
+
+def _effective_obligations(node: Mapping[str, Any]) -> dict[str, list[str]]:
+    carried = node["lineage"]["obligations"]
+    return {
+        "requirements": _ordered_union(node["spec"]["requirement_ids"], carried["requirements"]),
+        "outputs": _ordered_union(node["spec"]["outputs"], carried["outputs"]),
+        "acceptance": _ordered_union(node["acceptance"], carried["acceptance"]),
+    }
+
+
+def _dependency_snapshot(node_id: str, node: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "outputs": _effective_obligations(node)["outputs"],
+        "disposition": node["status"] if node["status"] in TERMINAL_NODE_STATUSES else "nonterminal",
+        "result": node["result"],
+        "evidence": node["evidence"],
+    }
+
+
+def _assessment_input_digest(state: Mapping[str, Any], node: Mapping[str, Any]) -> str:
+    obligations = _effective_obligations(node)
+    requirements = {
+        requirement_id: state["requirements"].get(requirement_id)
+        for requirement_id in obligations["requirements"]
+    }
+    dependencies = [
+        _dependency_snapshot(dependency, state["nodes"][dependency])
+        for dependency in node["dependencies"]
+    ]
+    payload = {
+        "spec": node["spec"],
+        "acceptance": node["acceptance"],
+        "obligations": node["lineage"]["obligations"],
+        "requirements": requirements,
+        "dependencies": dependencies,
+        "write_scopes": node["write_scopes"],
+        "dimensions": node["assessment"]["dimensions"],
+        "ambiguity": node["assessment"]["ambiguity"],
+        "planning_policy": _planning_policy(state),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _future_leaf(node: Mapping[str, Any]) -> bool:
+    return (
+        not node["lineage"]["child_ids"]
+        and node["launch"]["state"] == "unclaimed"
+        and node["status"] in ("pending", "ready", "blocked")
+    )
+
+
+def _assessable_leaf(node: Mapping[str, Any]) -> bool:
+    return _future_leaf(node) or (
+        not node["lineage"]["child_ids"]
+        and node["status"] == "failed"
+        and node["launch"]["state"] in ("unclaimed", "terminal")
+    )
+
+
+def _is_resolution_endpoint(node: Mapping[str, Any]) -> bool:
+    return (
+        _assessable_leaf(node)
+        or node["launch"]["state"] in ("claimed", "reconcile_required", "bound", "running")
+        or node["status"] == "done"
+    )
+
+
+def _raw_over_budget(state: Mapping[str, Any], node: Mapping[str, Any]) -> bool:
+    policy = state["conventions"]
+    dimensions = node["assessment"]["dimensions"]
+    return (
+        node["assessment"]["total"] > policy["max_node_complexity"]
+        or any(
+            dimensions[name] > policy["max_dimension_complexity"]
+            for name in COMPLEXITY_DIMENSIONS
+        )
+    )
+
+
+def _derived_assessment_state(state: Mapping[str, Any], node: Mapping[str, Any]) -> str:
+    if node["lineage"]["child_ids"]:
+        return "decomposed"
+    if not _assessable_leaf(node):
+        return node["assessment"]["state"]
+    if node["assessment"]["input_digest"] != _assessment_input_digest(state, node):
+        return "stale"
+    policy = state["conventions"]
+    if node["spec"]["open_questions"] or node["assessment"]["ambiguity"] > policy["max_node_ambiguity"]:
+        return "refinement_required"
+    if _raw_over_budget(state, node):
+        return "split_required"
+    return "executable"
+
+
+def _assessment_shell(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    checked = _validate_assessment_inputs(inputs)
+    dimensions = {name: checked["dimensions"][name] for name in COMPLEXITY_DIMENSIONS}
+    return {
+        "rubric_version": ASSESSMENT_RUBRIC_VERSION,
+        "dimensions": dimensions,
+        "total": sum(dimensions.values()),
+        "ambiguity": checked["ambiguity"],
+        "rationale": checked["rationale"],
+        "input_digest": "0" * 64,
+        "state": "stale",
+    }
+
+
+def _build_assessment(
+    state: Mapping[str, Any],
+    node: Mapping[str, Any],
+    inputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    assessment = _assessment_shell(inputs)
+    mutable = dict(node)
+    mutable["assessment"] = assessment
+    assessment["input_digest"] = _assessment_input_digest(state, mutable)
+    assessment["state"] = _derived_assessment_state(state, mutable)
+    return assessment
+
+
+def _assessment_is_current_executable(state: Mapping[str, Any], node_id: str) -> bool:
+    node = state["nodes"][node_id]
+    return (
+        _assessable_leaf(node)
+        and node["assessment"]["state"] == "executable"
+        and node["assessment"]["input_digest"] == _assessment_input_digest(state, node)
+        and _derived_assessment_state(state, node) == "executable"
+    )
+
+
+def _node_is_executable(state: Mapping[str, Any], node_id: str) -> bool:
+    return _future_leaf(state["nodes"][node_id]) and _assessment_is_current_executable(state, node_id)
+
+
+def _invalidate_assessment(state: Mapping[str, Any], node: dict[str, Any]) -> None:
+    if _assessable_leaf(node):
+        node["assessment"]["state"] = _derived_assessment_state(state, node)
+        if node["status"] == "ready" and node["assessment"]["state"] != "executable":
+            node["status"] = "pending"
+
+
+def _invalidate_direct_dependents(state: dict[str, Any], node_id: str) -> None:
+    for node in state["nodes"].values():
+        if node_id in node["dependencies"]:
+            _invalidate_assessment(state, node)
+
+
+def _active_blocked_node_ids(state: Mapping[str, Any]) -> set[str]:
+    return {
+        item["node_id"]
+        for item in state["blockers"]
+        if item["status"] == "active" and item["node_id"] is not None
+    }
+
+
+def _workflow_dispatch_blocked(state: Mapping[str, Any]) -> bool:
+    return state["status"] == "blocked" or any(
+        item["status"] == "active" and item["node_id"] is None for item in state["blockers"]
+    )
+
+
+def _planning_at_fixed_point(state: Mapping[str, Any]) -> bool:
+    blocked = _active_blocked_node_ids(state)
+    return all(
+        node["status"] == "blocked"
+        or node_id in blocked
+        or not _assessable_leaf(node)
+        or _assessment_is_current_executable(state, node_id)
+        for node_id, node in state["nodes"].items()
+    )
+
+
+def _live_depends(nodes: Mapping[str, Mapping[str, Any]], node_id: str, possible_parent: str) -> bool:
     pending = list(nodes[node_id]["dependencies"])
     seen: set[str] = set()
     while pending:
         current = pending.pop()
         if current == possible_parent:
             return True
-        if current not in seen:
-            seen.add(current)
-            pending.extend(nodes[current]["dependencies"])
+        if current in seen or nodes[current]["status"] in SUCCESS_NODE_STATUSES:
+            continue
+        seen.add(current)
+        pending.extend(nodes[current]["dependencies"])
+    return False
+
+
+def _child_reaches_prerequisite(
+    nodes: Mapping[str, Mapping[str, Any]],
+    child_id: str,
+    prerequisite: str,
+    child_ids: set[str],
+) -> bool:
+    pending = [child_id]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for dependency in nodes[current]["dependencies"]:
+            if dependency == prerequisite:
+                return True
+            if dependency in child_ids:
+                pending.append(dependency)
     return False
 
 
@@ -307,7 +586,7 @@ def graph_diagnostics(nodes: Mapping[str, Mapping[str, Any]], *, case_sensitive:
     if not missing:
         for index, left_id in enumerate(active):
             for right_id in active[index + 1 :]:
-                if _depends(nodes, left_id, right_id) or _depends(nodes, right_id, left_id):
+                if _live_depends(nodes, left_id, right_id) or _live_depends(nodes, right_id, left_id):
                     continue
                 for left in nodes[left_id]["write_scopes"]:
                     for right in nodes[right_id]["write_scopes"]:
@@ -318,24 +597,111 @@ def graph_diagnostics(nodes: Mapping[str, Mapping[str, Any]], *, case_sensitive:
     return {"missing_dependencies": missing, "cycles": cycles, "write_scope_collisions": collisions}
 
 
-def ready_nodes(state: Mapping[str, Any]) -> list[str]:
+def _frontier_nodes(state: Mapping[str, Any]) -> list[str]:
     nodes = state["nodes"]
-    if state["status"] == "blocked" or any(
-        item["status"] == "active" and item["node_id"] is None for item in state["blockers"]
-    ):
+    if _workflow_dispatch_blocked(state):
         return []
-    blocked = {item["node_id"] for item in state["blockers"] if item["status"] == "active" and item["node_id"]}
+    blocked = _active_blocked_node_ids(state)
     ready = []
     for node_id, node in nodes.items():
         if (
             node["status"] not in ("pending", "ready")
             or node["launch"]["state"] != "unclaimed"
+            or node["lineage"]["child_ids"]
             or node_id in blocked
         ):
             continue
         if all(nodes[dependency]["status"] in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]):
             ready.append(node_id)
-    return sorted(ready, key=lambda item: (-nodes[item]["priority"], item))
+    return ready
+
+
+def _critical_path_loads(state: Mapping[str, Any]) -> dict[str, int]:
+    nodes = state["nodes"]
+    dependents: dict[str, list[str]] = {node_id: [] for node_id in nodes}
+    for node_id, node in nodes.items():
+        for dependency in node["dependencies"]:
+            if dependency in dependents:
+                dependents[dependency].append(node_id)
+    memo: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def load(node_id: str) -> int:
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in visiting:
+            return 0
+        visiting.add(node_id)
+        node = nodes[node_id]
+        own = 0
+        if node["status"] not in SUCCESS_NODE_STATUSES and not node["lineage"]["child_ids"]:
+            own = node["assessment"]["total"]
+        downstream = 0
+        if node["status"] not in SUCCESS_NODE_STATUSES:
+            downstream = max((load(item) for item in dependents[node_id]), default=0)
+        visiting.remove(node_id)
+        memo[node_id] = own + downstream
+        return memo[node_id]
+
+    for candidate in nodes:
+        load(candidate)
+    return {node_id: memo[node_id] for node_id in sorted(memo)}
+
+
+def ready_nodes(state: Mapping[str, Any]) -> list[str]:
+    """Return executable, dependency-safe leaves in critical-path dispatch order."""
+    if not _planning_at_fixed_point(state):
+        return []
+    nodes = state["nodes"]
+    loads = _critical_path_loads(state)
+    ready = [node_id for node_id in _frontier_nodes(state) if _node_is_executable(state, node_id)]
+    return sorted(ready, key=lambda item: (-loads[item], -nodes[item]["priority"], item))
+
+
+def planning_diagnostics(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe planning violations and capacity without treating drafts as an invalid DAG."""
+    nodes = state["nodes"]
+    policy = state["conventions"]
+    over_budget = []
+    ambiguous = []
+    refinement_required = []
+    stale = []
+    decomposed = []
+    for node_id, node in nodes.items():
+        if _assessable_leaf(node) and _raw_over_budget(state, node):
+            over_budget.append(node_id)
+        if _assessable_leaf(node) and (
+            node["spec"]["open_questions"]
+            or node["assessment"]["ambiguity"] > policy["max_node_ambiguity"]
+        ):
+            ambiguous.append(node_id)
+        assessment_state = _derived_assessment_state(state, node)
+        if _assessable_leaf(node):
+            if assessment_state == "refinement_required":
+                refinement_required.append(node_id)
+            elif assessment_state == "stale":
+                stale.append(node_id)
+        elif assessment_state == "decomposed":
+            decomposed.append(node_id)
+    usable = state["conventions"]["max_parallel"] - state["conventions"]["reserve"]
+    occupied = sum(
+        node["launch"]["state"] in ("claimed", "reconcile_required", "bound", "running")
+        for node in nodes.values()
+    )
+    dispatch_order = ready_nodes(state)
+    frontier_width = len(dispatch_order)
+    return {
+        "over_budget_nodes": sorted(over_budget),
+        "ambiguous_nodes": sorted(ambiguous),
+        "refinement_required_nodes": sorted(refinement_required),
+        "stale_nodes": sorted(stale),
+        "decomposed_nodes": sorted(decomposed),
+        "frontier_width": frontier_width,
+        "usable_parallelism": usable,
+        "available_parallelism": min(frontier_width, max(0, usable - occupied)),
+        "critical_path_load": _critical_path_loads(state),
+        "dispatch_order": dispatch_order,
+    }
 
 
 def _recovery_required(state: Mapping[str, Any]) -> bool:
@@ -377,7 +743,11 @@ def validate_state(state: Any) -> dict[str, Any]:
 
     conventions = _keys(
         top["conventions"],
-        {"max_parallel", "reserve", "platform", "write_scope_case_sensitive"},
+        {
+            "max_parallel", "reserve", "platform", "write_scope_case_sensitive",
+            "max_node_complexity", "max_dimension_complexity", "max_node_ambiguity",
+            "max_refinement_depth",
+        },
         "conventions",
     )
     if not isinstance(conventions["max_parallel"], int) or isinstance(conventions["max_parallel"], bool) or not 1 <= conventions["max_parallel"] <= 8:
@@ -387,6 +757,16 @@ def validate_state(state: Any) -> dict[str, Any]:
     _text(conventions["platform"], "conventions.platform", maximum=64)
     if not isinstance(conventions["write_scope_case_sensitive"], bool):
         raise StateError("conventions.write_scope_case_sensitive must be boolean")
+    integer_policies = {
+        "max_node_complexity": (0, len(COMPLEXITY_DIMENSIONS) * 4),
+        "max_dimension_complexity": (0, 4),
+        "max_node_ambiguity": (0, 4),
+        "max_refinement_depth": (1, 32),
+    }
+    for name, (minimum, maximum) in integer_policies.items():
+        value = conventions[name]
+        if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+            raise StateError(f"conventions.{name} must be an integer from {minimum} through {maximum}")
 
     if not isinstance(top["nodes"], dict) or len(top["nodes"]) > MAX_NODES:
         raise StateError(f"nodes must be an object with at most {MAX_NODES} entries")
@@ -399,7 +779,7 @@ def validate_state(state: Any) -> dict[str, Any]:
             {
                 "id", "title", "stage", "priority", "dependencies", "write_scopes", "role", "model",
                 "effort", "acceptance", "route", "launch", "attempts", "status", "result", "evidence",
-                "estimated_cost", "actual_cost", "superseded_by",
+                "estimated_cost", "actual_cost", "superseded_by", "spec", "assessment", "lineage",
             },
             f"nodes.{node_id}",
         )
@@ -430,11 +810,69 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError(f"nodes.{node_id}.acceptance must be non-empty")
         for item in node["acceptance"]:
             _text(item, f"nodes.{node_id}.acceptance", maximum=2048)
+        if len(set(node["acceptance"])) != len(node["acceptance"]):
+            raise StateError(f"nodes.{node_id}.acceptance must not contain duplicates")
+        _validate_spec(node["spec"], f"nodes.{node_id}.spec")
+        assessment = _keys(
+            node["assessment"],
+            {"rubric_version", "dimensions", "total", "ambiguity", "rationale", "input_digest", "state"},
+            f"nodes.{node_id}.assessment",
+        )
+        if (
+            not isinstance(assessment["rubric_version"], int)
+            or isinstance(assessment["rubric_version"], bool)
+            or assessment["rubric_version"] != ASSESSMENT_RUBRIC_VERSION
+        ):
+            raise StateError(f"nodes.{node_id}.assessment.rubric_version must be {ASSESSMENT_RUBRIC_VERSION}")
+        dimensions = _validate_dimensions(assessment["dimensions"], f"nodes.{node_id}.assessment.dimensions")
+        if (
+            not isinstance(assessment["total"], int)
+            or isinstance(assessment["total"], bool)
+            or assessment["total"] != sum(dimensions.values())
+        ):
+            raise StateError(f"nodes.{node_id}.assessment.total must equal the five dimension scores")
+        if (
+            not isinstance(assessment["ambiguity"], int)
+            or isinstance(assessment["ambiguity"], bool)
+            or not 0 <= assessment["ambiguity"] <= 4
+        ):
+            raise StateError(f"nodes.{node_id}.assessment.ambiguity must be an integer from 0 through 4")
+        _text(assessment["rationale"], f"nodes.{node_id}.assessment.rationale", maximum=4096)
+        if not isinstance(assessment["input_digest"], str) or not SHA256_RE.fullmatch(assessment["input_digest"]):
+            raise StateError(f"nodes.{node_id}.assessment.input_digest must be a SHA-256 digest")
+        if assessment["state"] not in ASSESSMENT_STATES:
+            raise StateError(f"nodes.{node_id}.assessment.state is invalid")
+        lineage = _keys(
+            node["lineage"],
+            {"parent_id", "depth", "child_ids", "split_reason", "obligations"},
+            f"nodes.{node_id}.lineage",
+        )
+        if lineage["parent_id"] is not None:
+            _identifier(lineage["parent_id"], f"nodes.{node_id}.lineage.parent_id")
+        if (
+            not isinstance(lineage["depth"], int)
+            or isinstance(lineage["depth"], bool)
+            or not 0 <= lineage["depth"] <= conventions["max_refinement_depth"]
+        ):
+            raise StateError(f"nodes.{node_id}.lineage.depth exceeds the planning depth limit")
+        _text_list(lineage["child_ids"], f"nodes.{node_id}.lineage.child_ids", identifiers=True)
+        if lineage["split_reason"] is not None:
+            _text(lineage["split_reason"], f"nodes.{node_id}.lineage.split_reason", maximum=4096)
+        obligations = _keys(
+            lineage["obligations"], set(OBLIGATION_FIELDS), f"nodes.{node_id}.lineage.obligations"
+        )
+        _text_list(
+            obligations["requirements"],
+            f"nodes.{node_id}.lineage.obligations.requirements",
+            identifiers=True,
+        )
+        for field in ("outputs", "acceptance"):
+            _text_list(obligations[field], f"nodes.{node_id}.lineage.obligations.{field}")
         route = _keys(node["route"], {"rationale", "routed_at", "attempt"}, f"nodes.{node_id}.route")
         _text(route["rationale"], f"nodes.{node_id}.route.rationale", maximum=4096)
         _parse_time(route["routed_at"], f"nodes.{node_id}.route.routed_at")
-        if not isinstance(route["attempt"], int) or isinstance(route["attempt"], bool) or route["attempt"] < 1:
-            raise StateError(f"nodes.{node_id}.route.attempt must be positive")
+        if not isinstance(route["attempt"], int) or isinstance(route["attempt"], bool) or route["attempt"] < 0:
+            raise StateError(f"nodes.{node_id}.route.attempt must be non-negative")
         launch = _keys(
             node["launch"],
             {"state", "request_id", "child_id", "claimed_at", "reconciliation"},
@@ -515,13 +953,53 @@ def validate_state(state: Any) -> dict[str, Any]:
         if node["status"] == "running" and launch["state"] != "running":
             raise StateError(f"nodes.{node_id} running status requires a running launch")
 
+    superseded_ids: list[str] = []
     for node_id, node in top["nodes"].items():
-        if node["superseded_by"] is not None:
-            _identifier(node["superseded_by"], f"nodes.{node_id}.superseded_by")
-            if node["superseded_by"] not in top["nodes"] or node["superseded_by"] == node_id:
-                raise StateError(f"nodes.{node_id}.superseded_by must name another existing node")
-            if any(node_id in other["dependencies"] for other in top["nodes"].values()):
-                raise StateError(f"nodes.{node_id} is superseded but still has dependents")
+        if node["superseded_by"] is None:
+            continue
+        _identifier(node["superseded_by"], f"nodes.{node_id}.superseded_by")
+        if node["superseded_by"] not in top["nodes"] or node["superseded_by"] == node_id:
+            raise StateError(f"nodes.{node_id}.superseded_by must name another existing node")
+        superseded_ids.append(node_id)
+
+    for start in superseded_ids:
+        seen: set[str] = set()
+        current = start
+        while top["nodes"][current]["superseded_by"] is not None:
+            if current in seen:
+                raise StateError("superseded_by cycle is not allowed")
+            seen.add(current)
+            current = top["nodes"][current]["superseded_by"]
+
+    for node_id in superseded_ids:
+        node = top["nodes"][node_id]
+        if (
+            node["status"] != "skipped"
+            or node["result"] != "superseded"
+            or not node["evidence"]
+            or node["launch"]["state"] != "unclaimed"
+            or node["lineage"]["child_ids"]
+        ):
+            raise StateError(f"nodes.{node_id} superseded_by source must be a skipped superseded leaf")
+        if any(node_id in other["dependencies"] for other in top["nodes"].values()):
+            raise StateError(f"nodes.{node_id} is superseded but still has dependents")
+        replacement = top["nodes"][node["superseded_by"]]
+        if any(
+            not set(node["lineage"]["obligations"][field]).issubset(
+                replacement["lineage"]["obligations"][field]
+            )
+            for field in OBLIGATION_FIELDS
+        ):
+            raise StateError(f"nodes.{node_id} supersede replacement loses carried obligations")
+
+    if top["status"] != "aborted":
+        for start in superseded_ids:
+            terminal_id = start
+            while top["nodes"][terminal_id]["superseded_by"] is not None:
+                terminal_id = top["nodes"][terminal_id]["superseded_by"]
+            terminal = top["nodes"][terminal_id]
+            if not (_is_resolution_endpoint(terminal) or terminal["lineage"]["child_ids"]):
+                raise StateError("superseded_by chain must terminate in resolvable work")
 
     diagnostic = graph_diagnostics(top["nodes"], case_sensitive=conventions["write_scope_case_sensitive"])
     if any(diagnostic.values()):
@@ -532,6 +1010,7 @@ def validate_state(state: Any) -> dict[str, Any]:
     )
     if occupied > conventions["max_parallel"] - conventions["reserve"]:
         raise StateError("active launch claims exceed usable controller capacity")
+    raw_over_budget_leaves: list[str] = []
     for node_id, node in top["nodes"].items():
         if node["status"] == "ready" and any(top["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]):
             raise StateError(f"nodes.{node_id} cannot be ready before its dependencies")
@@ -549,6 +1028,142 @@ def validate_state(state: Any) -> dict[str, Any]:
             _text(requirement["evidence"], f"requirements.{requirement_id}.evidence")
         if requirement["status"] != "active" and not requirement["evidence"]:
             raise StateError(f"requirements.{requirement_id} resolution requires evidence")
+
+    for node_id, node in top["nodes"].items():
+        lineage = node["lineage"]
+        parent_id = lineage["parent_id"]
+        if parent_id is None:
+            if lineage["depth"] != 0:
+                raise StateError(f"nodes.{node_id} root lineage depth must be zero")
+        else:
+            parent = top["nodes"].get(parent_id)
+            if parent is None:
+                raise StateError(f"nodes.{node_id}.lineage.parent_id is unknown")
+            if lineage["depth"] != parent["lineage"]["depth"] + 1:
+                raise StateError(f"nodes.{node_id}.lineage.depth must follow its parent")
+            if node_id not in parent["lineage"]["child_ids"]:
+                raise StateError(f"nodes.{node_id} is absent from its parent's lineage")
+        if lineage["child_ids"]:
+            if not lineage["split_reason"]:
+                raise StateError(f"nodes.{node_id} decomposed lineage requires a split reason")
+            if node["assessment"]["state"] != "decomposed" or node["status"] != "skipped":
+                raise StateError(f"nodes.{node_id} decomposed lineage requires skipped/decomposed state")
+            if node["dependencies"]:
+                raise StateError(f"nodes.{node_id} decomposed node retains live dependencies")
+            if any(node_id in other["dependencies"] for other in top["nodes"].values()):
+                raise StateError(f"nodes.{node_id} decomposed node still has a dependent")
+            for child_id in lineage["child_ids"]:
+                child = top["nodes"].get(child_id)
+                if child is None or child["lineage"]["parent_id"] != node_id:
+                    raise StateError(f"nodes.{node_id} lineage references a non-child node")
+            children = [top["nodes"][child_id] for child_id in lineage["child_ids"]]
+            effective = _effective_obligations(node)
+            if any(
+                not any(
+                    item in child["lineage"]["obligations"][field] for child in children
+                )
+                for field in OBLIGATION_FIELDS
+                for item in effective[field]
+            ):
+                raise StateError(f"nodes.{node_id} decomposed children lose carried obligations")
+        else:
+            if lineage["split_reason"] is not None:
+                raise StateError(f"nodes.{node_id} leaf lineage cannot have a split reason")
+            if node["assessment"]["state"] == "decomposed":
+                raise StateError(f"nodes.{node_id} decomposed assessment requires child lineage")
+        unknown_requirements = set(_effective_obligations(node)["requirements"]) - set(top["requirements"])
+        if unknown_requirements:
+            raise StateError(
+                f"nodes.{node_id} effective obligations reference unknown requirements: "
+                + ", ".join(sorted(unknown_requirements))
+            )
+        assessment_state = _derived_assessment_state(top, node)
+        if (_assessable_leaf(node) or lineage["child_ids"]) and node["assessment"]["state"] != assessment_state:
+            raise StateError(f"nodes.{node_id}.assessment.state is not derived from its current inputs")
+        if node["status"] == "ready" and assessment_state != "executable":
+            raise StateError(f"nodes.{node_id} ready status requires a current executable assessment")
+        if (
+            top["status"] != "aborted"
+            and node["status"] in ("skipped", "cancelled")
+            and not lineage["child_ids"]
+            and node["superseded_by"] is None
+            and any(lineage["obligations"][field] for field in OBLIGATION_FIELDS)
+        ):
+            raise StateError(f"nodes.{node_id} cannot discard carried obligations")
+        if _assessable_leaf(node) and _raw_over_budget(top, node):
+            raw_over_budget_leaves.append(node_id)
+        if node["launch"]["state"] in ("claimed", "reconcile_required", "bound", "running") and (
+            node["assessment"]["state"] != "executable"
+        ):
+            raise StateError(f"nodes.{node_id} active launch requires an executable assessment")
+
+    if top["status"] != "aborted":
+        obligation_sets: dict[str, dict[str, set[str]]] = {}
+        carriers_by_field: dict[str, dict[str, set[str]]] = {
+            field: {} for field in OBLIGATION_FIELDS
+        }
+        for node_id, node in top["nodes"].items():
+            obligation_sets[node_id] = {
+                field: set(node["lineage"]["obligations"][field])
+                for field in OBLIGATION_FIELDS
+            }
+            for field in OBLIGATION_FIELDS:
+                for obligation in node["lineage"]["obligations"][field]:
+                    carriers_by_field[field].setdefault(obligation, set()).add(node_id)
+        for field in OBLIGATION_FIELDS:
+            for obligation, carriers in carriers_by_field[field].items():
+                resolved = {
+                    node_id
+                    for node_id in carriers
+                    if _is_resolution_endpoint(top["nodes"][node_id])
+                }
+                predecessors: dict[str, set[str]] = {}
+                for node_id in carriers:
+                    node = top["nodes"][node_id]
+                    if node["lineage"]["child_ids"]:
+                        targets = (
+                            child_id
+                            for child_id in node["lineage"]["child_ids"]
+                            if obligation in obligation_sets[child_id][field]
+                        )
+                    elif node["superseded_by"] is not None:
+                        targets = iter((node["superseded_by"],))
+                    else:
+                        targets = iter(())
+                    for target in targets:
+                        if target in carriers:
+                            predecessors.setdefault(target, set()).add(node_id)
+                pending = list(resolved)
+                while pending:
+                    target = pending.pop()
+                    for predecessor in predecessors.get(target, ()):
+                        if predecessor not in resolved:
+                            resolved.add(predecessor)
+                            pending.append(predecessor)
+                unresolved = sorted(carriers - resolved)
+                if unresolved:
+                    raise StateError(
+                        f"carried {field} obligation has no acyclic resolution path: "
+                        f"{obligation!r} at " + ", ".join(unresolved)
+                    )
+
+    max_depth = conventions["max_refinement_depth"]
+    stranded = [
+        node_id
+        for node_id in raw_over_budget_leaves
+        if top["nodes"][node_id]["lineage"]["depth"] >= max_depth
+    ]
+    if stranded:
+        raise StateError(
+            "max_refinement_depth requires bounded final children/leaves: "
+            + ", ".join(sorted(stranded))
+        )
+    if MAX_NODES - len(top["nodes"]) < 2 * len(raw_over_budget_leaves):
+        raise StateError(
+            "workflow capacity must reserve two node records per split-required leaf or "
+            "raw-over-budget draft; "
+            "produce more bounded nodes"
+        )
 
     for field, limit in (("decisions", 256), ("blockers", 256), ("events", MAX_EVENTS)):
         if not isinstance(top[field], list) or len(top[field]) > limit:
@@ -655,6 +1270,10 @@ def new_state(repository: Mapping[str, str], task: str, session_id: str, convent
         "reserve": 1,
         "platform": os.name,
         "write_scope_case_sensitive": os.name != "nt",
+        "max_node_complexity": 8,
+        "max_dimension_complexity": 3,
+        "max_node_ambiguity": 1,
+        "max_refinement_depth": 8,
     }
     if conventions:
         profile.update(conventions)
@@ -1209,19 +1828,47 @@ def _public_state(state: Mapping[str, Any], *, full: bool = False) -> dict[str, 
     return result
 
 
-def _new_node(args: Any) -> dict[str, Any]:
+def _node_record(
+    *,
+    node_id: str,
+    title: str,
+    stage: str,
+    priority: int,
+    dependencies: list[str],
+    write_scopes: list[str],
+    role: str,
+    model: str | None,
+    effort: str | None,
+    acceptance: list[str],
+    route_rationale: str,
+    estimated_cost: float | None,
+    spec: Mapping[str, Any],
+    assessment: Mapping[str, Any],
+    parent_id: str | None = None,
+    depth: int = 0,
+) -> dict[str, Any]:
+    checked_spec = _validate_spec(spec)
     return {
-        "id": args.node_id,
-        "title": args.title,
-        "stage": args.stage,
-        "priority": args.priority,
-        "dependencies": list(dict.fromkeys(args.dependency)),
-        "write_scopes": list(dict.fromkeys(args.write_scope)),
-        "role": args.role,
-        "model": args.model,
-        "effort": args.effort,
-        "acceptance": list(dict.fromkeys(args.acceptance)),
-        "route": {"rationale": args.rationale, "routed_at": now_iso(), "attempt": 1},
+        "id": node_id,
+        "title": title,
+        "stage": stage,
+        "priority": priority,
+        "dependencies": list(dependencies),
+        "write_scopes": list(write_scopes),
+        "role": role,
+        "model": model,
+        "effort": effort,
+        "acceptance": list(acceptance),
+        "spec": copy.deepcopy(dict(checked_spec)),
+        "assessment": _assessment_shell(assessment),
+        "lineage": {
+            "parent_id": parent_id,
+            "depth": depth,
+            "child_ids": [],
+            "split_reason": None,
+            "obligations": {field: [] for field in OBLIGATION_FIELDS},
+        },
+        "route": {"rationale": route_rationale, "routed_at": now_iso(), "attempt": 0},
         "launch": {
             "state": "unclaimed",
             "request_id": None,
@@ -1233,10 +1880,134 @@ def _new_node(args: Any) -> dict[str, Any]:
         "status": "pending",
         "result": None,
         "evidence": None,
-        "estimated_cost": args.estimated_cost,
+        "estimated_cost": estimated_cost,
         "actual_cost": None,
         "superseded_by": None,
     }
+
+
+def _new_node(args: Any) -> dict[str, Any]:
+    return _node_record(
+        node_id=args.node_id,
+        title=args.title,
+        stage=args.stage,
+        priority=args.priority,
+        dependencies=args.dependency,
+        write_scopes=args.write_scope,
+        role=args.role,
+        model=args.model,
+        effort=args.effort,
+        acceptance=args.acceptance,
+        route_rationale=args.rationale,
+        estimated_cost=args.estimated_cost,
+        spec={
+            "objective": args.objective,
+            "inputs": args.input,
+            "outputs": args.output,
+            "constraints": args.constraint,
+            "non_goals": args.non_goal,
+            "requirement_ids": args.requirement_id,
+            "open_questions": args.open_question,
+        },
+        assessment={
+            "dimensions": {name: getattr(args, name) for name in COMPLEXITY_DIMENSIONS},
+            "ambiguity": args.ambiguity,
+            "rationale": args.complexity_rationale,
+        },
+    )
+
+
+def _refresh_node_assessment(state: dict[str, Any], node_id: str) -> None:
+    node = state["nodes"][node_id]
+    inputs = {
+        "dimensions": node["assessment"]["dimensions"],
+        "ambiguity": node["assessment"]["ambiguity"],
+        "rationale": node["assessment"]["rationale"],
+    }
+    node["assessment"] = _build_assessment(state, node, inputs)
+
+
+def _require_rewritable_leaf(node: Mapping[str, Any], operation: str) -> None:
+    failed_retry = node["status"] == "failed" and node["launch"]["state"] in ("unclaimed", "terminal")
+    future = node["status"] in ("pending", "ready", "blocked") and node["launch"]["state"] == "unclaimed"
+    if node["lineage"]["child_ids"] or not (future or failed_retry):
+        raise StateError(f"{operation} requires a non-active future or failed leaf")
+
+
+def _reset_failed_leaf(node: dict[str, Any]) -> None:
+    if node["status"] != "failed":
+        return
+    node["status"] = "pending"
+    node["result"] = None
+    node["evidence"] = None
+    node["launch"] = {
+        "state": "unclaimed",
+        "request_id": None,
+        "child_id": None,
+        "claimed_at": None,
+        "reconciliation": None,
+    }
+
+
+SPLIT_CHILD_KEYS = {
+    "id", "title", "stage", "priority", "dependencies", "write_scopes", "role", "model", "effort",
+    "acceptance", "route_rationale", "estimated_cost", "spec", "assessment",
+}
+
+
+def _split_child_record(raw: Any, *, parent_id: str, depth: int, index: int) -> dict[str, Any]:
+    field = f"plan.children[{index}]"
+    child = _keys(raw, SPLIT_CHILD_KEYS, field)
+    dependencies = _text_list(child["dependencies"], f"{field}.dependencies", identifiers=True)
+    if parent_id in dependencies:
+        raise StateError(f"{field} cannot depend on the node being decomposed")
+    write_scopes = _text_list(child["write_scopes"], f"{field}.write_scopes", required=True, maximum=32)
+    acceptance = _text_list(child["acceptance"], f"{field}.acceptance", required=True)
+    return _node_record(
+        node_id=_identifier(child["id"], f"{field}.id"),
+        title=_text(child["title"], f"{field}.title", maximum=1024),
+        stage=_identifier(child["stage"], f"{field}.stage"),
+        priority=child["priority"],
+        dependencies=dependencies,
+        write_scopes=write_scopes,
+        role=child["role"],
+        model=child["model"],
+        effort=child["effort"],
+        acceptance=acceptance,
+        route_rationale=_text(child["route_rationale"], f"{field}.route_rationale", maximum=4096),
+        estimated_cost=child["estimated_cost"],
+        spec=child["spec"],
+        assessment=child["assessment"],
+        parent_id=parent_id,
+        depth=depth,
+    )
+
+
+def _coverage_mapping(
+    value: Any,
+    expected: list[str],
+    child_ids: set[str],
+    field: str,
+) -> Mapping[str, list[str]]:
+    if not isinstance(value, dict):
+        raise StateError(f"{field} must be an object")
+    if set(value) != set(expected):
+        missing = set(expected) - set(value)
+        extra = set(value) - set(expected)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(sorted(missing)))
+        if extra:
+            detail.append("unknown " + ", ".join(sorted(extra)))
+        raise StateError(f"{field} does not exactly cover the parent items: " + "; ".join(detail))
+    checked: dict[str, list[str]] = {}
+    for item, replacements in value.items():
+        selected = _text_list(replacements, f"{field}.{item}", required=True, identifiers=True)
+        unknown = set(selected) - child_ids
+        if unknown:
+            raise StateError(f"{field}.{item} references non-child nodes: " + ", ".join(sorted(unknown)))
+        checked[item] = selected
+    return {item: checked[item] for item in expected}
 
 
 def _refresh_recovery_status(state: dict[str, Any]) -> None:
@@ -1262,7 +2033,11 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         profile = None
         if args.profile_file:
             profile = _read_command_object(None, args.profile_file, "profile")
-            allowed = {"max_parallel", "reserve", "platform", "write_scope_case_sensitive"}
+            allowed = {
+                "max_parallel", "reserve", "platform", "write_scope_case_sensitive",
+                "max_node_complexity", "max_dimension_complexity", "max_node_ambiguity",
+                "max_refinement_depth",
+            }
             if set(profile) - allowed:
                 raise StateError("profile contains unknown fields: " + ", ".join(sorted(set(profile) - allowed)))
         state = store.create(repository, task, pathlib.Path(args.session_file), profile, args.mutation_id)
@@ -1304,18 +2079,203 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
     if command == "node-add":
         node = _new_node(args)
-        operation = {**node, "route": {"rationale": args.rationale, "attempt": 1}}
+        operation = {**node, "route": {"rationale": args.rationale, "attempt": 0}}
 
         def add(state: dict[str, Any]) -> dict[str, Any]:
             if args.node_id in state["nodes"]:
                 raise StateError("node already exists")
             if any(dependency not in state["nodes"] for dependency in node["dependencies"]):
                 raise StateError("node has an unresolved dependency")
-            state["nodes"][args.node_id] = node
+            state["nodes"][args.node_id] = copy.deepcopy(node)
+            _refresh_node_assessment(state, args.node_id)
             return add_event(state, "node_added", args.title, args.node_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, add)
         return 0, "mutation_reconciled" if replay else "node_added", {**_public_state(state), "event": result}, []
+
+    if command == "node-refine":
+        refinement = _read_command_object(args.refinement_json, args.refinement_file, "refinement")
+        _keys(refinement, {"spec", "acceptance", "write_scopes", "assessment"}, "refinement")
+
+        def refine(state: dict[str, Any]) -> dict[str, Any]:
+            node = state["nodes"].get(args.node_id)
+            if node is None:
+                raise StateError("unknown node")
+            _require_rewritable_leaf(node, "node-refine")
+            prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
+            spec = _validate_spec(refinement["spec"], "refinement.spec")
+            acceptance = _text_list(refinement["acceptance"], "refinement.acceptance", required=True)
+            write_scopes = _text_list(
+                refinement["write_scopes"], "refinement.write_scopes", required=True, maximum=32
+            )
+            assessment = _validate_assessment_inputs(refinement["assessment"], "refinement.assessment")
+            node["spec"] = copy.deepcopy(dict(spec))
+            node["acceptance"] = acceptance
+            node["write_scopes"] = write_scopes
+            node["assessment"] = _assessment_shell(assessment)
+            node["model"] = None
+            node["effort"] = None
+            node["route"]["attempt"] = len(node["attempts"])
+            if node["status"] == "ready":
+                node["status"] = "pending"
+            _reset_failed_leaf(node)
+            _refresh_node_assessment(state, args.node_id)
+            if (
+                _raw_over_budget(state, node)
+                and node["lineage"]["depth"] >= state["conventions"]["max_refinement_depth"]
+            ):
+                raise StateError("max_refinement_depth must produce a bounded final leaf")
+            if _dependency_snapshot(args.node_id, node) != prior_dependency_snapshot:
+                _invalidate_direct_dependents(state, args.node_id)
+            return add_event(state, "node_refined", node["assessment"]["rationale"], args.node_id)
+
+        operation = {"node_id": args.node_id, "refinement": refinement}
+        state, result, replay = _mutate_command(store, args, command, operation, refine)
+        return 0, "mutation_reconciled" if replay else "node_refined", {**_public_state(state), "event": result}, []
+
+    if command == "node-split":
+        plan = _read_command_object(args.plan_json, args.plan_file, "plan")
+        _keys(plan, {"parent_id", "reason", "children", "coverage", "dependent_replacements"}, "plan")
+
+        def split(state: dict[str, Any]) -> dict[str, Any]:
+            parent_id = _identifier(plan["parent_id"], "plan.parent_id")
+            parent = state["nodes"].get(parent_id)
+            if parent is None:
+                raise StateError("split parent is unknown")
+            _require_rewritable_leaf(parent, "node-split")
+            reason = _text(plan["reason"], "plan.reason", maximum=4096)
+            if (
+                parent["assessment"]["input_digest"] != _assessment_input_digest(state, parent)
+                or parent["assessment"]["state"] != _derived_assessment_state(state, parent)
+            ):
+                raise StateError("node-split requires a current parent assessment")
+            failed_executable = (
+                parent["status"] == "failed" and parent["assessment"]["state"] == "executable"
+            )
+            if parent["assessment"]["state"] != "split_required" and not failed_executable:
+                raise StateError("node-split requires split-required or current executable failed work")
+            depth = parent["lineage"]["depth"] + 1
+            if depth > state["conventions"]["max_refinement_depth"]:
+                raise StateError("node-split exceeds max_refinement_depth")
+            if not isinstance(plan["children"], list) or not 2 <= len(plan["children"]) <= MAX_NODES:
+                raise StateError("plan.children must contain at least two bounded child definitions")
+            if len(state["nodes"]) + len(plan["children"]) > MAX_NODES:
+                raise StateError("node capacity would be exceeded", code="capacity_exceeded", exit_code=20)
+
+            children = [
+                _split_child_record(raw, parent_id=parent_id, depth=depth, index=index)
+                for index, raw in enumerate(plan["children"])
+            ]
+            child_ids = [child["id"] for child in children]
+            child_id_set = set(child_ids)
+            if len(child_id_set) != len(child_ids):
+                raise StateError("plan.children identifiers must be unique")
+            collisions = child_id_set & set(state["nodes"])
+            if collisions:
+                raise StateError("plan.children identifiers already exist: " + ", ".join(sorted(collisions)))
+            known_ids = set(state["nodes"]) | child_id_set
+            for child in children:
+                unknown = set(child["dependencies"]) - known_ids
+                if unknown:
+                    raise StateError(
+                        f"plan child {child['id']} has unresolved dependencies: " + ", ".join(sorted(unknown))
+                    )
+
+            coverage = _keys(plan["coverage"], {"requirements", "outputs", "acceptance"}, "plan.coverage")
+            effective_obligations = _effective_obligations(parent)
+            requirement_coverage = _coverage_mapping(
+                coverage["requirements"], effective_obligations["requirements"], child_id_set,
+                "plan.coverage.requirements",
+            )
+            output_coverage = _coverage_mapping(
+                coverage["outputs"], effective_obligations["outputs"], child_id_set,
+                "plan.coverage.outputs",
+            )
+            acceptance_coverage = _coverage_mapping(
+                coverage["acceptance"], effective_obligations["acceptance"], child_id_set,
+                "plan.coverage.acceptance",
+            )
+            direct_dependents = sorted(
+                node_id for node_id, node in state["nodes"].items() if parent_id in node["dependencies"]
+            )
+            rewritable_dependents: list[str] = []
+            terminal_dependents: list[str] = []
+            for dependent_id in direct_dependents:
+                dependent = state["nodes"][dependent_id]
+                if dependent["status"] in SUCCESS_NODE_STATUSES:
+                    terminal_dependents.append(dependent_id)
+                else:
+                    _require_rewritable_leaf(dependent, "node-split dependent rewiring")
+                    rewritable_dependents.append(dependent_id)
+            dependent_replacements = _coverage_mapping(
+                plan["dependent_replacements"], rewritable_dependents, child_id_set,
+                "plan.dependent_replacements",
+            )
+
+            for child in children:
+                state["nodes"][child["id"]] = child
+            for field, mapping in (
+                ("requirements", requirement_coverage),
+                ("outputs", output_coverage),
+                ("acceptance", acceptance_coverage),
+            ):
+                for obligation, selected in mapping.items():
+                    for child_id in selected:
+                        state["nodes"][child_id]["lineage"]["obligations"][field].append(obligation)
+            for child_id in child_ids:
+                _refresh_node_assessment(state, child_id)
+            if any(
+                _raw_over_budget(state, state["nodes"][child_id])
+                and state["nodes"][child_id]["lineage"]["depth"]
+                >= state["conventions"]["max_refinement_depth"]
+                for child_id in child_ids
+            ):
+                raise StateError("max_refinement_depth requires bounded final children")
+            if any(
+                state["nodes"][child_id]["assessment"]["total"] >= parent["assessment"]["total"]
+                for child_id in child_ids
+            ):
+                raise StateError("every split child must have lower total complexity than its parent")
+            parent_dependencies = list(parent["dependencies"])
+            parent["dependencies"] = []
+
+            for dependent_id in rewritable_dependents:
+                dependent = state["nodes"][dependent_id]
+                rewired: list[str] = []
+                for dependency in dependent["dependencies"]:
+                    replacements = dependent_replacements[dependent_id] if dependency == parent_id else [dependency]
+                    for replacement in replacements:
+                        if replacement not in rewired:
+                            rewired.append(replacement)
+                dependent["dependencies"] = rewired
+                _invalidate_assessment(state, dependent)
+            for dependent_id in terminal_dependents:
+                dependent = state["nodes"][dependent_id]
+                dependent["dependencies"] = [
+                    dependency for dependency in dependent["dependencies"] if dependency != parent_id
+                ]
+
+            for dependency in parent_dependencies:
+                if not any(
+                    _child_reaches_prerequisite(
+                        state["nodes"], child_id, dependency, child_id_set
+                    )
+                    for child_id in child_ids
+                ):
+                    raise StateError(f"split silently drops parent prerequisite {dependency}")
+
+            parent["lineage"]["child_ids"] = child_ids
+            parent["lineage"]["split_reason"] = reason
+            parent["assessment"]["state"] = "decomposed"
+            parent["status"] = "skipped"
+            if parent["result"] is None:
+                parent["result"] = "decomposed"
+            if parent["evidence"] is None:
+                parent["evidence"] = reason
+            return add_event(state, "node_split", reason, parent_id)
+
+        state, result, replay = _mutate_command(store, args, command, plan, split)
+        return 0, "mutation_reconciled" if replay else "node_split", {**_public_state(state), "event": result}, []
 
     if command == "node-route":
         operation = {
@@ -1328,27 +2288,32 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
         def route(state: dict[str, Any]) -> dict[str, Any]:
             node = state["nodes"].get(args.node_id)
-            retry_launch = bool(node and node["status"] == "failed" and node["launch"]["state"] == "terminal")
+            future = bool(
+                node
+                and node["status"] in ("pending", "ready")
+                and node["launch"]["state"] == "unclaimed"
+            )
+            failed_retry = bool(
+                node
+                and node["status"] == "failed"
+                and node["launch"]["state"] in ("unclaimed", "terminal")
+            )
             if (
                 not node
-                or node["status"] not in ("pending", "ready", "failed")
-                or (node["launch"]["state"] != "unclaimed" and not retry_launch)
+                or not (future or failed_retry)
+                or not _assessment_is_current_executable(state, args.node_id)
             ):
-                raise StateError("only unclaimed future/retry work can be routed")
-            if retry_launch:
-                node["launch"] = {
-                    "state": "unclaimed",
-                    "request_id": None,
-                    "child_id": None,
-                    "claimed_at": None,
-                    "reconciliation": None,
-                }
+                raise StateError("node-route requires current executable future or failed leaf work")
+            if _workflow_dispatch_blocked(state) or args.node_id in _active_blocked_node_ids(state):
+                raise StateError("node-route requires an unblocked workflow and node")
+            if not _planning_at_fixed_point(state):
+                raise StateError(PLANNING_FIXED_POINT_ERROR)
+            prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
+            _reset_failed_leaf(node)
+            if _dependency_snapshot(args.node_id, node) != prior_dependency_snapshot:
+                _invalidate_direct_dependents(state, args.node_id)
             node.update({"role": args.role, "model": args.model, "effort": args.effort})
             node["route"] = {"rationale": args.rationale, "routed_at": now_iso(), "attempt": len(node["attempts"]) + 1}
-            if node["status"] == "failed":
-                node["status"] = "pending"
-                node["result"] = None
-                node["evidence"] = None
             return add_event(state, "node_routed", args.rationale, args.node_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, route)
@@ -1372,6 +2337,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             node = state["nodes"].get(args.node_id)
             if not node:
                 raise StateError("unknown node")
+            prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
             if not any(value is not None for key, value in operation.items() if key != "node_id"):
                 raise StateError("node-update requires a changed field")
             if args.launch_state is not None:
@@ -1387,6 +2353,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 if args.launch_state not in allowed_launch[old_launch]:
                     raise StateError(f"invalid launch transition {old_launch} -> {args.launch_state}")
                 if args.launch_state == "claimed":
+                    if not _planning_at_fixed_point(state):
+                        raise StateError(PLANNING_FIXED_POINT_ERROR)
                     if args.node_id not in ready_nodes(state):
                         raise StateError("launch claim requires ready, dependency-safe, unblocked future work")
                     if not args.request_id:
@@ -1428,6 +2396,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         "claimed_at": None,
                         "reconciliation": args.reconciliation,
                     }
+                    _invalidate_assessment(state, node)
                     _refresh_recovery_status(state)
                 elif state["status"] == "aborted" and args.launch_state == "terminal":
                     node["launch"].update({"state": "terminal", "reconciliation": args.reconciliation})
@@ -1449,6 +2418,14 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 old_status = node["status"]
                 if args.status not in allowed_status[old_status]:
                     raise StateError(f"invalid node transition {old_status} -> {args.status}")
+                if (
+                    state["status"] != "aborted"
+                    and args.status in ("skipped", "cancelled")
+                    and not node["lineage"]["child_ids"]
+                    and node["superseded_by"] is None
+                    and any(node["lineage"]["obligations"][field] for field in OBLIGATION_FIELDS)
+                ):
+                    raise StateError("node transition cannot discard carried obligations")
                 if args.status == "running":
                     if node["launch"]["state"] not in ("bound", "running"):
                         raise StateError("running node requires a bound child launch")
@@ -1457,10 +2434,23 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     node["launch"]["state"] = "running"
                     state["status"] = "running"
                     state["phase"] = node["stage"]
-                if args.status == "ready" and any(
-                    state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]
-                ):
-                    raise StateError("node dependencies are not terminal-successful")
+                if args.status == "ready":
+                    if (
+                        node["launch"]["state"] != "unclaimed"
+                        or node["lineage"]["child_ids"]
+                        or args.node_id in _active_blocked_node_ids(state)
+                        or not _assessment_is_current_executable(state, args.node_id)
+                    ):
+                        raise StateError(
+                            "ready transition requires an unclaimed leaf with a current executable assessment"
+                        )
+                    if not _planning_at_fixed_point(state):
+                        raise StateError(PLANNING_FIXED_POINT_ERROR)
+                    if any(
+                        state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES
+                        for dependency in node["dependencies"]
+                    ):
+                        raise StateError("node dependencies are not terminal-successful")
                 node["status"] = args.status
                 if args.status in TERMINAL_NODE_STATUSES:
                     if args.status == "done" and (not args.result or not args.evidence):
@@ -1469,11 +2459,15 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     node["evidence"] = args.evidence
                     if node["launch"]["child_id"]:
                         node["launch"]["state"] = "terminal"
-                    if node["attempts"]:
+                    if node["attempts"] and node["attempts"][-1]["finished_at"] is None:
                         node["attempts"][-1]["finished_at"] = now_iso()
                         node["attempts"][-1]["outcome"] = args.attempt_outcome or args.status
             if args.actual_cost is not None:
                 node["actual_cost"] = args.actual_cost
+            if node["status"] == "failed" and _assessable_leaf(node):
+                _invalidate_assessment(state, node)
+            if _dependency_snapshot(args.node_id, node) != prior_dependency_snapshot:
+                _invalidate_direct_dependents(state, args.node_id)
             return add_event(state, "node_updated", f"node status={node['status']} launch={node['launch']['state']}", args.node_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, update)
@@ -1482,7 +2476,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
     if command == "graph-validate":
         state = store.load(args.workflow_id)
         diagnostics = graph_diagnostics(state["nodes"], case_sensitive=state["conventions"]["write_scope_case_sensitive"])
-        diagnostics["ready_nodes"] = ready_nodes(state)
+        diagnostics.update(planning_diagnostics(state))
+        diagnostics["ready_nodes"] = diagnostics["dispatch_order"]
         return 0, "graph_valid", diagnostics, []
 
     if command == "graph-replan":
@@ -1511,8 +2506,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     dependencies = node["dependencies"]
                     if item["op"] == "dependency_add" and dependency not in dependencies:
                         dependencies.append(dependency)
+                        _invalidate_assessment(state, node)
                     if item["op"] == "dependency_remove" and dependency in dependencies:
                         dependencies.remove(dependency)
+                        _invalidate_assessment(state, node)
                 elif item["op"] == "priority":
                     if (
                         set(item) != {"op", "node_id", "value"}
@@ -1525,6 +2522,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 elif item["op"] == "remove":
                     if set(item) != {"op", "node_id"} or any(node_id in other["dependencies"] for other in state["nodes"].values()):
                         raise StateError("only an unreferenced node can be removed")
+                    if any(node["lineage"]["obligations"][field] for field in OBLIGATION_FIELDS):
+                        raise StateError("cannot remove a node with carried obligations")
                     del state["nodes"][node_id]
                 else:
                     replacement = item.get("replacement")
@@ -1536,13 +2535,45 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         raise StateError("supersede operation is malformed")
                     if replacement == node_id:
                         raise StateError("node cannot supersede itself")
+                    cursor = replacement
+                    while cursor != node_id and state["nodes"][cursor]["superseded_by"] is not None:
+                        cursor = state["nodes"][cursor]["superseded_by"]
+                    if cursor == node_id:
+                        raise StateError("superseded_by cycle is not allowed")
+                    replacement_node = state["nodes"][replacement]
+                    transfer_required = any(
+                        not set(node["lineage"]["obligations"][field]).issubset(
+                            replacement_node["lineage"]["obligations"][field]
+                        )
+                        for field in OBLIGATION_FIELDS
+                    )
+                    if transfer_required:
+                        _require_rewritable_leaf(
+                            replacement_node, "graph-replan supersede replacement"
+                        )
+                        prior_replacement_snapshot = _dependency_snapshot(
+                            replacement, replacement_node
+                        )
+                        for field in OBLIGATION_FIELDS:
+                            replacement_node["lineage"]["obligations"][field] = _ordered_union(
+                                replacement_node["lineage"]["obligations"][field],
+                                node["lineage"]["obligations"][field],
+                            )
+                        _invalidate_assessment(state, replacement_node)
+                        if (
+                            _dependency_snapshot(replacement, replacement_node)
+                            != prior_replacement_snapshot
+                        ):
+                            _invalidate_direct_dependents(state, replacement)
                     node["status"] = "skipped"
                     node["result"] = "superseded"
                     node["evidence"] = plan["reason"]
                     node["superseded_by"] = replacement
                     for other in state["nodes"].values():
-                        other["dependencies"] = [replacement if value == node_id else value for value in other["dependencies"]]
-                        other["dependencies"] = list(dict.fromkeys(other["dependencies"]))
+                        if node_id in other["dependencies"]:
+                            other["dependencies"] = [replacement if value == node_id else value for value in other["dependencies"]]
+                            other["dependencies"] = list(dict.fromkeys(other["dependencies"]))
+                            _invalidate_assessment(state, other)
             return add_event(state, "graph_replanned", plan["reason"])
 
         state, result, replay = _mutate_command(store, args, command, plan, replan)
@@ -1560,12 +2591,18 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         def requirement(state: dict[str, Any]) -> dict[str, Any]:
             if args.status != "active" and not args.evidence:
                 raise StateError("resolved requirement needs evidence")
-            state["requirements"][args.requirement_id] = {
+            replacement = {
                 "text": args.text,
                 "source": args.source,
                 "status": args.status,
                 "evidence": args.evidence,
             }
+            changed = state["requirements"].get(args.requirement_id) != replacement
+            state["requirements"][args.requirement_id] = replacement
+            if changed:
+                for node in state["nodes"].values():
+                    if args.requirement_id in _effective_obligations(node)["requirements"]:
+                        _invalidate_assessment(state, node)
             return add_event(state, "requirement_set", args.requirement_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, requirement)
@@ -1594,8 +2631,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         def block(state: dict[str, Any]) -> dict[str, Any]:
             if args.node_id and args.node_id not in state["nodes"]:
                 raise StateError("blocker references unknown node")
-            if args.node_id and state["nodes"][args.node_id]["status"] not in ("pending", "ready"):
-                raise StateError("only unlaunched future work can be blocked")
+            if args.node_id:
+                node = state["nodes"][args.node_id]
+                if node["status"] not in ("pending", "ready") or node["launch"]["state"] != "unclaimed":
+                    raise StateError("only unlaunched future work can be blocked")
             item = {
                 "id": "blocker-" + hashlib.sha256(args.mutation_id.encode()).hexdigest()[:16],
                 "node_id": args.node_id,
