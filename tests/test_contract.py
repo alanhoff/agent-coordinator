@@ -28,10 +28,11 @@ EXPECTED_ROLES = {
 
 
 class PublicContractTests(unittest.TestCase):
-    def test_schema_v4_refinement_and_node_split_public_contract(self) -> None:
+    def test_schema_v6_refinement_and_node_split_public_contract(self) -> None:
         protocol = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")
         complexity_path = ROOT / "skill" / "references" / "complexity-accounting.md"
         complexity_reference = complexity_path.read_text(encoding="utf-8")
+        routing_reference = (ROOT / "skill" / "references" / "model-routing.md").read_text(encoding="utf-8")
 
         for required in (
             "node-refine",
@@ -41,6 +42,8 @@ class PublicContractTests(unittest.TestCase):
             "references/complexity-accounting.md",
         ):
             self.assertIn(required, protocol)
+        self.assertIn("assessment.ambiguity_total + 1", routing_reference)
+        self.assertNotIn("assessment.ambiguity_peak + 1", routing_reference)
 
         examples = [
             json.loads(block)
@@ -53,9 +56,15 @@ class PublicContractTests(unittest.TestCase):
             set(refinement["spec"]),
             {"objective", "inputs", "outputs", "constraints", "non_goals", "requirement_ids", "open_questions"},
         )
-        self.assertEqual(set(refinement["assessment"]), {"dimensions", "ambiguity", "rationale"})
+        self.assertEqual(
+            set(refinement["assessment"]),
+            {"dimensions", "ambiguity_factors", "rationale"},
+        )
         self.assertEqual(set(refinement["assessment"]["dimensions"]), {
             "breadth", "change_surface", "coupling", "novelty", "verification",
+        })
+        self.assertEqual(set(refinement["assessment"]["ambiguity_factors"]), {
+            "objective", "inputs", "boundaries", "dependencies", "acceptance",
         })
 
         self.assertEqual(
@@ -76,7 +85,10 @@ class PublicContractTests(unittest.TestCase):
                     "open_questions",
                 },
             )
-            self.assertEqual(set(child["assessment"]), {"dimensions", "ambiguity", "rationale"})
+            self.assertEqual(
+                set(child["assessment"]),
+                {"dimensions", "ambiguity_factors", "rationale"},
+            )
         self.assertEqual(set(split["coverage"]), {"requirements", "outputs", "acceptance"})
         for mapping in (*split["coverage"].values(), split["dependent_replacements"]):
             self.assertIsInstance(mapping, dict)
@@ -112,6 +124,7 @@ class PublicContractTests(unittest.TestCase):
         self.assertNotIn("VER" + "SION", (ROOT / "src" / "coordinator" / "__init__.py").read_text(encoding="utf-8"))
         state = new_state({"path": "/repository", "identity": "0" * 64}, "task", "session")
         self.assertNotIn("version", state)
+        self.assertNotIn("git", state)
 
     def test_inline_role_profiles(self) -> None:
         roles = ROOT / "skill" / "agents" / "roles"
@@ -203,6 +216,8 @@ class PublicContractTests(unittest.TestCase):
         execution = " ".join(execution.split())
         for required in (
             "delegation as enabled only when a subagent creation or delegation tool is callable",
+            "select and claim exactly one inline node",
+            "Never preclaim work for later inline execution",
             "lowercase SHA-256 digest of the request ID",
             "execute the same packet in the parent",
             "persist `reconcile_required`",
@@ -223,6 +238,14 @@ class PublicContractTests(unittest.TestCase):
         self.assertEqual(set(versions), {"3.11"})
         self.assertIn("ruff check --no-cache src skill/scripts tests", ci)
         self.assertIn("python -m compileall -q src skill/scripts tests", ci)
+
+    def test_compose_requires_a_fresh_full_workspace_without_a_demo_oracle(self) -> None:
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        self.assertIn("./data/project:/workspace", compose)
+        self.assertIn("unexpected_entry=$$(find /workspace", compose)
+        self.assertIn("test -z \"$$unexpected_entry\"", compose)
+        self.assertNotIn("git ", compose.casefold())
+        self.assertNotIn("npm test", compose)
 
 
 if __name__ == "__main__":

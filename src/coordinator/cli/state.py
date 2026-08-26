@@ -6,7 +6,15 @@ import argparse
 from typing import Any, Sequence
 
 from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocation
-from coordinator.state.store import LAUNCH_STATES, NODE_STATUSES, ROLES, StateError, StateStore, execute_command
+from coordinator.state.store import (
+    AMBIGUITY_FACTORS,
+    LAUNCH_STATES,
+    NODE_STATUSES,
+    ROLES,
+    StateError,
+    StateStore,
+    execute_command,
+)
 
 
 def _add_mutation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -45,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "context"):
         target = _subcommand(sub, name)
         target.add_argument("--workflow-id", required=True)
-    reconcile = _subcommand(sub, "reconcile-commit")
+    reconcile = _subcommand(sub, "reconcile-mutation")
     reconcile.add_argument("--workflow-id", required=True)
     reconcile.add_argument("--mutation-id", required=True)
     reconcile.add_argument("--digest")
@@ -59,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--stage", required=True)
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--dependency", action="append", default=[])
-    add.add_argument("--write-scope", action="append", required=True)
+    add.add_argument("--write-scope", action="append", default=[])
     add.add_argument("--role", choices=ROLES, required=True)
     add.add_argument("--model")
     add.add_argument("--effort")
@@ -78,7 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--coupling", type=int, required=True)
     add.add_argument("--novelty", type=int, required=True)
     add.add_argument("--verification", type=int, required=True)
-    add.add_argument("--ambiguity", type=int, required=True)
+    for factor in AMBIGUITY_FACTORS:
+        add.add_argument(f"--ambiguity-{factor}", dest=f"ambiguity_{factor}", type=int, required=True)
     add.add_argument("--complexity-rationale", required=True)
     refine = _subcommand(sub, "node-refine", mutate=True)
     refine.add_argument("--node-id", required=True)
@@ -135,7 +144,6 @@ def build_parser() -> argparse.ArgumentParser:
     finish = _subcommand(sub, "finish", mutate=True)
     finish.add_argument("--summary", required=True)
     finish.add_argument("--validation", required=True)
-    finish.add_argument("--commit", required=True)
     abort = _subcommand(sub, "abort", mutate=True)
     abort.add_argument("--reason", required=True)
     return parser

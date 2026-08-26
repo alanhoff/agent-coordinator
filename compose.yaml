@@ -7,7 +7,7 @@ services:
       PYTHONPATH: /coordinator-src
     working_dir: /workspace
     volumes:
-      - ./data/backend:/workspace/backend
+      - ./data/project:/workspace
       - ./data/.codex:/root/.codex
       - ./data/.agent-coordinator:/root/.agent-coordinator
       - ./skill:/root/.agents/skills/coordinator:ro
@@ -22,14 +22,12 @@ services:
         chown -R root:root /root/.agent-coordinator
         chmod -R go-rwx /root/.agent-coordinator
         restore_host_ownership() {
-          chown -R "$$host_uid:$$host_gid" /root/.codex /root/.agent-coordinator /workspace/backend
+          chown -R "$$host_uid:$$host_gid" /root/.codex /root/.agent-coordinator /workspace
         }
         trap restore_host_ownership EXIT
-        git init -q
-        git config user.name "Codex Coordinator"
-        git config user.email "coordinator@example.invalid"
-        git add -A
-        git commit -qm baseline --allow-empty
+        unexpected_entry=$$(find /workspace -mindepth 1 -maxdepth 1 ! -name .nvmrc -print -quit)
+        test -z "$$unexpected_entry"
+        test ! -e /workspace/.nvmrc || { test -f /workspace/.nvmrc && test ! -L /workspace/.nvmrc; }
         npx --yes @openai/codex@0.149.1 exec \
           --ignore-user-config \
           --model gpt-5.6-luna \
@@ -44,10 +42,10 @@ services:
     image: ghcr.io/openai/codex-universal@sha256:905e512f36460e1be4cfedb30928a8a28299edb0fcd5de7998ceaa72d27fe304
     environment:
       CODEX_ENV_NODE_VERSION: "22"
-      DB_PATH: /data/todos.db
+      TODO_DB_PATH: /data/todos.db
     working_dir: /workspace
     volumes:
-      - ./data/backend:/workspace/backend
+      - ./data/project:/workspace:ro
       - ./data/sqlite:/data
     ports:
       - "3000:3000"
@@ -55,7 +53,7 @@ services:
       - -c
       - |
         set -e
-        test -e "$$DB_PATH" || touch "$$DB_PATH"
+        test -e "$$TODO_DB_PATH" || touch "$$TODO_DB_PATH"
         chown -R "$$(stat -c %u /workspace/backend):$$(stat -c %g /workspace/backend)" /data
         cd /workspace/backend
         exec npm start

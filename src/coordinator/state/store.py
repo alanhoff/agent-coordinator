@@ -13,14 +13,16 @@ import re
 import secrets
 import stat
 import sys
+import unicodedata
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_NODES = 128
 MAX_EVENTS = 512
 MAX_RECEIPTS = 2048
+MAX_ATTEMPTS = 32
 MAX_TEXT = 32_768
 ROLES = (
     "architect",
@@ -38,16 +40,35 @@ SUCCESS_NODE_STATUSES = frozenset(("done", "skipped", "cancelled"))
 WORKFLOW_STATUSES = ("planning", "running", "blocked", "completed", "aborted")
 LAUNCH_STATES = ("unclaimed", "claimed", "reconcile_required", "bound", "running", "terminal")
 COMPLEXITY_DIMENSIONS = ("breadth", "change_surface", "coupling", "novelty", "verification")
+AMBIGUITY_FACTORS = ("objective", "inputs", "boundaries", "dependencies", "acceptance")
 ASSESSMENT_STATES = ("executable", "split_required", "refinement_required", "stale", "decomposed")
-ASSESSMENT_RUBRIC_VERSION = 1
-OBLIGATION_FIELDS = ("requirements", "outputs", "acceptance")
+ASSESSMENT_RUBRIC_VERSION = 2
+COVERAGE_FIELDS = ("requirements", "outputs", "acceptance")
+OBLIGATION_FIELDS = (
+    "objectives",
+    "requirements",
+    "inputs",
+    "outputs",
+    "constraints",
+    "non_goals",
+    "acceptance",
+    "write_scopes",
+)
 PLANNING_FIXED_POINT_ERROR = (
     "workflow planning fixed point requires every non-blocked assessable leaf "
     "to have a current executable assessment"
 )
+FINISH_EVENT_SEPARATOR = "; validation: "
 ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+WINDOWS_RESERVED_SCOPE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+    | {f"COM{index}" for index in "¹²³"}
+    | {f"LPT{index}" for index in "¹²³"}
+)
+WINDOWS_FORBIDDEN_SCOPE_CHARACTERS = frozenset('<>:"|?*')
 
 
 class StateError(RuntimeError):
@@ -103,106 +124,60 @@ def _decode_json(data: bytes | str, field: str, *, exit_code: int = 20) -> Any:
         return json.loads(data, object_pairs_hook=pairs)
     except StateError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise StateError(f"{field} is not valid UTF-8 JSON", code="corrupt_state", exit_code=exit_code) from exc
 
 
-def _lock_evidence(path: pathlib.Path) -> tuple[tuple[int, int, int, int, int, int], bytes, int] | None:
+def _json_bytes(value: Any, *, indent: int | None = 2) -> bytes:
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise StateError("workflow lock evidence is ambiguous", code="concurrent_controller", exit_code=20) from exc
+        suffix = "\n" if indent is not None else ""
+        return (
+            json.dumps(
+                value,
+                indent=indent,
+                sort_keys=True,
+                separators=None if indent is not None else (",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + suffix
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise StateError("state is not canonical JSON data") from exc
+
+
+def _acquire_advisory_lock(descriptor: int) -> None:
     try:
-        with os.fdopen(descriptor, "rb") as handle:
-            info = os.fstat(handle.fileno())
-            raw = handle.read(4097)
-        after = path.lstat()
-    except OSError as exc:
-        raise StateError("workflow lock evidence is ambiguous", code="concurrent_controller", exit_code=20) from exc
-    identity = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns)
-    observed = (after.st_dev, after.st_ino, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns)
-    if (
-        identity != observed
-        or not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(after.st_mode)
-        or _is_reparse(after)
-        or info.st_nlink != 1
-        or len(raw) > 4096
-        or len(raw) != info.st_size
-        or (os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077))
-    ):
-        raise StateError("workflow lock evidence is ambiguous", code="concurrent_controller", exit_code=20)
-    try:
-        value = _decode_json(raw, "workflow lock")
-        if not isinstance(value, dict) or set(value) != {"pid", "nonce", "created_at"}:
-            raise StateError("workflow lock fields are invalid")
-        if not isinstance(value["pid"], int) or isinstance(value["pid"], bool) or value["pid"] <= 0:
-            raise StateError("workflow lock process is invalid")
-        if not isinstance(value["nonce"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"]):
-            raise StateError("workflow lock nonce is invalid")
-        _parse_time(value["created_at"], "workflow lock created_at")
-    except StateError as exc:
-        raise StateError("workflow lock evidence is ambiguous", code="concurrent_controller", exit_code=20) from exc
-    return identity, raw, value["pid"]
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, PermissionError, OSError) as exc:
+        raise StateError(
+            "workflow is locked by another controller",
+            code="concurrent_controller",
+            exit_code=20,
+        ) from exc
 
 
-def _windows_process_is_proven_dead(pid: int) -> bool:
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    open_process.restype = wintypes.HANDLE
-    get_exit_code = kernel32.GetExitCodeProcess
-    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    get_exit_code.restype = wintypes.BOOL
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-
-    handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER
-    try:
-        exit_code = wintypes.DWORD()
-        if not get_exit_code(handle, ctypes.byref(exit_code)):
-            return False
-        return exit_code.value != 259  # STILL_ACTIVE
-    finally:
-        close_handle(handle)
-
-
-def _process_is_proven_dead(pid: int) -> bool:
+def _release_advisory_lock(descriptor: int) -> None:
     if os.name == "nt":
-        return _windows_process_is_proven_dead(pid)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError):
-        return False
-    return False
+        import msvcrt
 
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
 
-def _remove_proven_stale_lock(path: pathlib.Path) -> bool:
-    try:
-        first = _lock_evidence(path)
-        if first is None:
-            return True
-        if not _process_is_proven_dead(first[2]):
-            return False
-        second = _lock_evidence(path)
-        if second is None:
-            return True
-        if second != first:
-            return False
-        path.unlink()
-        return True
-    except (OSError, StateError):
-        return False
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _keys(value: Any, expected: set[str], field: str) -> Mapping[str, Any]:
@@ -236,31 +211,468 @@ def _identifier(value: Any, field: str) -> str:
     return text
 
 
+def _repository_identity(path: pathlib.Path, info: os.stat_result) -> str:
+    inode = getattr(info, "st_ino", 0)
+    device = getattr(info, "st_dev", None)
+    if not isinstance(inode, int) or inode <= 0 or not isinstance(device, int):
+        raise StateError(
+            "repository filesystem does not expose a stable object identity",
+            code="invalid_repository",
+            exit_code=20,
+        )
+    canonical = os.path.normcase(str(path)) if os.name == "nt" else str(path)
+    digest = hashlib.sha256()
+    for field in (
+        b"repository-object-v1",
+        os.fsencode(canonical),
+        str(device).encode(),
+        str(inode).encode(),
+    ):
+        digest.update(len(field).to_bytes(8, "big"))
+        digest.update(field)
+    return digest.hexdigest()
+
+
 def canonical_repository(path: pathlib.Path) -> dict[str, str]:
     resolved = pathlib.Path(os.path.realpath(path.expanduser())).resolve()
-    if not resolved.is_dir():
+    try:
+        info = resolved.lstat()
+        if os.name != "nt":
+            _assert_no_link_components(resolved)
+    except (FileNotFoundError, OSError) as exc:
+        raise StateError(
+            f"unable to inspect repository path: {resolved}",
+            code="invalid_repository",
+            exit_code=20,
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info):
         raise StateError(f"repository path is not a directory: {resolved}", code="invalid_repository")
-    canonical = os.path.normcase(str(resolved)) if os.name == "nt" else str(resolved)
-    return {"path": str(resolved), "identity": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    return {"path": str(resolved), "identity": _repository_identity(resolved, info)}
 
 
-def _scope(value: Any, field: str, *, case_sensitive: bool) -> str:
-    raw = _text(value, field, maximum=512).replace("\\", "/")
+def _repository_case_sensitive(repository_path: str) -> bool:
+    if os.name == "nt":
+        return False
+    token = f".agent-coordinator-case-{secrets.token_hex(8)}"
+    probe = pathlib.Path(repository_path) / token
+    alternate = pathlib.Path(repository_path) / token.upper()
+    try:
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        return False
+    close_error: OSError | None = None
+    try:
+        case_sensitive = not alternate.exists()
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            close_error = exc
+        try:
+            probe.unlink()
+        except OSError as exc:
+            raise StateError(
+                "unable to remove repository case-sensitivity probe",
+                code="io_error",
+                exit_code=20,
+            ) from exc
+        if close_error is not None:
+            raise StateError(
+                "unable to close repository case-sensitivity probe",
+                code="io_error",
+                exit_code=20,
+            ) from close_error
+    return case_sensitive
+
+
+def _scope_path(repository_path: str, scope: str) -> pathlib.Path | None:
+    current = pathlib.Path(repository_path)
+    parts = pathlib.PurePosixPath(scope).parts
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise StateError("unable to inspect node write scope", code="io_error", exit_code=20) from exc
+        if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+            raise StateError("node write scope contains an unsafe link", code="unsafe_path", exit_code=20)
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise StateError("node write scope has a non-directory parent", code="unsafe_path", exit_code=20)
+        if index == len(parts) - 1 and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise StateError("node write scope is not a regular file or directory", code="unsafe_path", exit_code=20)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+            raise StateError("node write scope contains a hard-linked file", code="unsafe_path", exit_code=20)
+    return current
+
+
+def _hash_scope_field(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _hash_scope_entry(digest: Any, path: pathlib.Path, relative: str) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise StateError("unable to inspect node write scope", code="io_error", exit_code=20) from exc
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and not _is_reparse(info):
+        _hash_scope_field(digest, b"directory")
+        _hash_scope_field(digest, os.fsencode(relative))
+        _hash_scope_field(digest, f"{mode:o}".encode("ascii"))
+        try:
+            children = sorted(path.iterdir(), key=lambda item: os.fsencode(item.name))
+        except OSError as exc:
+            raise StateError("unable to enumerate node write scope", code="io_error", exit_code=20) from exc
+        for child in children:
+            child_relative = f"{relative}/{child.name}" if relative else child.name
+            _hash_scope_entry(digest, child, child_relative)
+        return
+    if stat.S_ISREG(info.st_mode):
+        content_digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    content_digest.update(chunk)
+        except OSError as exc:
+            raise StateError("unable to read node write scope", code="io_error", exit_code=20) from exc
+        _hash_scope_field(digest, b"file")
+        _hash_scope_field(digest, os.fsencode(relative))
+        _hash_scope_field(digest, f"{mode:o}".encode("ascii"))
+        _hash_scope_field(digest, content_digest.digest())
+        return
+    if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            raise StateError("unable to inspect link in node write scope", code="io_error", exit_code=20) from exc
+        _hash_scope_field(digest, b"link")
+        _hash_scope_field(digest, os.fsencode(relative))
+        _hash_scope_field(digest, os.fsencode(target))
+        return
+    _hash_scope_field(digest, b"special")
+    _hash_scope_field(digest, os.fsencode(relative))
+    _hash_scope_field(digest, f"{info.st_mode:o}".encode("ascii"))
+
+
+def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+    )
+
+
+def _open_anchored_entry(parent: int, name: str, expected: os.stat_result) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if stat.S_ISDIR(expected.st_mode):
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+        actual = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise StateError(
+            "node write scope changed while it was inspected",
+            code="io_error",
+            exit_code=20,
+        ) from exc
+    if not _same_object(expected, actual):
+        os.close(descriptor)
+        raise StateError(
+            "node write scope changed while it was inspected",
+            code="io_error",
+            exit_code=20,
+        )
+    return descriptor
+
+
+def _hash_anchored_entry(
+    digest: Any,
+    parent: int,
+    name: str,
+    relative: str,
+    info: os.stat_result,
+) -> None:
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and not _is_reparse(info):
+        descriptor = _open_anchored_entry(parent, name, info)
+        try:
+            _hash_scope_field(digest, b"directory")
+            _hash_scope_field(digest, os.fsencode(relative))
+            _hash_scope_field(digest, f"{mode:o}".encode("ascii"))
+            try:
+                children = sorted(os.listdir(descriptor), key=os.fsencode)
+            except OSError as exc:
+                raise StateError(
+                    "unable to enumerate node write scope",
+                    code="io_error",
+                    exit_code=20,
+                ) from exc
+            for child in children:
+                try:
+                    child_info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+                except OSError as exc:
+                    raise StateError(
+                        "unable to inspect node write scope",
+                        code="io_error",
+                        exit_code=20,
+                    ) from exc
+                child_relative = f"{relative}/{child}" if relative else child
+                _hash_anchored_entry(digest, descriptor, child, child_relative, child_info)
+        finally:
+            os.close(descriptor)
+        return
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink != 1:
+            raise StateError(
+                "node write scope contains a hard-linked file",
+                code="unsafe_path",
+                exit_code=20,
+            )
+        descriptor = _open_anchored_entry(parent, name, info)
+        content_digest = hashlib.sha256()
+        try:
+            while chunk := os.read(descriptor, 1024 * 1024):
+                content_digest.update(chunk)
+        except OSError as exc:
+            raise StateError("unable to read node write scope", code="io_error", exit_code=20) from exc
+        finally:
+            os.close(descriptor)
+        _hash_scope_field(digest, b"file")
+        _hash_scope_field(digest, os.fsencode(relative))
+        _hash_scope_field(digest, f"{mode:o}".encode("ascii"))
+        _hash_scope_field(digest, content_digest.digest())
+        return
+    if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+        try:
+            target = os.readlink(name, dir_fd=parent)
+        except OSError as exc:
+            raise StateError("unable to inspect link in node write scope", code="io_error", exit_code=20) from exc
+        _hash_scope_field(digest, b"link")
+        _hash_scope_field(digest, os.fsencode(relative))
+        _hash_scope_field(digest, os.fsencode(target))
+        return
+    _hash_scope_field(digest, b"special")
+    _hash_scope_field(digest, os.fsencode(relative))
+    _hash_scope_field(digest, f"{info.st_mode:o}".encode("ascii"))
+
+
+def _anchored_scope_fingerprint(root: int, scope: str) -> str | None:
+    current = os.dup(root)
+    try:
+        parts = pathlib.PurePosixPath(scope).parts
+        for index, part in enumerate(parts):
+            try:
+                info = os.stat(part, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise StateError(
+                    "unable to inspect node write scope",
+                    code="io_error",
+                    exit_code=20,
+                ) from exc
+            final = index == len(parts) - 1
+            if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+                raise StateError(
+                    "node write scope contains an unsafe link",
+                    code="unsafe_path",
+                    exit_code=20,
+                )
+            if not final and not stat.S_ISDIR(info.st_mode):
+                raise StateError(
+                    "node write scope has a non-directory parent",
+                    code="unsafe_path",
+                    exit_code=20,
+                )
+            if final:
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise StateError(
+                        "node write scope is not a regular file or directory",
+                        code="unsafe_path",
+                        exit_code=20,
+                    )
+                digest = hashlib.sha256()
+                _hash_anchored_entry(digest, current, part, "", info)
+                return digest.hexdigest()
+            child = _open_anchored_entry(current, part, info)
+            os.close(current)
+            current = child
+    finally:
+        os.close(current)
+    return None
+
+
+@contextmanager
+def _anchored_repository(repository: Mapping[str, str]) -> Iterator[int | None]:
+    path = pathlib.Path(repository["path"])
+    if os.name == "nt":
+        current = canonical_repository(path)
+        if current["identity"] != repository["identity"]:
+            raise StateError(
+                "workflow repository object changed",
+                code="invalid_repository",
+                exit_code=20,
+            )
+        yield None
+        after = canonical_repository(path)
+        if after["identity"] != repository["identity"]:
+            raise StateError(
+                "workflow repository object changed while it was inspected",
+                code="invalid_repository",
+                exit_code=20,
+            )
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        raise StateError(
+            "unable to open workflow repository object",
+            code="invalid_repository",
+            exit_code=20,
+        ) from exc
+    try:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or _repository_identity(path, info) != repository["identity"]
+        ):
+            raise StateError(
+                "workflow repository object changed",
+                code="invalid_repository",
+                exit_code=20,
+            )
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _scope_fingerprint(
+    repository_path: str,
+    scope: str,
+    *,
+    expected_identity: str | None = None,
+) -> str | None:
+    repository = canonical_repository(pathlib.Path(repository_path))
+    if expected_identity is not None and repository["identity"] != expected_identity:
+        raise StateError(
+            "workflow repository object changed",
+            code="invalid_repository",
+            exit_code=20,
+        )
+    if os.name != "nt":
+        with _anchored_repository(repository) as descriptor:
+            assert descriptor is not None
+            return _anchored_scope_fingerprint(descriptor, scope)
+    path = _scope_path(repository_path, scope)
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    _hash_scope_entry(digest, path, "")
+    return digest.hexdigest()
+
+
+def _scope_snapshot(state: Mapping[str, Any], node: Mapping[str, Any]) -> dict[str, str | None]:
+    repository = state["repository"]
+    with _anchored_repository(repository) as descriptor:
+        if descriptor is not None:
+            return {
+                scope: _anchored_scope_fingerprint(descriptor, scope)
+                for scope in node["write_scopes"]
+            }
+        return {
+            scope: _scope_fingerprint(
+                repository["path"],
+                scope,
+                expected_identity=repository["identity"],
+            )
+            for scope in node["write_scopes"]
+        }
+
+
+def _complete_scope_evidence(state: Mapping[str, Any], node: Mapping[str, Any]) -> dict[str, dict[str, str | None]]:
+    attempt = node["attempts"][-1]
+    current = _scope_snapshot(state, node)
+    missing = [scope for scope, fingerprint in current.items() if fingerprint is None]
+    if missing:
+        raise StateError(
+            f"done node {node['id']} has no materialized file or directory in write scope(s): "
+            + ", ".join(missing)
+        )
+    unchanged = [
+        scope
+        for scope, fingerprint in current.items()
+        if fingerprint == attempt["scope_baseline"][scope]
+    ]
+    if unchanged:
+        raise StateError(
+            f"done node {node['id']} has no attempt-scoped change in write scope(s): "
+            + ", ".join(unchanged)
+        )
+    return {
+        scope: {"before": attempt["scope_baseline"][scope], "after": fingerprint}
+        for scope, fingerprint in current.items()
+    }
+
+
+def _verify_finish_scopes(state: Mapping[str, Any]) -> None:
+    missing = [
+        f"{node_id}:{scope}"
+        for node_id, node in state["nodes"].items()
+        if node["status"] == "done"
+        for scope, fingerprint in _scope_snapshot(state, node).items()
+        if fingerprint is None
+    ]
+    if missing:
+        raise StateError(
+            "finish requires every done artifact scope to remain materialized: "
+            + ", ".join(missing)
+        )
+
+
+def _canonical_scope(value: Any, field: str, *, platform: str | None = None) -> str:
+    raw = unicodedata.normalize("NFC", _text(value, field, maximum=512).replace("\\", "/"))
+    if "\0" in raw:
+        raise StateError(f"{field} contains a NUL byte")
     if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
         raise StateError(f"{field} must be repository-relative")
     parts = pathlib.PurePosixPath(raw).parts
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise StateError(f"{field} contains an unsafe path segment")
-    normalized = "/".join(parts).rstrip("/")
-    if normalized.endswith("/**"):
-        normalized = normalized[:-3].rstrip("/") or "."
+    if (os.name if platform is None else platform) == "nt":
+        for part in parts:
+            if (
+                part.endswith((" ", "."))
+                or any(character in WINDOWS_FORBIDDEN_SCOPE_CHARACTERS for character in part)
+                or any(ord(character) < 32 for character in part)
+                or part.split(".", 1)[0].upper() in WINDOWS_RESERVED_SCOPE_NAMES
+            ):
+                raise StateError(f"{field} contains a non-portable path segment: {part!r}")
+    return "/".join(parts).rstrip("/")
+
+
+def _scope(value: Any, field: str, *, case_sensitive: bool, platform: str | None = None) -> str:
+    normalized = _canonical_scope(value, field, platform=platform)
     return normalized if case_sensitive else normalized.casefold()
 
 
-def scopes_overlap(left: str, right: str, *, case_sensitive: bool | None = None) -> bool:
+def scopes_overlap(
+    left: str,
+    right: str,
+    *,
+    case_sensitive: bool | None = None,
+    platform: str | None = None,
+) -> bool:
     sensitive = os.name != "nt" if case_sensitive is None else case_sensitive
-    a = _scope(left, "write scope", case_sensitive=sensitive)
-    b = _scope(right, "write scope", case_sensitive=sensitive)
+    a = _scope(left, "write scope", case_sensitive=sensitive, platform=platform)
+    b = _scope(right, "write scope", case_sensitive=sensitive, platform=platform)
     return a == b or a.startswith(b + "/") or b.startswith(a + "/") or a == "." or b == "."
 
 
@@ -271,6 +683,7 @@ def _text_list(
     required: bool = False,
     identifiers: bool = False,
     maximum: int = 128,
+    item_maximum: int = 2048,
 ) -> list[str]:
     if not isinstance(value, list) or len(value) > maximum or (required and not value):
         qualifier = "1.." if required else "0.."
@@ -280,7 +693,7 @@ def _text_list(
         result.append(
             _identifier(item, f"{field}[{index}]")
             if identifiers
-            else _text(item, f"{field}[{index}]", maximum=2048)
+            else _text(item, f"{field}[{index}]", maximum=item_maximum)
         )
     if len(set(result)) != len(result):
         raise StateError(f"{field} must not contain duplicates")
@@ -312,15 +725,19 @@ def _validate_dimensions(value: Any, field: str) -> dict[str, int]:
     return {name: dimensions[name] for name in COMPLEXITY_DIMENSIONS}
 
 
+def _validate_ambiguity_factors(value: Any, field: str) -> dict[str, int]:
+    factors = _keys(value, set(AMBIGUITY_FACTORS), field)
+    for name in AMBIGUITY_FACTORS:
+        score = factors[name]
+        if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 4:
+            raise StateError(f"{field}.{name} must be an integer from 0 through 4")
+    return {name: factors[name] for name in AMBIGUITY_FACTORS}
+
+
 def _validate_assessment_inputs(value: Any, field: str = "assessment") -> Mapping[str, Any]:
-    assessment = _keys(value, {"dimensions", "ambiguity", "rationale"}, field)
+    assessment = _keys(value, {"dimensions", "ambiguity_factors", "rationale"}, field)
     _validate_dimensions(assessment["dimensions"], f"{field}.dimensions")
-    if (
-        not isinstance(assessment["ambiguity"], int)
-        or isinstance(assessment["ambiguity"], bool)
-        or not 0 <= assessment["ambiguity"] <= 4
-    ):
-        raise StateError(f"{field}.ambiguity must be an integer from 0 through 4")
+    _validate_ambiguity_factors(assessment["ambiguity_factors"], f"{field}.ambiguity_factors")
     _text(assessment["rationale"], f"{field}.rationale", maximum=4096)
     return assessment
 
@@ -328,9 +745,10 @@ def _validate_assessment_inputs(value: Any, field: str = "assessment") -> Mappin
 def _planning_policy(state: Mapping[str, Any]) -> dict[str, int]:
     conventions = state["conventions"]
     return {
-        "max_node_complexity": conventions["max_node_complexity"],
-        "max_dimension_complexity": conventions["max_dimension_complexity"],
-        "max_node_ambiguity": conventions["max_node_ambiguity"],
+        "node_complexity_split_threshold": conventions["node_complexity_split_threshold"],
+        "dimension_complexity_split_threshold": conventions["dimension_complexity_split_threshold"],
+        "node_ambiguity_refine_threshold": conventions["node_ambiguity_refine_threshold"],
+        "factor_ambiguity_refine_threshold": conventions["factor_ambiguity_refine_threshold"],
         "max_refinement_depth": conventions["max_refinement_depth"],
     }
 
@@ -342,9 +760,14 @@ def _ordered_union(*values: list[str]) -> list[str]:
 def _effective_obligations(node: Mapping[str, Any]) -> dict[str, list[str]]:
     carried = node["lineage"]["obligations"]
     return {
+        "objectives": _ordered_union([node["spec"]["objective"]], carried["objectives"]),
         "requirements": _ordered_union(node["spec"]["requirement_ids"], carried["requirements"]),
+        "inputs": _ordered_union(node["spec"]["inputs"], carried["inputs"]),
         "outputs": _ordered_union(node["spec"]["outputs"], carried["outputs"]),
+        "constraints": _ordered_union(node["spec"]["constraints"], carried["constraints"]),
+        "non_goals": _ordered_union(node["spec"]["non_goals"], carried["non_goals"]),
         "acceptance": _ordered_union(node["acceptance"], carried["acceptance"]),
+        "write_scopes": _ordered_union(node["write_scopes"], carried["write_scopes"]),
     }
 
 
@@ -360,10 +783,14 @@ def _dependency_snapshot(node_id: str, node: Mapping[str, Any]) -> dict[str, Any
 
 def _assessment_input_digest(state: Mapping[str, Any], node: Mapping[str, Any]) -> str:
     obligations = _effective_obligations(node)
-    requirements = {
-        requirement_id: state["requirements"].get(requirement_id)
-        for requirement_id in obligations["requirements"]
-    }
+    requirements = {}
+    for requirement_id in obligations["requirements"]:
+        requirement = state["requirements"].get(requirement_id)
+        requirements[requirement_id] = (
+            None
+            if requirement is None
+            else {"text": requirement["text"], "source": requirement["source"]}
+        )
     dependencies = [
         _dependency_snapshot(dependency, state["nodes"][dependency])
         for dependency in node["dependencies"]
@@ -376,7 +803,7 @@ def _assessment_input_digest(state: Mapping[str, Any], node: Mapping[str, Any]) 
         "dependencies": dependencies,
         "write_scopes": node["write_scopes"],
         "dimensions": node["assessment"]["dimensions"],
-        "ambiguity": node["assessment"]["ambiguity"],
+        "ambiguity_factors": node["assessment"]["ambiguity_factors"],
         "planning_policy": _planning_policy(state),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
@@ -407,14 +834,34 @@ def _is_resolution_endpoint(node: Mapping[str, Any]) -> bool:
     )
 
 
+def _node_resolves_completion(node: Mapping[str, Any]) -> bool:
+    return node["status"] == "done" or (
+        node["status"] == "skipped"
+        and (bool(node["lineage"]["child_ids"]) or node["superseded_by"] is not None)
+    )
+
+
 def _raw_over_budget(state: Mapping[str, Any], node: Mapping[str, Any]) -> bool:
     policy = state["conventions"]
     dimensions = node["assessment"]["dimensions"]
     return (
-        node["assessment"]["total"] > policy["max_node_complexity"]
+        node["assessment"]["total"] >= policy["node_complexity_split_threshold"]
         or any(
-            dimensions[name] > policy["max_dimension_complexity"]
+            dimensions[name] >= policy["dimension_complexity_split_threshold"]
             for name in COMPLEXITY_DIMENSIONS
+        )
+    )
+
+
+def _raw_requires_refinement(state: Mapping[str, Any], node: Mapping[str, Any]) -> bool:
+    policy = state["conventions"]
+    factors = node["assessment"]["ambiguity_factors"]
+    return (
+        bool(node["spec"]["open_questions"])
+        or node["assessment"]["ambiguity_total"] >= policy["node_ambiguity_refine_threshold"]
+        or any(
+            factors[name] >= policy["factor_ambiguity_refine_threshold"]
+            for name in AMBIGUITY_FACTORS
         )
     )
 
@@ -426,8 +873,7 @@ def _derived_assessment_state(state: Mapping[str, Any], node: Mapping[str, Any])
         return node["assessment"]["state"]
     if node["assessment"]["input_digest"] != _assessment_input_digest(state, node):
         return "stale"
-    policy = state["conventions"]
-    if node["spec"]["open_questions"] or node["assessment"]["ambiguity"] > policy["max_node_ambiguity"]:
+    if _raw_requires_refinement(state, node):
         return "refinement_required"
     if _raw_over_budget(state, node):
         return "split_required"
@@ -437,11 +883,17 @@ def _derived_assessment_state(state: Mapping[str, Any], node: Mapping[str, Any])
 def _assessment_shell(inputs: Mapping[str, Any]) -> dict[str, Any]:
     checked = _validate_assessment_inputs(inputs)
     dimensions = {name: checked["dimensions"][name] for name in COMPLEXITY_DIMENSIONS}
+    ambiguity_factors = {
+        name: checked["ambiguity_factors"][name]
+        for name in AMBIGUITY_FACTORS
+    }
     return {
         "rubric_version": ASSESSMENT_RUBRIC_VERSION,
         "dimensions": dimensions,
         "total": sum(dimensions.values()),
-        "ambiguity": checked["ambiguity"],
+        "ambiguity_factors": ambiguity_factors,
+        "ambiguity_total": sum(ambiguity_factors.values()),
+        "ambiguity_peak": max(ambiguity_factors.values()),
         "rationale": checked["rationale"],
         "input_digest": "0" * 64,
         "state": "stale",
@@ -527,6 +979,28 @@ def _live_depends(nodes: Mapping[str, Mapping[str, Any]], node_id: str, possible
     return False
 
 
+def _depends_on(
+    nodes: Mapping[str, Mapping[str, Any]],
+    node_id: str,
+    prerequisite: str,
+) -> bool:
+    if node_id not in nodes:
+        return False
+    if node_id == prerequisite:
+        return True
+    pending = list(nodes[node_id]["dependencies"])
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == prerequisite:
+            return True
+        if current in seen or current not in nodes:
+            continue
+        seen.add(current)
+        pending.extend(nodes[current]["dependencies"])
+    return False
+
+
 def _child_reaches_prerequisite(
     nodes: Mapping[str, Mapping[str, Any]],
     child_id: str,
@@ -548,7 +1022,12 @@ def _child_reaches_prerequisite(
     return False
 
 
-def graph_diagnostics(nodes: Mapping[str, Mapping[str, Any]], *, case_sensitive: bool) -> dict[str, Any]:
+def graph_diagnostics(
+    nodes: Mapping[str, Mapping[str, Any]],
+    *,
+    case_sensitive: bool,
+    platform: str | None = None,
+) -> dict[str, Any]:
     missing: list[dict[str, str]] = []
     for node_id, node in nodes.items():
         for dependency in node["dependencies"]:
@@ -590,7 +1069,12 @@ def graph_diagnostics(nodes: Mapping[str, Mapping[str, Any]], *, case_sensitive:
                     continue
                 for left in nodes[left_id]["write_scopes"]:
                     for right in nodes[right_id]["write_scopes"]:
-                        if scopes_overlap(left, right, case_sensitive=case_sensitive):
+                        if scopes_overlap(
+                            left,
+                            right,
+                            case_sensitive=case_sensitive,
+                            platform=platform,
+                        ):
                             collisions.append(
                                 {"left": left_id, "right": right_id, "left_scope": left, "right_scope": right}
                             )
@@ -661,19 +1145,15 @@ def ready_nodes(state: Mapping[str, Any]) -> list[str]:
 def planning_diagnostics(state: Mapping[str, Any]) -> dict[str, Any]:
     """Describe planning violations and capacity without treating drafts as an invalid DAG."""
     nodes = state["nodes"]
-    policy = state["conventions"]
-    over_budget = []
+    split_required = []
     ambiguous = []
     refinement_required = []
     stale = []
     decomposed = []
     for node_id, node in nodes.items():
         if _assessable_leaf(node) and _raw_over_budget(state, node):
-            over_budget.append(node_id)
-        if _assessable_leaf(node) and (
-            node["spec"]["open_questions"]
-            or node["assessment"]["ambiguity"] > policy["max_node_ambiguity"]
-        ):
+            split_required.append(node_id)
+        if _assessable_leaf(node) and _raw_requires_refinement(state, node):
             ambiguous.append(node_id)
         assessment_state = _derived_assessment_state(state, node)
         if _assessable_leaf(node):
@@ -691,8 +1171,17 @@ def planning_diagnostics(state: Mapping[str, Any]) -> dict[str, Any]:
     dispatch_order = ready_nodes(state)
     frontier_width = len(dispatch_order)
     return {
-        "over_budget_nodes": sorted(over_budget),
+        "split_required_nodes": sorted(split_required),
         "ambiguous_nodes": sorted(ambiguous),
+        "ambiguity_scores": {
+            node_id: {
+                "total": node["assessment"]["ambiguity_total"],
+                "peak": node["assessment"]["ambiguity_peak"],
+                "factors": dict(node["assessment"]["ambiguity_factors"]),
+            }
+            for node_id, node in sorted(nodes.items())
+            if _assessable_leaf(node)
+        },
         "refinement_required_nodes": sorted(refinement_required),
         "stale_nodes": sorted(stale),
         "decomposed_nodes": sorted(decomposed),
@@ -719,7 +1208,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         {
             "schema_version", "workflow_id", "repository", "task", "status", "phase",
             "revision", "created_at", "updated_at", "conventions", "nodes", "requirements",
-            "decisions", "blockers", "events", "git", "controller", "receipts",
+            "decisions", "blockers", "events", "controller", "receipts",
         },
         "state",
     )
@@ -745,7 +1234,8 @@ def validate_state(state: Any) -> dict[str, Any]:
         top["conventions"],
         {
             "max_parallel", "reserve", "platform", "write_scope_case_sensitive",
-            "max_node_complexity", "max_dimension_complexity", "max_node_ambiguity",
+            "node_complexity_split_threshold", "dimension_complexity_split_threshold",
+            "node_ambiguity_refine_threshold", "factor_ambiguity_refine_threshold",
             "max_refinement_depth",
         },
         "conventions",
@@ -754,13 +1244,17 @@ def validate_state(state: Any) -> dict[str, Any]:
         raise StateError("conventions.max_parallel must be between 1 and 8")
     if not isinstance(conventions["reserve"], int) or isinstance(conventions["reserve"], bool) or not 0 <= conventions["reserve"] < conventions["max_parallel"]:
         raise StateError("conventions.reserve must be below max_parallel")
-    _text(conventions["platform"], "conventions.platform", maximum=64)
+    if conventions["platform"] != os.name:
+        raise StateError("workflow state belongs to a different filesystem platform")
     if not isinstance(conventions["write_scope_case_sensitive"], bool):
         raise StateError("conventions.write_scope_case_sensitive must be boolean")
+    if os.name == "nt" and conventions["write_scope_case_sensitive"]:
+        raise StateError("Windows write-scope comparison must be case-insensitive")
     integer_policies = {
-        "max_node_complexity": (0, len(COMPLEXITY_DIMENSIONS) * 4),
-        "max_dimension_complexity": (0, 4),
-        "max_node_ambiguity": (0, 4),
+        "node_complexity_split_threshold": (1, len(COMPLEXITY_DIMENSIONS) * 4),
+        "dimension_complexity_split_threshold": (1, 4),
+        "node_ambiguity_refine_threshold": (1, len(AMBIGUITY_FACTORS) * 4),
+        "factor_ambiguity_refine_threshold": (1, 4),
         "max_refinement_depth": (1, 32),
     }
     for name, (minimum, maximum) in integer_policies.items():
@@ -797,10 +1291,18 @@ def validate_state(state: Any) -> dict[str, Any]:
                 raise StateError(f"nodes.{node_id} cannot depend on itself")
         if len(set(node["dependencies"])) != len(node["dependencies"]):
             raise StateError(f"nodes.{node_id}.dependencies must be a unique list")
-        if not isinstance(node["write_scopes"], list) or not node["write_scopes"] or len(node["write_scopes"]) > 32:
-            raise StateError(f"nodes.{node_id}.write_scopes must contain 1..32 paths")
+        if not isinstance(node["write_scopes"], list) or len(node["write_scopes"]) > 32:
+            raise StateError(f"nodes.{node_id}.write_scopes must contain 0..32 paths")
         for scope in node["write_scopes"]:
-            _scope(scope, f"nodes.{node_id}.write_scope", case_sensitive=conventions["write_scope_case_sensitive"])
+            field = f"nodes.{node_id}.write_scope"
+            _scope(
+                scope,
+                field,
+                case_sensitive=conventions["write_scope_case_sensitive"],
+                platform=conventions["platform"],
+            )
+            if scope != _canonical_scope(scope, field, platform=conventions["platform"]):
+                raise StateError(f"{field} must use canonical forward-slash form")
         if node["role"] not in ROLES:
             raise StateError(f"nodes.{node_id} has an invalid role")
         for field in ("model", "effort"):
@@ -812,10 +1314,13 @@ def validate_state(state: Any) -> dict[str, Any]:
             _text(item, f"nodes.{node_id}.acceptance", maximum=2048)
         if len(set(node["acceptance"])) != len(node["acceptance"]):
             raise StateError(f"nodes.{node_id}.acceptance must not contain duplicates")
-        _validate_spec(node["spec"], f"nodes.{node_id}.spec")
+        spec = _validate_spec(node["spec"], f"nodes.{node_id}.spec")
         assessment = _keys(
             node["assessment"],
-            {"rubric_version", "dimensions", "total", "ambiguity", "rationale", "input_digest", "state"},
+            {
+                "rubric_version", "dimensions", "total", "ambiguity_factors",
+                "ambiguity_total", "ambiguity_peak", "rationale", "input_digest", "state",
+            },
             f"nodes.{node_id}.assessment",
         )
         if (
@@ -825,18 +1330,47 @@ def validate_state(state: Any) -> dict[str, Any]:
         ):
             raise StateError(f"nodes.{node_id}.assessment.rubric_version must be {ASSESSMENT_RUBRIC_VERSION}")
         dimensions = _validate_dimensions(assessment["dimensions"], f"nodes.{node_id}.assessment.dimensions")
+        if not node["write_scopes"] and dimensions["change_surface"] != 0:
+            raise StateError(
+                f"nodes.{node_id} evidence-only work requires "
+                "assessment.dimensions.change_surface=0"
+            )
+        if node["write_scopes"] and dimensions["change_surface"] == 0:
+            raise StateError(
+                f"nodes.{node_id} artifact-scoped work requires "
+                "assessment.dimensions.change_surface at least 1"
+            )
         if (
             not isinstance(assessment["total"], int)
             or isinstance(assessment["total"], bool)
             or assessment["total"] != sum(dimensions.values())
         ):
             raise StateError(f"nodes.{node_id}.assessment.total must equal the five dimension scores")
+        ambiguity_factors = _validate_ambiguity_factors(
+            assessment["ambiguity_factors"],
+            f"nodes.{node_id}.assessment.ambiguity_factors",
+        )
+        material_ambiguity = any(score >= 2 for score in ambiguity_factors.values())
+        if bool(spec["open_questions"]) != material_ambiguity:
+            raise StateError(
+                f"nodes.{node_id} open questions and material ambiguity scores must agree"
+            )
         if (
-            not isinstance(assessment["ambiguity"], int)
-            or isinstance(assessment["ambiguity"], bool)
-            or not 0 <= assessment["ambiguity"] <= 4
+            not isinstance(assessment["ambiguity_total"], int)
+            or isinstance(assessment["ambiguity_total"], bool)
+            or assessment["ambiguity_total"] != sum(ambiguity_factors.values())
         ):
-            raise StateError(f"nodes.{node_id}.assessment.ambiguity must be an integer from 0 through 4")
+            raise StateError(
+                f"nodes.{node_id}.assessment.ambiguity_total must equal the five factor scores"
+            )
+        if (
+            not isinstance(assessment["ambiguity_peak"], int)
+            or isinstance(assessment["ambiguity_peak"], bool)
+            or assessment["ambiguity_peak"] != max(ambiguity_factors.values())
+        ):
+            raise StateError(
+                f"nodes.{node_id}.assessment.ambiguity_peak must equal the highest factor score"
+            )
         _text(assessment["rationale"], f"nodes.{node_id}.assessment.rationale", maximum=4096)
         if not isinstance(assessment["input_digest"], str) or not SHA256_RE.fullmatch(assessment["input_digest"]):
             raise StateError(f"nodes.{node_id}.assessment.input_digest must be a SHA-256 digest")
@@ -866,8 +1400,27 @@ def validate_state(state: Any) -> dict[str, Any]:
             f"nodes.{node_id}.lineage.obligations.requirements",
             identifiers=True,
         )
-        for field in ("outputs", "acceptance"):
+        _text_list(
+            obligations["objectives"],
+            f"nodes.{node_id}.lineage.obligations.objectives",
+            item_maximum=MAX_TEXT,
+        )
+        for field in ("inputs", "outputs", "constraints", "non_goals", "acceptance"):
             _text_list(obligations[field], f"nodes.{node_id}.lineage.obligations.{field}")
+        carried_scopes = _text_list(
+            obligations["write_scopes"],
+            f"nodes.{node_id}.lineage.obligations.write_scopes",
+        )
+        for scope in carried_scopes:
+            field = f"nodes.{node_id}.lineage.obligations.write_scopes"
+            _scope(
+                scope,
+                field,
+                case_sensitive=conventions["write_scope_case_sensitive"],
+                platform=conventions["platform"],
+            )
+            if scope != _canonical_scope(scope, field, platform=conventions["platform"]):
+                raise StateError(f"{field} must use canonical forward-slash form")
         route = _keys(node["route"], {"rationale", "routed_at", "attempt"}, f"nodes.{node_id}.route")
         _text(route["rationale"], f"nodes.{node_id}.route.rationale", maximum=4096)
         _parse_time(route["routed_at"], f"nodes.{node_id}.route.routed_at")
@@ -883,14 +1436,6 @@ def validate_state(state: Any) -> dict[str, Any]:
         for key in ("request_id", "child_id"):
             if launch[key] is not None:
                 _identifier(launch[key], f"nodes.{node_id}.launch.{key}")
-        if launch["request_id"] is not None:
-            if launch["request_id"] in request_ids:
-                raise StateError("launch request identifiers must be unique")
-            request_ids.add(launch["request_id"])
-        if launch["child_id"] is not None:
-            if launch["child_id"] in child_ids:
-                raise StateError("launch child identifiers must be unique")
-            child_ids.add(launch["child_id"])
         if launch["claimed_at"] is not None:
             _parse_time(launch["claimed_at"], f"nodes.{node_id}.launch.claimed_at")
         if launch["reconciliation"] is not None:
@@ -901,12 +1446,32 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError(f"nodes.{node_id} claimed launch requires request_id")
         if launch["state"] in ("bound", "running", "terminal") and not launch["child_id"]:
             raise StateError(f"nodes.{node_id} bound launch requires child_id")
-        if not isinstance(node["attempts"], list) or len(node["attempts"]) > 32:
+        if not isinstance(node["attempts"], list) or len(node["attempts"]) > MAX_ATTEMPTS:
             raise StateError(f"nodes.{node_id}.attempts must be a bounded list")
         for index, raw_attempt in enumerate(node["attempts"]):
-            attempt = _keys(raw_attempt, {"number", "started_at", "finished_at", "outcome"}, f"nodes.{node_id}.attempts[{index}]")
-            if not isinstance(attempt["number"], int) or isinstance(attempt["number"], bool) or attempt["number"] != index + 1:
+            attempt = _keys(
+                raw_attempt,
+                {
+                    "number", "request_id", "child_id", "started_at", "finished_at", "outcome",
+                    "scope_baseline", "scope_evidence",
+                },
+                f"nodes.{node_id}.attempts[{index}]",
+            )
+            if (
+                not isinstance(attempt["number"], int)
+                or isinstance(attempt["number"], bool)
+                or attempt["number"] != index + 1
+            ):
                 raise StateError(f"nodes.{node_id} attempts must be consecutively numbered")
+            _identifier(attempt["request_id"], f"nodes.{node_id}.attempt.request_id")
+            if attempt["request_id"] in request_ids:
+                raise StateError("launch request identifiers must be unique across attempt history")
+            request_ids.add(attempt["request_id"])
+            if attempt["child_id"] is not None:
+                _identifier(attempt["child_id"], f"nodes.{node_id}.attempt.child_id")
+                if attempt["child_id"] in child_ids:
+                    raise StateError("launch child identifiers must be unique across attempt history")
+                child_ids.add(attempt["child_id"])
             _parse_time(attempt["started_at"], f"nodes.{node_id}.attempt.started_at")
             if attempt["finished_at"] is not None:
                 _parse_time(attempt["finished_at"], f"nodes.{node_id}.attempt.finished_at")
@@ -914,6 +1479,43 @@ def validate_state(state: Any) -> dict[str, Any]:
                 _text(attempt["outcome"], f"nodes.{node_id}.attempt.outcome", maximum=4096)
             if (attempt["finished_at"] is None) != (attempt["outcome"] is None):
                 raise StateError(f"nodes.{node_id}.attempts[{index}] completion fields must both be null or both be set")
+            baseline = attempt["scope_baseline"]
+            if not isinstance(baseline, dict) or len(baseline) > 32:
+                raise StateError(f"nodes.{node_id}.attempts[{index}].scope_baseline must be bounded")
+            for scope, fingerprint in baseline.items():
+                if scope != _canonical_scope(
+                    scope,
+                    f"nodes.{node_id}.attempts[{index}].scope_baseline",
+                    platform=conventions["platform"],
+                ):
+                    raise StateError("attempt scope baseline keys must be canonical")
+                if fingerprint is not None and (
+                    not isinstance(fingerprint, str) or not SHA256_RE.fullmatch(fingerprint)
+                ):
+                    raise StateError("attempt scope baseline values must be SHA-256 digests or null")
+            evidence = attempt["scope_evidence"]
+            if not isinstance(evidence, dict) or set(evidence) - set(baseline):
+                raise StateError(f"nodes.{node_id}.attempts[{index}].scope_evidence has unknown scopes")
+            for scope, raw_scope_evidence in evidence.items():
+                scope_evidence = _keys(
+                    raw_scope_evidence,
+                    {"before", "after"},
+                    f"nodes.{node_id}.attempts[{index}].scope_evidence.{scope}",
+                )
+                before = scope_evidence["before"]
+                after = scope_evidence["after"]
+                if before != baseline[scope]:
+                    raise StateError("attempt scope evidence must retain its baseline fingerprint")
+                if before is not None and (
+                    not isinstance(before, str) or not SHA256_RE.fullmatch(before)
+                ):
+                    raise StateError("attempt scope evidence before value must be a SHA-256 digest or null")
+                if not isinstance(after, str) or not SHA256_RE.fullmatch(after):
+                    raise StateError("attempt scope evidence after value must be a SHA-256 digest")
+                if before == after:
+                    raise StateError("attempt scope evidence must record a changed fingerprint")
+            if attempt["finished_at"] is None and evidence:
+                raise StateError("unfinished attempt cannot contain completion evidence")
         unfinished = [attempt for attempt in node["attempts"] if attempt["finished_at"] is None]
         if len(unfinished) > 1 or (unfinished and unfinished[0] is not node["attempts"][-1]):
             raise StateError(f"nodes.{node_id} has inconsistent attempt completion")
@@ -923,8 +1525,18 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError(f"nodes.{node_id} active launch requires one unfinished attempt")
         if launch["state"] == "terminal" and (not node["attempts"] or unfinished):
             raise StateError(f"nodes.{node_id} terminal launch requires a completed attempt")
+        if launch["state"] != "unclaimed" and node["attempts"]:
+            latest_attempt = node["attempts"][-1]
+            if launch["request_id"] != latest_attempt["request_id"]:
+                raise StateError(f"nodes.{node_id} launch request does not match its attempt")
+            if launch["child_id"] != latest_attempt["child_id"]:
+                raise StateError(f"nodes.{node_id} launch child does not match its attempt")
         if launch["state"] != "unclaimed" and node["attempts"] and route["attempt"] != node["attempts"][-1]["number"]:
             raise StateError(f"nodes.{node_id} route attempt does not match the launch attempt")
+        if launch["state"] in ("claimed", "reconcile_required", "bound", "running") and (
+            set(node["attempts"][-1]["scope_baseline"]) != set(node["write_scopes"])
+        ):
+            raise StateError(f"nodes.{node_id} active attempt must cover current write scopes")
         if node["status"] not in NODE_STATUSES:
             raise StateError(f"nodes.{node_id}.status is invalid")
         for key in ("result", "evidence", "superseded_by"):
@@ -940,6 +1552,12 @@ def validate_state(state: Any) -> dict[str, Any]:
                 raise StateError(f"nodes.{node_id}.{key} must be non-negative or null")
         if node["status"] == "done" and (not node["result"] or not node["evidence"]):
             raise StateError(f"nodes.{node_id} done status requires result and evidence")
+        if node["status"] == "done" and (
+            not node["attempts"]
+            or set(node["attempts"][-1]["scope_baseline"]) != set(node["write_scopes"])
+            or set(node["attempts"][-1]["scope_evidence"]) != set(node["write_scopes"])
+        ):
+            raise StateError(f"nodes.{node_id} done status requires attempt evidence for every write scope")
         active_launch = launch["state"] in ("claimed", "reconcile_required", "bound", "running")
         aborted_recovery = (
             top["status"] == "aborted"
@@ -948,13 +1566,29 @@ def validate_state(state: Any) -> dict[str, Any]:
         )
         if node["status"] in TERMINAL_NODE_STATUSES and active_launch and not aborted_recovery:
             raise StateError(f"nodes.{node_id} terminal status cannot retain an active launch")
+        if node["status"] in ("pending", "blocked") and active_launch:
+            raise StateError(f"nodes.{node_id} pending/blocked status cannot retain an active launch")
         if launch["state"] == "terminal" and node["status"] not in TERMINAL_NODE_STATUSES:
             raise StateError(f"nodes.{node_id} terminal launch requires terminal node status")
-        if node["status"] == "running" and launch["state"] != "running":
-            raise StateError(f"nodes.{node_id} running status requires a running launch")
+        if node["status"] == "running" and launch["state"] not in (
+            "running",
+            "reconcile_required",
+        ):
+            raise StateError(
+                f"nodes.{node_id} running status requires a running or takeover-reconciliation launch"
+            )
 
     superseded_ids: list[str] = []
     for node_id, node in top["nodes"].items():
+        if (
+            top["status"] != "aborted"
+            and node["status"] in ("skipped", "cancelled")
+            and not node["lineage"]["child_ids"]
+            and node["superseded_by"] is None
+        ):
+            raise StateError(
+                f"nodes.{node_id} skipped/cancelled work must be decomposed or superseded"
+            )
         if node["superseded_by"] is None:
             continue
         _identifier(node["superseded_by"], f"nodes.{node_id}.superseded_by")
@@ -984,13 +1618,23 @@ def validate_state(state: Any) -> dict[str, Any]:
         if any(node_id in other["dependencies"] for other in top["nodes"].values()):
             raise StateError(f"nodes.{node_id} is superseded but still has dependents")
         replacement = top["nodes"][node["superseded_by"]]
+        source_obligations = _effective_obligations(node)
+        replacement_obligations = _effective_obligations(replacement)
         if any(
-            not set(node["lineage"]["obligations"][field]).issubset(
-                replacement["lineage"]["obligations"][field]
-            )
+            not set(source_obligations[field]).issubset(replacement_obligations[field])
             for field in OBLIGATION_FIELDS
         ):
-            raise StateError(f"nodes.{node_id} supersede replacement loses carried obligations")
+            raise StateError(f"nodes.{node_id} supersede replacement loses effective obligations")
+        missing_prerequisites = [
+            dependency
+            for dependency in node["dependencies"]
+            if not _depends_on(top["nodes"], node["superseded_by"], dependency)
+        ]
+        if missing_prerequisites:
+            raise StateError(
+                f"nodes.{node_id} supersede replacement loses prerequisite(s): "
+                + ", ".join(missing_prerequisites)
+            )
 
     if top["status"] != "aborted":
         for start in superseded_ids:
@@ -1001,7 +1645,11 @@ def validate_state(state: Any) -> dict[str, Any]:
             if not (_is_resolution_endpoint(terminal) or terminal["lineage"]["child_ids"]):
                 raise StateError("superseded_by chain must terminate in resolvable work")
 
-    diagnostic = graph_diagnostics(top["nodes"], case_sensitive=conventions["write_scope_case_sensitive"])
+    diagnostic = graph_diagnostics(
+        top["nodes"],
+        case_sensitive=conventions["write_scope_case_sensitive"],
+        platform=conventions["platform"],
+    )
     if any(diagnostic.values()):
         raise StateError("invalid workflow graph: " + json.dumps(diagnostic, sort_keys=True))
     occupied = sum(
@@ -1080,6 +1728,12 @@ def validate_state(state: Any) -> dict[str, Any]:
         assessment_state = _derived_assessment_state(top, node)
         if (_assessable_leaf(node) or lineage["child_ids"]) and node["assessment"]["state"] != assessment_state:
             raise StateError(f"nodes.{node_id}.assessment.state is not derived from its current inputs")
+        if (
+            _is_resolution_endpoint(node)
+            and not _assessable_leaf(node)
+            and node["assessment"]["input_digest"] != _assessment_input_digest(top, node)
+        ):
+            raise StateError(f"nodes.{node_id}.assessment is stale for active or completed work")
         if node["status"] == "ready" and assessment_state != "executable":
             raise StateError(f"nodes.{node_id} ready status requires a current executable assessment")
         if (
@@ -1103,12 +1757,12 @@ def validate_state(state: Any) -> dict[str, Any]:
             field: {} for field in OBLIGATION_FIELDS
         }
         for node_id, node in top["nodes"].items():
+            effective = _effective_obligations(node)
             obligation_sets[node_id] = {
-                field: set(node["lineage"]["obligations"][field])
-                for field in OBLIGATION_FIELDS
+                field: set(effective[field]) for field in OBLIGATION_FIELDS
             }
             for field in OBLIGATION_FIELDS:
-                for obligation in node["lineage"]["obligations"][field]:
+                for obligation in effective[field]:
                     carriers_by_field[field].setdefault(obligation, set()).add(node_id)
         for field in OBLIGATION_FIELDS:
             for obligation, carriers in carriers_by_field[field].items():
@@ -1116,6 +1770,10 @@ def validate_state(state: Any) -> dict[str, Any]:
                     node_id
                     for node_id in carriers
                     if _is_resolution_endpoint(top["nodes"][node_id])
+                    and (
+                        field != "write_scopes"
+                        or bool(top["nodes"][node_id]["write_scopes"])
+                    )
                 }
                 predecessors: dict[str, set[str]] = {}
                 for node_id in carriers:
@@ -1143,7 +1801,7 @@ def validate_state(state: Any) -> dict[str, Any]:
                 unresolved = sorted(carriers - resolved)
                 if unresolved:
                     raise StateError(
-                        f"carried {field} obligation has no acyclic resolution path: "
+                        f"effective {field} obligation has no acyclic resolution path: "
                         f"{obligation!r} at " + ", ".join(unresolved)
                     )
 
@@ -1201,24 +1859,26 @@ def validate_state(state: Any) -> dict[str, Any]:
         if not isinstance(event["revision"], int) or isinstance(event["revision"], bool) or event["revision"] < 0:
             raise StateError("event revision must be non-negative")
         if event["revision"] > top["revision"] or (index and event["revision"] < top["events"][index - 1]["revision"]):
-            raise StateError("event revisions must be committed and durably ordered")
+            raise StateError("event revisions must be persisted and durably ordered")
     for field in ("decisions", "blockers", "events"):
         if len({item["id"] for item in top[field]}) != len(top[field]):
             raise StateError(f"{field} identifiers must be unique")
 
-    git = _keys(top["git"], {"head", "branch", "dirty", "checkpoint"}, "git")
-    for key in ("head", "branch", "checkpoint"):
-        if git[key] is not None:
-            _text(git[key], f"git.{key}", maximum=1024)
-    if not isinstance(git["dirty"], bool):
-        raise StateError("git.dirty must be boolean")
     controller = _keys(
         top["controller"],
-        {"epoch", "session_id", "checkpoint", "resume_required", "recovery_status"},
+        {
+            "epoch",
+            "origin_session_id",
+            "session_id",
+            "checkpoint",
+            "resume_required",
+            "recovery_status",
+        },
         "controller",
     )
     if not isinstance(controller["epoch"], int) or isinstance(controller["epoch"], bool) or controller["epoch"] < 1:
         raise StateError("controller.epoch must be positive")
+    _identifier(controller["origin_session_id"], "controller.origin_session_id")
     _identifier(controller["session_id"], "controller.session_id")
     if not isinstance(controller["checkpoint"], int) or isinstance(controller["checkpoint"], bool) or controller["checkpoint"] < 0:
         raise StateError("controller.checkpoint must be non-negative")
@@ -1247,12 +1907,14 @@ def validate_state(state: Any) -> dict[str, Any]:
     if controller["recovery_status"] == "takeover_pending" and not controller["resume_required"]:
         raise StateError("takeover_pending requires explicit resume")
     if top["status"] == "completed":
-        if top["phase"] != "completed" or not top["nodes"] or any(node["status"] not in SUCCESS_NODE_STATUSES for node in top["nodes"].values()):
-            raise StateError("completed workflow requires a terminal-successful graph")
+        if (
+            top["phase"] != "completed"
+            or not top["nodes"]
+            or any(not _node_resolves_completion(node) for node in top["nodes"].values())
+        ):
+            raise StateError("completed workflow requires every node to resolve through done work")
         if any(item["status"] == "active" for item in top["requirements"].values()) or any(item["status"] == "active" for item in top["blockers"]):
             raise StateError("completed workflow cannot retain active requirements or blockers")
-        if not isinstance(top["git"]["checkpoint"], str) or not COMMIT_RE.fullmatch(top["git"]["checkpoint"]):
-            raise StateError("completed workflow requires a full commit checkpoint")
     if top["status"] == "aborted" and top["phase"] != "aborted":
         raise StateError("aborted workflow phase is inconsistent")
     if top["phase"] == "completed" and top["status"] != "completed":
@@ -1262,20 +1924,38 @@ def validate_state(state: Any) -> dict[str, Any]:
     return state
 
 
-def new_state(repository: Mapping[str, str], task: str, session_id: str, conventions: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def new_state(
+    repository: Mapping[str, str],
+    task: str,
+    session_id: str,
+    conventions: Mapping[str, Any] | None = None,
+    *,
+    write_scope_case_sensitive: bool | None = None,
+) -> dict[str, Any]:
     created = now_iso()
     suffix = hashlib.sha256((repository["identity"] + "\0" + task + "\0" + created + secrets.token_hex(8)).encode()).hexdigest()[:20]
     profile = {
         "max_parallel": 4,
         "reserve": 1,
         "platform": os.name,
-        "write_scope_case_sensitive": os.name != "nt",
-        "max_node_complexity": 8,
-        "max_dimension_complexity": 3,
-        "max_node_ambiguity": 1,
+        "write_scope_case_sensitive": (
+            os.name != "nt"
+            if write_scope_case_sensitive is None
+            else write_scope_case_sensitive
+        ),
+        "node_complexity_split_threshold": 6,
+        "dimension_complexity_split_threshold": 3,
+        "node_ambiguity_refine_threshold": 4,
+        "factor_ambiguity_refine_threshold": 2,
         "max_refinement_depth": 8,
     }
     if conventions:
+        derived = {"platform", "write_scope_case_sensitive"} & set(conventions)
+        if derived:
+            raise StateError(
+                "state-owner-derived conventions cannot be overridden: "
+                + ", ".join(sorted(derived))
+            )
         profile.update(conventions)
     state = {
         "schema_version": SCHEMA_VERSION,
@@ -1293,9 +1973,9 @@ def new_state(repository: Mapping[str, str], task: str, session_id: str, convent
         "decisions": [],
         "blockers": [],
         "events": [],
-        "git": {"head": None, "branch": None, "dirty": False, "checkpoint": None},
         "controller": {
             "epoch": 1,
+            "origin_session_id": _identifier(session_id, "session_id"),
             "session_id": _identifier(session_id, "session_id"),
             "checkpoint": 0,
             "resume_required": False,
@@ -1450,10 +2130,7 @@ class StateStore:
         return sorted(states, key=lambda value: value["updated_at"], reverse=True)
 
     def _atomic_json(self, path: pathlib.Path, value: Any) -> None:
-        try:
-            data = (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise StateError("state is not canonical JSON data") from exc
+        data = _json_bytes(value)
         if len(data) > MAX_STATE_BYTES:
             raise StateError(f"state exceeds {MAX_STATE_BYTES} bytes", code="state_too_large", exit_code=20)
         self._ensure_private_directory(path.parent)
@@ -1480,7 +2157,11 @@ class StateStore:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise StateError("durable state commit failed; reconcile the mutation id", code="commit_uncertain", exit_code=20) from exc
+            raise StateError(
+                "durable state persistence failed; reconcile the mutation id",
+                code="persistence_uncertain",
+                exit_code=20,
+            ) from exc
 
     def _prepare_session_target(self, target: pathlib.Path, repository_path: str) -> pathlib.Path:
         target = target.expanduser().absolute()
@@ -1538,26 +2219,52 @@ class StateStore:
         path = self.locks / (_identifier(name, "lock name") + ".lock")
         nonce = secrets.token_hex(16)
         payload = json.dumps({"pid": os.getpid(), "nonce": nonce, "created_at": now_iso()}).encode()
-        for attempt in range(2):
-            try:
-                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                break
-            except FileExistsError as exc:
-                if attempt or not _remove_proven_stale_lock(path):
-                    raise StateError("workflow is locked by another controller", code="concurrent_controller", exit_code=20) from exc
+        descriptor: int | None = None
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            info = os.fstat(descriptor)
+            observed = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+                or _is_reparse(observed)
+                or (info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
+                or info.st_nlink != 1
+                or (
+                    os.name != "nt"
+                    and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)
+                )
+            ):
+                raise StateError(
+                    "workflow lock file is unsafe",
+                    code="concurrent_controller",
+                    exit_code=20,
+                )
+            _acquire_advisory_lock(descriptor)
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
             yield
+        except StateError:
+            raise
+        except OSError as exc:
+            raise StateError(
+                "unable to acquire workflow lock",
+                code="concurrent_controller",
+                exit_code=20,
+            ) from exc
         finally:
-            try:
-                current = _lock_evidence(path)
-                if current is not None and current[1] == payload:
-                    path.unlink()
-            except (OSError, StateError):
-                pass
+            if descriptor is not None:
+                try:
+                    _release_advisory_lock(descriptor)
+                except OSError:
+                    pass
+                os.close(descriptor)
 
     def open_session(self, repository: Mapping[str, str], session_file: pathlib.Path) -> dict[str, Any]:
         session_id = "session-" + secrets.token_hex(12)
@@ -1619,16 +2326,32 @@ class StateStore:
         mutation_id: str = "init",
     ) -> dict[str, Any]:
         mutation = _identifier(mutation_id, "mutation_id")
-        digest = self._payload_digest({"command": "init", "repository": repository["identity"], "task": task, "conventions": conventions})
         session = self._session(session_file, repository["identity"])
+        digest = self._payload_digest(
+            {
+                "command": "init",
+                "repository": repository["identity"],
+                "session_id": session["session_id"],
+                "task": task,
+                "conventions": conventions,
+            }
+        )
         with self._lock("workflow-create"):
             for existing in self.list_valid():
+                if existing["controller"]["origin_session_id"] != session["session_id"]:
+                    continue
                 receipt = existing["receipts"].get(mutation)
                 if receipt:
                     if receipt["digest"] != digest:
                         raise StateError("mutation id was reused for different initialization", code="mutation_conflict", exit_code=20)
                     return existing
-            state = new_state(repository, task, session["session_id"], conventions)
+            state = new_state(
+                repository,
+                task,
+                session["session_id"],
+                conventions,
+                write_scope_case_sensitive=_repository_case_sensitive(repository["path"]),
+            )
             add_event(state, "workflow_created", "workflow initialized")
             state["revision"] = 1
             state["controller"]["checkpoint"] = 1
@@ -1705,7 +2428,8 @@ class StateStore:
             state = self.load(workflow_id)
             session = self._session(session_file, state["repository"]["identity"])
             digest = self._payload_digest({"command": "controller-takeover", "session_id": session["session_id"]})
-            receipt = state["receipts"].get(_identifier(mutation_id, "mutation_id"))
+            mutation = _identifier(mutation_id, "mutation_id")
+            receipt = state["receipts"].get(mutation)
             if receipt:
                 if receipt["digest"] != digest:
                     raise StateError("mutation id was reused for another takeover", code="mutation_conflict", exit_code=20)
@@ -1717,6 +2441,12 @@ class StateStore:
             if state["status"] == "completed" or (state["status"] == "aborted" and not _recovery_required(state)):
                 raise StateError("terminal workflow cannot change controllers")
             candidate = copy.deepcopy(state)
+            for node in candidate["nodes"].values():
+                if node["launch"]["state"] in ("claimed", "bound", "running"):
+                    node["launch"]["state"] = "reconcile_required"
+                    node["launch"]["reconciliation"] = (
+                        "controller takeover requires provider outcome reconciliation"
+                    )
             candidate["controller"].update(
                 {
                     "epoch": candidate["controller"]["epoch"] + 1,
@@ -1732,16 +2462,17 @@ class StateStore:
             candidate["revision"] += 1
             candidate["updated_at"] = now_iso()
             candidate["controller"]["checkpoint"] = candidate["revision"]
-            candidate["receipts"][mutation_id] = {"digest": digest, "revision": candidate["revision"], "at": candidate["updated_at"]}
+            candidate["receipts"][mutation] = {"digest": digest, "revision": candidate["revision"], "at": candidate["updated_at"]}
             if len(candidate["receipts"]) > MAX_RECEIPTS:
                 raise StateError("workflow mutation receipt capacity is exhausted", code="capacity_exceeded", exit_code=20)
             validate_state(candidate)
             self._atomic_json(self._state_path(workflow_id), candidate)
             return candidate
 
-    def reconcile_commit(self, workflow_id: str, mutation_id: str, digest: str | None = None) -> dict[str, Any]:
+    def reconcile_mutation(self, workflow_id: str, mutation_id: str, digest: str | None = None) -> dict[str, Any]:
         state = self.load(workflow_id)
-        receipt = state["receipts"].get(_identifier(mutation_id, "mutation_id"))
+        mutation = _identifier(mutation_id, "mutation_id")
+        receipt = state["receipts"].get(mutation)
         if receipt is None:
             return {"outcome": "not_applied", "revision": state["revision"]}
         if digest is not None and not secrets.compare_digest(receipt["digest"], digest.lower()):
@@ -1854,7 +2585,7 @@ def _node_record(
         "stage": stage,
         "priority": priority,
         "dependencies": list(dependencies),
-        "write_scopes": list(write_scopes),
+        "write_scopes": [_canonical_scope(scope, "write_scope") for scope in write_scopes],
         "role": role,
         "model": model,
         "effort": effort,
@@ -1911,7 +2642,10 @@ def _new_node(args: Any) -> dict[str, Any]:
         },
         assessment={
             "dimensions": {name: getattr(args, name) for name in COMPLEXITY_DIMENSIONS},
-            "ambiguity": args.ambiguity,
+            "ambiguity_factors": {
+                name: getattr(args, f"ambiguity_{name}")
+                for name in AMBIGUITY_FACTORS
+            },
             "rationale": args.complexity_rationale,
         },
     )
@@ -1921,7 +2655,7 @@ def _refresh_node_assessment(state: dict[str, Any], node_id: str) -> None:
     node = state["nodes"][node_id]
     inputs = {
         "dimensions": node["assessment"]["dimensions"],
-        "ambiguity": node["assessment"]["ambiguity"],
+        "ambiguity_factors": node["assessment"]["ambiguity_factors"],
         "rationale": node["assessment"]["rationale"],
     }
     node["assessment"] = _build_assessment(state, node, inputs)
@@ -1961,7 +2695,7 @@ def _split_child_record(raw: Any, *, parent_id: str, depth: int, index: int) -> 
     dependencies = _text_list(child["dependencies"], f"{field}.dependencies", identifiers=True)
     if parent_id in dependencies:
         raise StateError(f"{field} cannot depend on the node being decomposed")
-    write_scopes = _text_list(child["write_scopes"], f"{field}.write_scopes", required=True, maximum=32)
+    write_scopes = _text_list(child["write_scopes"], f"{field}.write_scopes", maximum=32)
     acceptance = _text_list(child["acceptance"], f"{field}.acceptance", required=True)
     return _node_record(
         node_id=_identifier(child["id"], f"{field}.id"),
@@ -2034,8 +2768,9 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         if args.profile_file:
             profile = _read_command_object(None, args.profile_file, "profile")
             allowed = {
-                "max_parallel", "reserve", "platform", "write_scope_case_sensitive",
-                "max_node_complexity", "max_dimension_complexity", "max_node_ambiguity",
+                "max_parallel", "reserve",
+                "node_complexity_split_threshold", "dimension_complexity_split_threshold",
+                "node_ambiguity_refine_threshold", "factor_ambiguity_refine_threshold",
                 "max_refinement_depth",
             }
             if set(profile) - allowed:
@@ -2051,8 +2786,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
     if command in ("status", "context"):
         state = store.load(args.workflow_id)
         return 0, "workflow_loaded", _public_state(state, full=command == "context"), []
-    if command == "reconcile-commit":
-        result = store.reconcile_commit(args.workflow_id, args.mutation_id, args.digest)
+    if command == "reconcile-mutation":
+        result = store.reconcile_mutation(args.workflow_id, args.mutation_id, args.digest)
         exit_code = 0 if result["outcome"] == "applied" else 1
         return exit_code, "mutation_" + result["outcome"], result, []
     if command == "controller-takeover":
@@ -2102,16 +2837,27 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             if node is None:
                 raise StateError("unknown node")
             _require_rewritable_leaf(node, "node-refine")
+            if _derived_assessment_state(state, node) == "split_required":
+                raise StateError("node-refine cannot replace required decomposition; use node-split")
+            prior_obligations = _effective_obligations(node)
             prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
             spec = _validate_spec(refinement["spec"], "refinement.spec")
             acceptance = _text_list(refinement["acceptance"], "refinement.acceptance", required=True)
             write_scopes = _text_list(
-                refinement["write_scopes"], "refinement.write_scopes", required=True, maximum=32
+                refinement["write_scopes"], "refinement.write_scopes", maximum=32
             )
+            write_scopes = [
+                _canonical_scope(scope, "refinement.write_scope") for scope in write_scopes
+            ]
             assessment = _validate_assessment_inputs(refinement["assessment"], "refinement.assessment")
             node["spec"] = copy.deepcopy(dict(spec))
             node["acceptance"] = acceptance
             node["write_scopes"] = write_scopes
+            for field in OBLIGATION_FIELDS:
+                node["lineage"]["obligations"][field] = _ordered_union(
+                    node["lineage"]["obligations"][field],
+                    prior_obligations[field],
+                )
             node["assessment"] = _assessment_shell(assessment)
             node["model"] = None
             node["effort"] = None
@@ -2181,20 +2927,22 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         f"plan child {child['id']} has unresolved dependencies: " + ", ".join(sorted(unknown))
                     )
 
-            coverage = _keys(plan["coverage"], {"requirements", "outputs", "acceptance"}, "plan.coverage")
+            coverage = _keys(plan["coverage"], set(COVERAGE_FIELDS), "plan.coverage")
             effective_obligations = _effective_obligations(parent)
-            requirement_coverage = _coverage_mapping(
-                coverage["requirements"], effective_obligations["requirements"], child_id_set,
-                "plan.coverage.requirements",
-            )
-            output_coverage = _coverage_mapping(
-                coverage["outputs"], effective_obligations["outputs"], child_id_set,
-                "plan.coverage.outputs",
-            )
-            acceptance_coverage = _coverage_mapping(
-                coverage["acceptance"], effective_obligations["acceptance"], child_id_set,
-                "plan.coverage.acceptance",
-            )
+            coverage_mappings = {
+                field: _coverage_mapping(
+                    coverage[field],
+                    effective_obligations[field],
+                    child_id_set,
+                    f"plan.coverage.{field}",
+                )
+                for field in COVERAGE_FIELDS
+            }
+            artifact_children = [child for child in children if child["write_scopes"]]
+            if effective_obligations["write_scopes"] and not artifact_children:
+                raise StateError(
+                    "node-split cannot convert artifact-scoped work into evidence-only children"
+                )
             direct_dependents = sorted(
                 node_id for node_id, node in state["nodes"].items() if parent_id in node["dependencies"]
             )
@@ -2214,14 +2962,25 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
             for child in children:
                 state["nodes"][child["id"]] = child
-            for field, mapping in (
-                ("requirements", requirement_coverage),
-                ("outputs", output_coverage),
-                ("acceptance", acceptance_coverage),
-            ):
+            for field, mapping in coverage_mappings.items():
                 for obligation, selected in mapping.items():
                     for child_id in selected:
-                        state["nodes"][child_id]["lineage"]["obligations"][field].append(obligation)
+                        child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
+                        child_obligations[field] = _ordered_union(
+                            child_obligations[field], [obligation]
+                        )
+            for child_id in child_ids:
+                child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
+                for field in ("objectives", "inputs", "constraints", "non_goals"):
+                    child_obligations[field] = _ordered_union(
+                        child_obligations[field], effective_obligations[field]
+                    )
+            for child in artifact_children:
+                child_obligations = state["nodes"][child["id"]]["lineage"]["obligations"]
+                child_obligations["write_scopes"] = _ordered_union(
+                    child_obligations["write_scopes"],
+                    effective_obligations["write_scopes"],
+                )
             for child_id in child_ids:
                 _refresh_node_assessment(state, child_id)
             if any(
@@ -2313,7 +3072,11 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             if _dependency_snapshot(args.node_id, node) != prior_dependency_snapshot:
                 _invalidate_direct_dependents(state, args.node_id)
             node.update({"role": args.role, "model": args.model, "effort": args.effort})
-            node["route"] = {"rationale": args.rationale, "routed_at": now_iso(), "attempt": len(node["attempts"]) + 1}
+            node["route"] = {
+                "rationale": args.rationale,
+                "routed_at": now_iso(),
+                "attempt": len(node["attempts"]) + 1,
+            }
             return add_event(state, "node_routed", args.rationale, args.node_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, route)
@@ -2344,7 +3107,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 allowed_launch = {
                     "unclaimed": {"claimed"},
                     "claimed": {"reconcile_required", "bound"},
-                    "reconcile_required": {"bound", "unclaimed"},
+                    "reconcile_required": {"bound", "running", "terminal", "unclaimed"},
                     "bound": {"running", "terminal"},
                     "running": {"terminal"},
                     "terminal": set(),
@@ -2359,29 +3122,53 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         raise StateError("launch claim requires ready, dependency-safe, unblocked future work")
                     if not args.request_id:
                         raise StateError("launch claim requires --request-id")
+                    _identifier(args.request_id, "request_id")
                     if node["attempts"] and node["attempts"][-1]["finished_at"] is None:
                         raise StateError("prior launch attempt must be reconciled before another claim")
                     if node["route"]["attempt"] != len(node["attempts"]) + 1:
                         raise StateError("persist a fresh node-route for this launch attempt")
+                    if node["status"] == "pending":
+                        node["status"] = "ready"
                     claimed_at = now_iso()
                     node["launch"].update(
                         {"state": "claimed", "request_id": args.request_id, "claimed_at": claimed_at, "child_id": None, "reconciliation": None}
                     )
-                    if len(node["attempts"]) >= 32:
+                    if len(node["attempts"]) >= MAX_ATTEMPTS:
                         raise StateError("node attempt limit reached", code="capacity_exceeded", exit_code=20)
                     node["attempts"].append(
-                        {"number": len(node["attempts"]) + 1, "started_at": claimed_at, "finished_at": None, "outcome": None}
+                        {
+                            "number": node["route"]["attempt"],
+                            "request_id": args.request_id,
+                            "child_id": None,
+                            "started_at": claimed_at,
+                            "finished_at": None,
+                            "outcome": None,
+                            "scope_baseline": _scope_snapshot(state, node),
+                            "scope_evidence": {},
+                        }
                     )
                 elif args.launch_state == "reconcile_required":
                     node["launch"]["state"] = "reconcile_required"
                     node["launch"]["reconciliation"] = args.reconciliation or "provider outcome is uncertain"
                     state["controller"]["recovery_status"] = "reconcile_required"
-                elif args.launch_state == "bound":
-                    if not args.child_id:
+                elif args.launch_state in ("bound", "running"):
+                    child_id = args.child_id or node["launch"]["child_id"]
+                    if not child_id:
                         raise StateError("bound launch requires --child-id")
                     if old_launch == "reconcile_required" and not args.reconciliation:
                         raise StateError("reconciled binding requires --reconciliation evidence")
-                    node["launch"].update({"state": "bound", "child_id": args.child_id, "reconciliation": args.reconciliation})
+                    known_child = node["launch"]["child_id"]
+                    if known_child is not None and child_id != known_child:
+                        raise StateError("reconciled binding must retain the known child identifier")
+                    _identifier(child_id, "child_id")
+                    node["launch"].update(
+                        {
+                            "state": args.launch_state,
+                            "child_id": child_id,
+                            "reconciliation": args.reconciliation,
+                        }
+                    )
+                    node["attempts"][-1]["child_id"] = child_id
                     _refresh_recovery_status(state)
                 elif args.launch_state == "unclaimed":
                     if not args.reconciliation:
@@ -2396,9 +3183,19 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         "claimed_at": None,
                         "reconciliation": args.reconciliation,
                     }
+                    if node["status"] == "running":
+                        node["status"] = "pending"
+                        node["result"] = None
+                        node["evidence"] = None
                     _invalidate_assessment(state, node)
                     _refresh_recovery_status(state)
-                elif state["status"] == "aborted" and args.launch_state == "terminal":
+                elif args.launch_state == "terminal" and (
+                    old_launch == "reconcile_required" or state["status"] == "aborted"
+                ):
+                    if not args.reconciliation or not args.attempt_outcome:
+                        raise StateError(
+                            "reconciled terminal launch requires reconciliation and attempt outcome"
+                        )
                     node["launch"].update({"state": "terminal", "reconciliation": args.reconciliation})
                     node["attempts"][-1].update({"finished_at": now_iso(), "outcome": args.attempt_outcome})
                     _refresh_recovery_status(state)
@@ -2406,10 +3203,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     node["launch"]["state"] = args.launch_state
             if args.status is not None:
                 allowed_status = {
-                    "pending": {"ready", "blocked", "skipped", "cancelled"},
-                    "ready": {"running", "blocked", "skipped", "cancelled"},
-                    "running": {"done", "failed", "cancelled"},
-                    "blocked": {"pending", "ready", "failed", "cancelled"},
+                    "pending": {"ready", "blocked"},
+                    "ready": {"running", "blocked"},
+                    "running": {"done", "failed"},
+                    "blocked": {"pending", "ready", "failed"},
                     "failed": {"pending"},
                     "done": set(),
                     "skipped": set(),
@@ -2418,14 +3215,8 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 old_status = node["status"]
                 if args.status not in allowed_status[old_status]:
                     raise StateError(f"invalid node transition {old_status} -> {args.status}")
-                if (
-                    state["status"] != "aborted"
-                    and args.status in ("skipped", "cancelled")
-                    and not node["lineage"]["child_ids"]
-                    and node["superseded_by"] is None
-                    and any(node["lineage"]["obligations"][field] for field in OBLIGATION_FIELDS)
-                ):
-                    raise StateError("node transition cannot discard carried obligations")
+                if args.status == "blocked" and node["launch"]["state"] != "unclaimed":
+                    raise StateError("blocked transition requires an unclaimed launch")
                 if args.status == "running":
                     if node["launch"]["state"] not in ("bound", "running"):
                         raise StateError("running node requires a bound child launch")
@@ -2451,10 +3242,12 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         for dependency in node["dependencies"]
                     ):
                         raise StateError("node dependencies are not terminal-successful")
+                if args.status == "done":
+                    if not args.result or not args.evidence:
+                        raise StateError("done node requires --result and --evidence")
+                    node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(state, node)
                 node["status"] = args.status
                 if args.status in TERMINAL_NODE_STATUSES:
-                    if args.status == "done" and (not args.result or not args.evidence):
-                        raise StateError("done node requires --result and --evidence")
                     node["result"] = args.result
                     node["evidence"] = args.evidence
                     if node["launch"]["child_id"]:
@@ -2475,7 +3268,11 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
     if command == "graph-validate":
         state = store.load(args.workflow_id)
-        diagnostics = graph_diagnostics(state["nodes"], case_sensitive=state["conventions"]["write_scope_case_sensitive"])
+        diagnostics = graph_diagnostics(
+            state["nodes"],
+            case_sensitive=state["conventions"]["write_scope_case_sensitive"],
+            platform=state["conventions"]["platform"],
+        )
         diagnostics.update(planning_diagnostics(state))
         diagnostics["ready_nodes"] = diagnostics["dispatch_order"]
         return 0, "graph_valid", diagnostics, []
@@ -2487,7 +3284,12 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
         def replan(state: dict[str, Any]) -> dict[str, Any]:
             for item in plan["operations"]:
-                if not isinstance(item, dict) or item.get("op") not in ("dependency_add", "dependency_remove", "priority", "remove", "supersede"):
+                if not isinstance(item, dict) or item.get("op") not in (
+                    "dependency_add",
+                    "dependency_remove",
+                    "priority",
+                    "supersede",
+                ):
                     raise StateError("plan contains an unsupported operation")
                 node_id = item.get("node_id")
                 if not isinstance(node_id, str) or node_id not in state["nodes"]:
@@ -2519,12 +3321,6 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     ):
                         raise StateError("priority operation is malformed")
                     node["priority"] = item["value"]
-                elif item["op"] == "remove":
-                    if set(item) != {"op", "node_id"} or any(node_id in other["dependencies"] for other in state["nodes"].values()):
-                        raise StateError("only an unreferenced node can be removed")
-                    if any(node["lineage"]["obligations"][field] for field in OBLIGATION_FIELDS):
-                        raise StateError("cannot remove a node with carried obligations")
-                    del state["nodes"][node_id]
                 else:
                     replacement = item.get("replacement")
                     if (
@@ -2535,15 +3331,40 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         raise StateError("supersede operation is malformed")
                     if replacement == node_id:
                         raise StateError("node cannot supersede itself")
+                    if _raw_over_budget(state, node):
+                        raise StateError("split-policy work must use node-split, not supersede")
                     cursor = replacement
                     while cursor != node_id and state["nodes"][cursor]["superseded_by"] is not None:
                         cursor = state["nodes"][cursor]["superseded_by"]
                     if cursor == node_id:
                         raise StateError("superseded_by cycle is not allowed")
                     replacement_node = state["nodes"][replacement]
+                    missing_prerequisites = [
+                        dependency
+                        for dependency in node["dependencies"]
+                        if not _depends_on(state["nodes"], replacement, dependency)
+                    ]
+                    if missing_prerequisites:
+                        _require_rewritable_leaf(
+                            replacement_node, "graph-replan supersede replacement"
+                        )
+                        prior_replacement_snapshot = _dependency_snapshot(
+                            replacement, replacement_node
+                        )
+                        replacement_node["dependencies"] = _ordered_union(
+                            replacement_node["dependencies"], missing_prerequisites
+                        )
+                        _invalidate_assessment(state, replacement_node)
+                        if (
+                            _dependency_snapshot(replacement, replacement_node)
+                            != prior_replacement_snapshot
+                        ):
+                            _invalidate_direct_dependents(state, replacement)
+                    source_obligations = _effective_obligations(node)
+                    replacement_obligations = _effective_obligations(replacement_node)
                     transfer_required = any(
-                        not set(node["lineage"]["obligations"][field]).issubset(
-                            replacement_node["lineage"]["obligations"][field]
+                        not set(source_obligations[field]).issubset(
+                            replacement_obligations[field]
                         )
                         for field in OBLIGATION_FIELDS
                     )
@@ -2555,9 +3376,14 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                             replacement, replacement_node
                         )
                         for field in OBLIGATION_FIELDS:
+                            missing = [
+                                value
+                                for value in source_obligations[field]
+                                if value not in replacement_obligations[field]
+                            ]
                             replacement_node["lineage"]["obligations"][field] = _ordered_union(
                                 replacement_node["lineage"]["obligations"][field],
-                                node["lineage"]["obligations"][field],
+                                missing,
                             )
                         _invalidate_assessment(state, replacement_node)
                         if (
@@ -2597,9 +3423,27 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 "status": args.status,
                 "evidence": args.evidence,
             }
-            changed = state["requirements"].get(args.requirement_id) != replacement
+            prior = state["requirements"].get(args.requirement_id)
+            semantic_change = prior is not None and (
+                prior["text"] != replacement["text"]
+                or prior["source"] != replacement["source"]
+            )
+            if semantic_change:
+                locked = sorted(
+                    node_id
+                    for node_id, node in state["nodes"].items()
+                    if args.requirement_id in _effective_obligations(node)["requirements"]
+                    and _is_resolution_endpoint(node)
+                    and not _assessable_leaf(node)
+                )
+                if locked:
+                    raise StateError(
+                        "referenced requirement text/source is immutable after work starts or completes: "
+                        + ", ".join(locked)
+                    )
+            changed = prior != replacement
             state["requirements"][args.requirement_id] = replacement
-            if changed:
+            if changed and (prior is None or semantic_change):
                 for node in state["nodes"].values():
                     if args.requirement_id in _effective_obligations(node)["requirements"]:
                         _invalidate_assessment(state, node)
@@ -2686,21 +3530,30 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         return 0, "mutation_reconciled" if replay else "event_recorded", {**_public_state(state), "event": result}, []
 
     if command == "finish":
-        operation = {"summary": args.summary, "validation": args.validation, "commit": args.commit}
+        operation = {"summary": args.summary, "validation": args.validation}
 
         def finish(state: dict[str, Any]) -> dict[str, Any]:
-            if not COMMIT_RE.fullmatch(args.commit):
-                raise StateError("finish requires a full lowercase commit checkpoint")
-            if not state["nodes"] or any(node["status"] not in SUCCESS_NODE_STATUSES for node in state["nodes"].values()):
-                raise StateError("all visible nodes must be terminal-successful")
+            summary = _text(args.summary, "finish summary", maximum=4096)
+            validation = _text(
+                args.validation,
+                "finish validation",
+                maximum=MAX_TEXT - len(summary) - len(FINISH_EVENT_SEPARATOR),
+            )
+            if not state["nodes"] or any(
+                not _node_resolves_completion(node)
+                for node in state["nodes"].values()
+            ):
+                raise StateError(
+                    "all visible nodes must resolve through done work, decomposition, or supersede"
+                )
             if any(item["status"] == "active" for item in state["requirements"].values()):
                 raise StateError("all requirements must be resolved")
             if any(item["status"] == "active" for item in state["blockers"]):
                 raise StateError("all blockers must be resolved")
+            _verify_finish_scopes(state)
             state["status"] = "completed"
             state["phase"] = "completed"
-            state["git"]["checkpoint"] = args.commit
-            return add_event(state, "workflow_finished", args.summary + "; validation: " + args.validation)
+            return add_event(state, "workflow_finished", summary + FINISH_EVENT_SEPARATOR + validation)
 
         state, result, replay = _mutate_command(store, args, command, operation, finish)
         return 0, "mutation_reconciled" if replay else "workflow_completed", {**_public_state(state), "event": result}, []

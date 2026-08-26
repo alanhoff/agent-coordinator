@@ -33,10 +33,10 @@ attempt and omits unset model/effort arguments from delegated invocations.
 
 Route only a non-blocked assessable leaf whose persisted assessment is current and `executable`, and
 only when every other non-blocked assessable leaf is also current and executable. Keep the router API
-unchanged and adapt schema-v4 assessment values to its existing 1–5 request fields as follows:
+unchanged and adapt schema-v6 assessment values to its existing 1–5 request fields as follows:
 
 - `complexity = clamp(1, 5, ceil(assessment.total / 4))`
-- `ambiguity = assessment.ambiguity + 1`
+- `ambiguity = clamp(1, 5, assessment.ambiguity_total + 1)`
 - `coupling = assessment.dimensions.coupling + 1`
 - `novelty = assessment.dimensions.novelty + 1`
 

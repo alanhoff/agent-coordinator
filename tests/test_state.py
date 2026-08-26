@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from coordinator.cli import state as state_cli  # noqa: E402
 from coordinator.state import store as state_owner  # noqa: E402
 from coordinator.state.store import (  # noqa: E402
+    FINISH_EVENT_SEPARATOR,
     MAX_STATE_BYTES,
+    MAX_TEXT,
     StateError,
     StateStore,
     planning_diagnostics,
@@ -36,6 +39,22 @@ DIMENSIONS = {
     "novelty": 1,
     "verification": 1,
 }
+AMBIGUITY_FACTORS = {
+    "objective": 0,
+    "inputs": 0,
+    "boundaries": 0,
+    "dependencies": 0,
+    "acceptance": 0,
+}
+COVERAGE_FIELDS = ("requirements", "outputs", "acceptance")
+OBLIGATION_FIELDS = (
+    "objectives", "requirements", "inputs", "outputs", "constraints", "non_goals",
+    "acceptance", "write_scopes",
+)
+
+
+def empty_obligations() -> dict[str, list[str]]:
+    return {field: [] for field in OBLIGATION_FIELDS}
 
 
 def specification(
@@ -58,12 +77,13 @@ def specification(
 def assessment_inputs(
     *,
     dimensions: dict[str, int] | None = None,
-    ambiguity: int = 0,
+    ambiguity_factors: dict[str, int] | None = None,
     rationale: str = "small bounded leaf",
 ) -> dict:
+    factors = dict(ambiguity_factors or AMBIGUITY_FACTORS)
     return {
         "dimensions": dict(dimensions or DIMENSIONS),
-        "ambiguity": ambiguity,
+        "ambiguity_factors": factors,
         "rationale": rationale,
     }
 
@@ -96,6 +116,29 @@ def split_child(
     }
 
 
+def effective_obligations(node: dict) -> dict[str, list[str]]:
+    carried = node["lineage"]["obligations"]
+    return {
+        "objectives": list(dict.fromkeys([node["spec"]["objective"], *carried["objectives"]])),
+        "requirements": list(dict.fromkeys([*node["spec"]["requirement_ids"], *carried["requirements"]])),
+        "inputs": list(dict.fromkeys([*node["spec"]["inputs"], *carried["inputs"]])),
+        "outputs": list(dict.fromkeys([*node["spec"]["outputs"], *carried["outputs"]])),
+        "constraints": list(dict.fromkeys([*node["spec"]["constraints"], *carried["constraints"]])),
+        "non_goals": list(dict.fromkeys([*node["spec"]["non_goals"], *carried["non_goals"]])),
+        "acceptance": list(dict.fromkeys([*node["acceptance"], *carried["acceptance"]])),
+        "write_scopes": list(dict.fromkeys([*node["write_scopes"], *carried["write_scopes"]])),
+    }
+
+
+def preserved_refinement_obligations(node: dict) -> dict[str, list[str]]:
+    effective = effective_obligations(node)
+    carried = node["lineage"]["obligations"]
+    return {
+        field: list(dict.fromkeys([*carried[field], *effective[field]]))
+        for field in effective
+    }
+
+
 class DurableStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -104,6 +147,7 @@ class DurableStateTests(unittest.TestCase):
         self.home.mkdir()
         self.repo = self.base / "repo"
         self.repo.mkdir()
+        (self.repo / "preexisting.txt").write_text("baseline artifact\n", encoding="utf-8")
         self.session = self.base / "private" / "session.json"
         self.environment = mock.patch.dict(
             os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}, clear=False
@@ -162,54 +206,104 @@ class DurableStateTests(unittest.TestCase):
         mutation: str,
         *extra: str,
         scope: str | None = None,
+        evidence_only: bool = False,
         expected: int = 0,
     ) -> dict:
+        scope_arguments = [] if evidence_only else ["--write-scope", scope or f"src/{node_id}"]
         return self.mutation(
             "node-add", revision, mutation,
             "--node-id", node_id, "--title", node_id, "--stage", "implementation",
-            "--write-scope", scope or f"src/{node_id}", "--role", "implementer",
+            *scope_arguments, "--role", "implementer",
             "--acceptance", "focused test passes", "--rationale", "bounded implementation",
             "--objective", f"Implement {node_id}", "--output", f"{node_id} implementation",
-            "--breadth", "1", "--change-surface", "1", "--coupling", "1",
-            "--novelty", "1", "--verification", "1", "--ambiguity", "0",
+            "--breadth", "1", "--change-surface", "0" if evidence_only else "1", "--coupling", "1",
+            "--novelty", "1", "--verification", "1",
+            "--ambiguity-objective", "0", "--ambiguity-inputs", "0",
+            "--ambiguity-boundaries", "0", "--ambiguity-dependencies", "0",
+            "--ambiguity-acceptance", "0",
             "--complexity-rationale", "small bounded leaf",
             *extra,
             expected=expected,
         )
+
+    def start_scoped_work(self, *, node_id: str = "work", scope: str = "src/work") -> dict:
+        self.add(node_id, 1, f"add-{node_id}", scope=scope)
+        self.mutation(
+            "node-update", 2, f"ready-{node_id}",
+            "--node-id", node_id, "--status", "ready",
+        )
+        self.route(node_id, 3, f"route-{node_id}")
+        self.mutation(
+            "node-update", 4, f"claim-{node_id}", "--node-id", node_id,
+            "--launch-state", "claimed", "--request-id", f"request-{node_id}",
+        )
+        self.mutation(
+            "node-update", 5, f"bind-{node_id}", "--node-id", node_id,
+            "--launch-state", "bound", "--child-id", f"child-{node_id}",
+        )
+        self.mutation(
+            "node-update", 6, f"run-{node_id}",
+            "--node-id", node_id, "--status", "running",
+        )
+        return StateStore().load(self.workflow_id)
 
     def test_derived_assessment_scoring_policy_bounds_and_refinement_diagnostics(self) -> None:
         self.add("small", 1, "add-small")
         self.add(
             "oversized-total", 2, "add-oversized-total",
             "--breadth", "2", "--change-surface", "2", "--coupling", "2",
-            "--novelty", "2", "--verification", "1",
+            "--novelty", "1", "--verification", "1",
         )
-        self.add("oversized-dimension", 3, "add-oversized-dimension", "--breadth", "4")
-        self.add("ambiguous", 4, "add-ambiguous", "--ambiguity", "2")
+        self.add("oversized-dimension", 3, "add-oversized-dimension", "--breadth", "3")
         self.add(
-            "questions", 5, "add-questions", "--ambiguity", "1",
+            "ambiguous", 4, "add-ambiguous", "--ambiguity-objective", "2",
+            "--open-question", "Which exact objective applies?",
+        )
+        self.add(
+            "aggregate-ambiguous", 5, "add-aggregate-ambiguous",
+            "--ambiguity-objective", "1", "--ambiguity-inputs", "1",
+            "--ambiguity-boundaries", "1", "--ambiguity-dependencies", "1",
+        )
+        self.add(
+            "questions", 6, "add-questions", "--ambiguity-objective", "2",
             "--open-question", "Which output contract applies?",
         )
+        self.add("residual-one", 7, "add-residual-one", "--ambiguity-objective", "1")
+        self.add(
+            "residual-two", 8, "add-residual-two",
+            "--ambiguity-objective", "1", "--ambiguity-inputs", "1",
+        )
+        self.add(
+            "residual-three", 9, "add-residual-three",
+            "--ambiguity-objective", "1", "--ambiguity-inputs", "1",
+            "--ambiguity-boundaries", "1",
+        )
 
-        self.add("invalid-score", 6, "add-invalid-score", "--verification", "5", expected=2)
-        self.add("invalid-ambiguity", 6, "add-invalid-ambiguity", "--ambiguity", "-1", expected=2)
+        self.add("invalid-score", 10, "add-invalid-score", "--verification", "5", expected=2)
+        self.add(
+            "invalid-ambiguity", 10, "add-invalid-ambiguity",
+            "--ambiguity-objective", "-1", expected=2,
+        )
 
         state = StateStore().load(self.workflow_id)
-        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["schema_version"], 6)
+        self.assertNotIn("git", state)
         self.assertEqual(
             {
                 key: state["conventions"][key]
                 for key in (
-                    "max_node_complexity",
-                    "max_dimension_complexity",
-                    "max_node_ambiguity",
+                    "node_complexity_split_threshold",
+                    "dimension_complexity_split_threshold",
+                    "node_ambiguity_refine_threshold",
+                    "factor_ambiguity_refine_threshold",
                     "max_refinement_depth",
                 )
             },
             {
-                "max_node_complexity": 8,
-                "max_dimension_complexity": 3,
-                "max_node_ambiguity": 1,
+                "node_complexity_split_threshold": 6,
+                "dimension_complexity_split_threshold": 3,
+                "node_ambiguity_refine_threshold": 4,
+                "factor_ambiguity_refine_threshold": 2,
                 "max_refinement_depth": 8,
             },
         )
@@ -220,26 +314,53 @@ class DurableStateTests(unittest.TestCase):
             },
             {
                 "small": (5, "executable"),
-                "oversized-total": (9, "split_required"),
-                "oversized-dimension": (8, "split_required"),
+                "oversized-total": (8, "split_required"),
+                "oversized-dimension": (7, "split_required"),
                 "ambiguous": (5, "refinement_required"),
+                "aggregate-ambiguous": (5, "refinement_required"),
                 "questions": (5, "refinement_required"),
+                "residual-one": (5, "executable"),
+                "residual-two": (5, "executable"),
+                "residual-three": (5, "executable"),
             },
         )
         for node in state["nodes"].values():
-            self.assertEqual(node["assessment"]["rubric_version"], 1)
+            self.assertEqual(node["assessment"]["rubric_version"], 2)
             self.assertRegex(node["assessment"]["input_digest"], r"^[0-9a-f]{64}$")
 
         diagnostics = planning_diagnostics(state)
-        self.assertEqual(diagnostics["over_budget_nodes"], ["oversized-dimension", "oversized-total"])
-        self.assertEqual(diagnostics["ambiguous_nodes"], ["ambiguous", "questions"])
-        self.assertEqual(diagnostics["refinement_required_nodes"], ["ambiguous", "questions"])
+        self.assertEqual(diagnostics["split_required_nodes"], ["oversized-dimension", "oversized-total"])
+        self.assertEqual(diagnostics["ambiguous_nodes"], ["aggregate-ambiguous", "ambiguous", "questions"])
+        self.assertEqual(
+            diagnostics["refinement_required_nodes"],
+            ["aggregate-ambiguous", "ambiguous", "questions"],
+        )
+        self.assertEqual(
+            {
+                node_id: (item["total"], item["peak"])
+                for node_id, item in diagnostics["ambiguity_scores"].items()
+                if node_id in (
+                    "small", "residual-one", "residual-two", "residual-three",
+                    "ambiguous", "aggregate-ambiguous", "questions",
+                )
+            },
+            {
+                "small": (0, 0),
+                "residual-one": (1, 1),
+                "residual-two": (2, 1),
+                "residual-three": (3, 1),
+                "ambiguous": (2, 2),
+                "aggregate-ambiguous": (4, 1),
+                "questions": (2, 2),
+            },
+        )
         self.assertEqual(diagnostics["dispatch_order"], [])
 
         for field, invalid in (
-            ("max_node_complexity", 21),
-            ("max_dimension_complexity", 5),
-            ("max_node_ambiguity", 5),
+            ("node_complexity_split_threshold", 21),
+            ("dimension_complexity_split_threshold", 5),
+            ("node_ambiguity_refine_threshold", 21),
+            ("factor_ambiguity_refine_threshold", 5),
             ("max_refinement_depth", 0),
         ):
             with self.subTest(policy=field):
@@ -252,14 +373,299 @@ class DurableStateTests(unittest.TestCase):
         forged_total["nodes"]["small"]["assessment"]["total"] = 6
         with self.assertRaisesRegex(StateError, r"assessment\.total"):
             validate_state(forged_total)
+        forged_ambiguity = copy.deepcopy(state)
+        forged_ambiguity["nodes"]["small"]["assessment"]["ambiguity_total"] = 1
+        with self.assertRaisesRegex(StateError, r"assessment\.ambiguity_total"):
+            validate_state(forged_ambiguity)
         forged_state = copy.deepcopy(state)
         forged_state["nodes"]["small"]["assessment"]["state"] = "split_required"
         with self.assertRaisesRegex(StateError, "not derived"):
             validate_state(forged_state)
 
+        split_escape = {
+            "spec": specification("oversized-total"),
+            "acceptance": ["focused test passes"],
+            "write_scopes": ["src/oversized-total"],
+            "assessment": assessment_inputs(rationale="Attempt to rescore instead of split"),
+        }
+        rejected_escape = self.mutation(
+            "node-refine", 10, "reject-split-escape", "--node-id", "oversized-total",
+            "--refinement-json", json.dumps(split_escape), expected=2,
+        )
+        self.assertIn("use node-split", rejected_escape["data"]["message"])
+        self.assertEqual(
+            StateStore().load(self.workflow_id)["nodes"]["oversized-total"]["assessment"]["state"],
+            "split_required",
+        )
+
+    def test_exact_threshold_work_cannot_escape_decomposition(self) -> None:
+        self.add("threshold", 1, "add-threshold", "--breadth", "3")
+        self.add("replacement", 2, "add-threshold-replacement")
+        baseline = StateStore().load(self.workflow_id)
+        for status in ("skipped", "cancelled"):
+            rejected = self.mutation(
+                "node-update", 3, f"reject-threshold-{status}", "--node-id", "threshold",
+                "--status", status, expected=2,
+            )
+            self.assertIn("invalid node transition", rejected["data"]["message"])
+        supersede = {
+            "reason": "An exact-threshold node must not disappear into replacement work",
+            "operations": [{"op": "supersede", "node_id": "threshold", "replacement": "replacement"}],
+        }
+        rejected_supersede = self.mutation(
+            "graph-replan", 3, "reject-threshold-supersede", "--plan-json", json.dumps(supersede),
+            expected=2,
+        )
+        self.assertIn("must use node-split", rejected_supersede["data"]["message"])
+        remove = {
+            "reason": "No obligation-dropping remove operation exists",
+            "operations": [{"op": "remove", "node_id": "threshold"}],
+        }
+        rejected_remove = self.mutation(
+            "graph-replan", 3, "reject-threshold-remove", "--plan-json", json.dumps(remove),
+            expected=2,
+        )
+        self.assertIn("unsupported operation", rejected_remove["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        split = {
+            "parent_id": "threshold",
+            "reason": "The inclusive dimension threshold requires two bounded leaves",
+            "children": [
+                split_child(
+                    "threshold-code", acceptance=["code proof"], outputs=["threshold implementation"],
+                    requirement_ids=[],
+                ),
+                split_child(
+                    "threshold-proof", acceptance=["focused test passes"], outputs=["proof artifact"],
+                    requirement_ids=[],
+                ),
+            ],
+            "coverage": {
+                "requirements": {},
+                "outputs": {"threshold implementation": ["threshold-code"]},
+                "acceptance": {"focused test passes": ["threshold-proof"]},
+            },
+            "dependent_replacements": {},
+        }
+        self.mutation("node-split", 3, "split-threshold", "--plan-json", json.dumps(split))
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["nodes"]["threshold"]["assessment"]["state"], "decomposed")
+        self.assertEqual(
+            {state["nodes"][node_id]["assessment"]["state"] for node_id in ("threshold-code", "threshold-proof")},
+            {"executable"},
+        )
+
+    def test_exact_aggregate_threshold_requires_decomposition(self) -> None:
+        self.add(
+            "aggregate-threshold", 1, "add-aggregate-threshold",
+            "--breadth", "2", "--change-surface", "1", "--coupling", "1",
+            "--novelty", "1", "--verification", "1",
+        )
+        state = StateStore().load(self.workflow_id)
+        node = state["nodes"]["aggregate-threshold"]
+        self.assertEqual((node["assessment"]["total"], node["assessment"]["state"]), (6, "split_required"))
+        self.assertEqual(planning_diagnostics(state)["split_required_nodes"], ["aggregate-threshold"])
+
+        rejected_route = self.route(
+            "aggregate-threshold", 2, "reject-aggregate-route", expected=2
+        )
+        self.assertIn("requires current executable", rejected_route["data"]["message"])
+        rejected_claim = self.mutation(
+            "node-update", 2, "reject-aggregate-claim", "--node-id", "aggregate-threshold",
+            "--launch-state", "claimed", "--request-id", "request-aggregate", expected=2,
+        )
+        self.assertIn("planning fixed point", rejected_claim["data"]["message"])
+
+        self.add("aggregate-replacement", 2, "add-aggregate-replacement")
+        supersede = {
+            "reason": "Exact aggregate threshold cannot escape through replacement",
+            "operations": [
+                {
+                    "op": "supersede",
+                    "node_id": "aggregate-threshold",
+                    "replacement": "aggregate-replacement",
+                }
+            ],
+        }
+        rejected_supersede = self.mutation(
+            "graph-replan", 3, "reject-aggregate-supersede",
+            "--plan-json", json.dumps(supersede), expected=2,
+        )
+        self.assertIn("must use node-split", rejected_supersede["data"]["message"])
+
+        split = {
+            "parent_id": "aggregate-threshold",
+            "reason": "The inclusive aggregate threshold requires bounded children",
+            "children": [
+                split_child(
+                    "aggregate-code", acceptance=["code proof"],
+                    outputs=["aggregate-threshold implementation"], requirement_ids=[],
+                ),
+                split_child(
+                    "aggregate-proof", acceptance=["focused test passes"],
+                    outputs=["aggregate proof artifact"], requirement_ids=[],
+                ),
+            ],
+            "coverage": {
+                "requirements": {},
+                "outputs": {"aggregate-threshold implementation": ["aggregate-code"]},
+                "acceptance": {"focused test passes": ["aggregate-proof"]},
+            },
+            "dependent_replacements": {},
+        }
+        self.mutation(
+            "node-split", 3, "split-aggregate-threshold", "--plan-json", json.dumps(split)
+        )
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["nodes"]["aggregate-threshold"]["assessment"]["state"], "decomposed")
+        self.assertEqual(
+            {state["nodes"][node_id]["assessment"]["state"] for node_id in ("aggregate-code", "aggregate-proof")},
+            {"executable"},
+        )
+
+    def test_stale_over_budget_work_can_be_recalculated_below_policy(self) -> None:
+        self.mutation(
+            "requirement-set", 1, "set-adaptive-requirement",
+            "--requirement-id", "adaptive-req", "--text", "Implement the broad behavior",
+            "--source", "task", "--status", "active",
+        )
+        self.add(
+            "adaptive", 2, "add-adaptive", "--requirement-id", "adaptive-req",
+            "--breadth", "2",
+        )
+        before = StateStore().load(self.workflow_id)["nodes"]["adaptive"]
+        self.assertEqual((before["assessment"]["total"], before["assessment"]["state"]), (6, "split_required"))
+
+        self.mutation(
+            "requirement-set", 3, "narrow-adaptive-requirement",
+            "--requirement-id", "adaptive-req", "--text", "Implement the narrowed behavior",
+            "--source", "task", "--status", "active",
+        )
+        stale = StateStore().load(self.workflow_id)["nodes"]["adaptive"]
+        self.assertEqual(stale["assessment"]["state"], "stale")
+        refinement = {
+            "spec": copy.deepcopy(stale["spec"]),
+            "acceptance": list(stale["acceptance"]),
+            "write_scopes": list(stale["write_scopes"]),
+            "assessment": assessment_inputs(
+                rationale="The changed requirement removes the former extra breadth"
+            ),
+        }
+        self.mutation(
+            "node-refine", 4, "recalculate-adaptive", "--node-id", "adaptive",
+            "--refinement-json", json.dumps(refinement),
+        )
+        recalculated = StateStore().load(self.workflow_id)["nodes"]["adaptive"]
+        self.assertEqual(
+            (recalculated["assessment"]["total"], recalculated["assessment"]["state"]),
+            (5, "executable"),
+        )
+        self.route("adaptive", 5, "route-recalculated-adaptive")
+
+    def test_artifact_and_full_specification_provenance_survives_split(self) -> None:
+        self.add(
+            "artifact-parent", 1, "add-artifact-parent", "--breadth", "2",
+            "--input", "approved schema", "--constraint", "must create runtime artifacts",
+            "--non-goal", "documentation-only delivery", scope="backend",
+        )
+        split = {
+            "parent_id": "artifact-parent",
+            "reason": "Separate implementation and proof without losing the parent contract",
+            "children": [
+                split_child(
+                    "artifact-code", acceptance=["code proof"],
+                    outputs=["artifact-parent implementation"], requirement_ids=[],
+                ),
+                split_child(
+                    "artifact-proof", acceptance=["focused test passes"],
+                    outputs=["proof artifact"], requirement_ids=[],
+                ),
+            ],
+            "coverage": {
+                "requirements": {},
+                "outputs": {"artifact-parent implementation": ["artifact-code"]},
+                "acceptance": {"focused test passes": ["artifact-proof"]},
+            },
+            "dependent_replacements": {},
+        }
+        for child in split["children"]:
+            child["write_scopes"] = []
+        baseline = StateStore().load(self.workflow_id)
+        rejected = self.mutation(
+            "node-split", 2, "reject-evidence-only-split", "--plan-json", json.dumps(split),
+            expected=2,
+        )
+        self.assertIn("cannot convert artifact-scoped work", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        split["children"][0]["write_scopes"] = ["backend/runtime.js"]
+        mismatched_child = self.mutation(
+            "node-split", 2, "reject-unscoped-artifact-child",
+            "--plan-json", json.dumps(split), expected=2,
+        )
+        self.assertIn(
+            "evidence-only work requires assessment.dimensions.change_surface=0",
+            mismatched_child["data"]["message"],
+        )
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        split["children"][1]["write_scopes"] = ["backend/proof.txt"]
+        self.mutation(
+            "node-split", 2, "split-artifact-parent", "--plan-json", json.dumps(split)
+        )
+        state = StateStore().load(self.workflow_id)
+        for child_id in ("artifact-code", "artifact-proof"):
+            obligations = state["nodes"][child_id]["lineage"]["obligations"]
+            self.assertIn("Implement artifact-parent", obligations["objectives"])
+            self.assertIn("approved schema", obligations["inputs"])
+            self.assertIn("must create runtime artifacts", obligations["constraints"])
+            self.assertIn("documentation-only delivery", obligations["non_goals"])
+            self.assertIn("backend", obligations["write_scopes"])
+
+    def test_artifact_work_cannot_be_refined_or_superseded_to_evidence_only(self) -> None:
+        self.add(
+            "artifact-source", 1, "add-artifact-source",
+            "--constraint", "must materialize the implementation", scope="backend",
+        )
+        self.add("evidence-replacement", 2, "add-evidence-replacement", evidence_only=True)
+        baseline = StateStore().load(self.workflow_id)
+        supersede = {
+            "reason": "Artifact work cannot disappear into evidence-only replacement work",
+            "operations": [
+                {
+                    "op": "supersede",
+                    "node_id": "artifact-source",
+                    "replacement": "evidence-replacement",
+                }
+            ],
+        }
+        rejected_supersede = self.mutation(
+            "graph-replan", 3, "reject-evidence-supersede",
+            "--plan-json", json.dumps(supersede), expected=2,
+        )
+        self.assertIn("effective write_scopes obligation", rejected_supersede["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        source = baseline["nodes"]["artifact-source"]
+        refinement = {
+            "spec": copy.deepcopy(source["spec"]),
+            "acceptance": list(source["acceptance"]),
+            "write_scopes": [],
+            "assessment": assessment_inputs(
+                dimensions={**DIMENSIONS, "change_surface": 0}
+            ),
+        }
+        rejected_refinement = self.mutation(
+            "node-refine", 3, "reject-evidence-refinement", "--node-id", "artifact-source",
+            "--refinement-json", json.dumps(refinement), expected=2,
+        )
+        self.assertIn("effective write_scopes obligation", rejected_refinement["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
     def test_refinement_replaces_exact_inputs_and_recovers_assessment_to_executable(self) -> None:
         self.add(
-            "draft", 1, "add-draft", "--ambiguity", "3",
+            "draft", 1, "add-draft", "--ambiguity-objective", "3",
             "--open-question", "Which public result is required?",
         )
         original = StateStore().load(self.workflow_id)["nodes"]["draft"]
@@ -304,10 +710,19 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(node["acceptance"], refinement["acceptance"])
         self.assertEqual(node["write_scopes"], refinement["write_scopes"])
         self.assertEqual(node["assessment"]["dimensions"], refinement["assessment"]["dimensions"])
-        self.assertEqual((node["assessment"]["total"], node["assessment"]["ambiguity"]), (4, 0))
+        self.assertEqual(
+            (
+                node["assessment"]["total"],
+                node["assessment"]["ambiguity_total"],
+                node["assessment"]["ambiguity_peak"],
+            ),
+            (4, 0, 0),
+        )
         self.assertEqual(node["assessment"]["state"], "executable")
         self.assertNotEqual(node["assessment"]["input_digest"], original["assessment"]["input_digest"])
-        self.assertEqual(node["lineage"], original["lineage"])
+        expected_lineage = copy.deepcopy(original["lineage"])
+        expected_lineage["obligations"] = preserved_refinement_obligations(original)
+        self.assertEqual(node["lineage"], expected_lineage)
 
         self.mutation(
             "node-route", 3, "route-refined", "--node-id", "draft", "--role", "implementer",
@@ -439,35 +854,29 @@ class DurableStateTests(unittest.TestCase):
             ([], ["upstream v2 artifact"], ["upstream revised acceptance"]),
         )
 
-        self.mutation("node-update", 11, "skip-upstream", "--node-id", "upstream", "--status", "skipped")
-        skipped = StateStore().load(self.workflow_id)
-        self.assertEqual(
-            (skipped["nodes"]["upstream"]["result"], skipped["nodes"]["upstream"]["evidence"]),
-            (None, None),
+        skip_baseline = StateStore().load(self.workflow_id)
+        skipped = self.mutation(
+            "node-update", 11, "reject-ordinary-skip", "--node-id", "upstream",
+            "--status", "skipped", expected=2,
         )
-        self.assertEqual(skipped["nodes"]["output-dependent"]["assessment"]["state"], "stale")
-        self.mutation(
-            "node-refine", 12, "reassess-after-upstream-disposition", "--node-id", "output-dependent",
-            "--refinement-json", json.dumps(dependent_refinement),
-        )
-        disposition_reassessed = StateStore().load(self.workflow_id)
-        self.assertEqual(
-            disposition_reassessed["nodes"]["output-dependent"]["assessment"]["state"],
-            "executable",
-        )
-        self.assertIn("output-dependent", ready_nodes(disposition_reassessed))
+        self.assertIn("invalid node transition", skipped["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), skip_baseline)
 
         self.mutation(
-            "requirement-set", 13, "requirement-satisfied", "--requirement-id", "req-public",
-            "--text", "Expose the public result", "--source", "task", "--status", "satisfied",
+            "requirement-set", 11, "requirement-satisfied", "--requirement-id", "req-public",
+            "--text", "Expose the approved public result", "--source", "task", "--status", "satisfied",
             "--evidence", "public contract approved",
         )
         self.mutation(
-            "block", 14, "defer-stale-requirement-work", "--node-id", "requirement-work",
+            "node-refine", 12, "reassess-upstream-requirement", "--node-id", "upstream",
+            "--refinement-json", json.dumps(upstream_refinement),
+        )
+        self.mutation(
+            "block", 13, "defer-stale-requirement-work", "--node-id", "requirement-work",
             "--reason", "requirement accounting changed", "--needed", "reassess declared work",
         )
-        self.route("dependency", 15, "route-dependency")
-        self.mutation("node-update", 16, "ready-dependency", "--node-id", "dependency", "--status", "ready")
+        self.route("dependency", 14, "route-dependency")
+        self.mutation("node-update", 15, "ready-dependency", "--node-id", "dependency", "--status", "ready")
         self.assertEqual(
             (
                 StateStore().load(self.workflow_id)["nodes"]["direct-dependent"]["assessment"]["input_digest"],
@@ -476,14 +885,14 @@ class DurableStateTests(unittest.TestCase):
             (dependency_digest, "executable"),
         )
         self.mutation(
-            "node-update", 17, "claim-dependency", "--node-id", "dependency",
+            "node-update", 16, "claim-dependency", "--node-id", "dependency",
             "--launch-state", "claimed", "--request-id", "request-dependency",
         )
         self.mutation(
-            "node-update", 18, "bind-dependency", "--node-id", "dependency",
+            "node-update", 17, "bind-dependency", "--node-id", "dependency",
             "--launch-state", "bound", "--child-id", "child-dependency",
         )
-        self.mutation("node-update", 19, "run-dependency", "--node-id", "dependency", "--status", "running")
+        self.mutation("node-update", 18, "run-dependency", "--node-id", "dependency", "--status", "running")
         self.assertEqual(
             (
                 StateStore().load(self.workflow_id)["nodes"]["direct-dependent"]["assessment"]["input_digest"],
@@ -491,8 +900,11 @@ class DurableStateTests(unittest.TestCase):
             ),
             (dependency_digest, "executable"),
         )
+        dependency_scope = self.repo / "src" / "dependency"
+        dependency_scope.parent.mkdir(parents=True)
+        dependency_scope.write_text("dependency implementation\n", encoding="utf-8")
         self.mutation(
-            "node-update", 20, "finish-dependency", "--node-id", "dependency", "--status", "done",
+            "node-update", 19, "finish-dependency", "--node-id", "dependency", "--status", "done",
             "--result", "dependency implemented", "--evidence", "dependency tests passed",
         )
 
@@ -516,7 +928,7 @@ class DurableStateTests(unittest.TestCase):
 
     def test_critical_path_dispatch_order_and_capacity_planning_diagnostics(self) -> None:
         complex_args = (
-            "--breadth", "2", "--change-surface", "2", "--coupling", "2",
+            "--breadth", "1", "--change-surface", "1", "--coupling", "1",
             "--novelty", "1", "--verification", "1",
         )
         self.add("long-root", 1, "add-long-root", *complex_args, "--priority", "1")
@@ -533,8 +945,9 @@ class DurableStateTests(unittest.TestCase):
                 "missing_dependencies",
                 "cycles",
                 "write_scope_collisions",
-                "over_budget_nodes",
+                "split_required_nodes",
                 "ambiguous_nodes",
+                "ambiguity_scores",
                 "refinement_required_nodes",
                 "stale_nodes",
                 "decomposed_nodes",
@@ -552,9 +965,9 @@ class DurableStateTests(unittest.TestCase):
                 "alpha": 5,
                 "beta": 5,
                 "high-priority": 5,
-                "long-middle": 16,
-                "long-root": 24,
-                "long-tail": 8,
+                "long-middle": 10,
+                "long-root": 15,
+                "long-tail": 5,
             },
         )
         expected_order = ["long-root", "high-priority", "alpha", "beta"]
@@ -584,11 +997,14 @@ class DurableStateTests(unittest.TestCase):
         )
         self.add("stale", 2, "add-stale", "--requirement-id", "req-route")
         self.add("split-required", 3, "add-split-required", "--breadth", "4")
-        self.add("refinement-required", 4, "add-refinement-required", "--ambiguity", "2")
+        self.add(
+            "refinement-required", 4, "add-refinement-required",
+            "--ambiguity-objective", "2", "--open-question", "Which objective applies?",
+        )
         self.add("decomposed", 5, "add-decomposed", "--breadth", "4")
         self.mutation(
             "requirement-set", 6, "change-route-requirement", "--requirement-id", "req-route",
-            "--text", "Route only current work", "--source", "task", "--status", "satisfied",
+            "--text", "Route only reassessed current work", "--source", "task", "--status", "satisfied",
             "--evidence", "routing rule approved",
         )
         lower = {**DIMENSIONS, "breadth": 0}
@@ -712,6 +1128,16 @@ class DurableStateTests(unittest.TestCase):
         )
 
     def test_node_split_is_atomic_and_preserves_coverage_rewiring_lineage_and_failed_attempt(self) -> None:
+        profile = self.base / "split-history-profile.json"
+        profile.write_text(
+            json.dumps({"node_complexity_split_threshold": 8}), encoding="utf-8"
+        )
+        created = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Exercise failed split history",
+            "--profile-file", str(profile), "--session-file", str(self.session),
+            "--mutation-id", "init-split-history",
+        )
+        self.workflow_id = created["data"]["workflow_id"]
         self.mutation(
             "requirement-set", 1, "add-req-a", "--requirement-id", "req-a",
             "--text", "Produce artifact A", "--source", "task", "--status", "active",
@@ -724,7 +1150,7 @@ class DurableStateTests(unittest.TestCase):
             "parent", 3, "add-parent",
             "--requirement-id", "req-a", "--requirement-id", "req-b",
             "--output", "public API artifact", "--acceptance", "integration passes",
-            "--breadth", "2", "--change-surface", "2", "--coupling", "2",
+            "--breadth", "2", "--change-surface", "2", "--coupling", "1",
             "--novelty", "1", "--verification", "1",
         )
         self.add("dependent", 4, "add-dependent", "--dependency", "parent")
@@ -745,7 +1171,10 @@ class DurableStateTests(unittest.TestCase):
         )
         failed_attempt = copy.deepcopy(StateStore().load(self.workflow_id)["nodes"]["parent"]["attempts"])
         lower = {**DIMENSIONS, "breadth": 0}
-        recursive = {name: (4 if name == "breadth" else 0) for name in DIMENSIONS}
+        recursive = {
+            name: (4 if name == "breadth" else 1 if name == "change_surface" else 0)
+            for name in DIMENSIONS
+        }
         split = {
             "parent_id": "parent",
             "reason": "Separate the two requirement and proof surfaces",
@@ -800,21 +1229,31 @@ class DurableStateTests(unittest.TestCase):
                 "depth": 0,
                 "child_ids": ["child-a", "child-b"],
                 "split_reason": split["reason"],
-                "obligations": {"requirements": [], "outputs": [], "acceptance": []},
+                "obligations": empty_obligations(),
             },
         )
         self.assertEqual(state["nodes"]["dependent"]["dependencies"], ["child-a", "child-b"])
         self.assertEqual(state["nodes"]["dependent"]["assessment"]["state"], "stale")
         child_obligations = {
             "child-a": {
+                "objectives": ["Implement parent"],
                 "requirements": ["req-a"],
+                "inputs": [],
                 "outputs": ["parent implementation"],
+                "constraints": [],
+                "non_goals": [],
                 "acceptance": ["focused test passes"],
+                "write_scopes": ["src/parent"],
             },
             "child-b": {
+                "objectives": ["Implement parent"],
                 "requirements": ["req-b"],
+                "inputs": [],
                 "outputs": ["public API artifact"],
+                "constraints": [],
+                "non_goals": [],
                 "acceptance": ["integration passes"],
+                "write_scopes": ["src/parent"],
             },
         }
         for node_id in ("child-a", "child-b"):
@@ -829,11 +1268,11 @@ class DurableStateTests(unittest.TestCase):
                     "obligations": child_obligations[node_id],
                 },
             )
-        self.assertEqual((state["nodes"]["child-a"]["assessment"]["total"], state["nodes"]["child-a"]["assessment"]["state"]), (4, "split_required"))
+        self.assertEqual((state["nodes"]["child-a"]["assessment"]["total"], state["nodes"]["child-a"]["assessment"]["state"]), (5, "split_required"))
         self.assertEqual((state["nodes"]["child-b"]["assessment"]["total"], state["nodes"]["child-b"]["assessment"]["state"]), (4, "executable"))
         self.assertEqual(ready_nodes(state), [])
 
-        recursive_lower = {**lower, "change_surface": 0}
+        recursive_lower = lower
         recursive_split = {
             "parent_id": "child-a",
             "reason": "Carry inherited requirement, output, and acceptance obligations to a bounded leaf",
@@ -882,9 +1321,14 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(
             grandchild["lineage"]["obligations"],
             {
+                "objectives": ["Implement child-a", "Implement parent"],
                 "requirements": ["req-a"],
+                "inputs": [],
                 "outputs": ["child A artifact", "parent implementation"],
+                "constraints": [],
+                "non_goals": [],
                 "acceptance": ["focused test passes"],
+                "write_scopes": ["src/child-a", "src/parent"],
             },
         )
         self.assertEqual(
@@ -893,7 +1337,6 @@ class DurableStateTests(unittest.TestCase):
         )
         self.assertEqual(state["nodes"]["dependent"]["dependencies"], ["grandchild-a", "child-b"])
 
-        carried = copy.deepcopy(grandchild["lineage"]["obligations"])
         carried_digest = grandchild["assessment"]["input_digest"]
         descendant_refinement = {
             "spec": {
@@ -913,13 +1356,14 @@ class DurableStateTests(unittest.TestCase):
             "--refinement-json", json.dumps(descendant_refinement),
         )
         refined_descendant = StateStore().load(self.workflow_id)["nodes"]["grandchild-a"]
-        self.assertEqual(refined_descendant["lineage"]["obligations"], carried)
+        preserved_after_refine = preserved_refinement_obligations(grandchild)
+        self.assertEqual(refined_descendant["lineage"]["obligations"], preserved_after_refine)
         self.assertEqual(refined_descendant["spec"]["outputs"], ["descendant refined output"])
         self.assertNotEqual(refined_descendant["assessment"]["input_digest"], carried_digest)
         refined_digest = refined_descendant["assessment"]["input_digest"]
         self.mutation(
             "requirement-set", 14, "satisfy-carried-requirement", "--requirement-id", "req-a",
-            "--text", "Produce artifact A", "--source", "task", "--status", "satisfied",
+            "--text", "Produce approved artifact A", "--source", "task", "--status", "satisfied",
             "--evidence", "carried requirement approved",
         )
         stale_descendant = StateStore().load(self.workflow_id)["nodes"]["grandchild-a"]
@@ -930,13 +1374,16 @@ class DurableStateTests(unittest.TestCase):
             "node-refine", 15, "reassess-carried-requirement", "--node-id", "grandchild-a",
             "--refinement-json", json.dumps(descendant_refinement),
         )
+        source_effective = effective_obligations(
+            StateStore().load(self.workflow_id)["nodes"]["grandchild-a"]
+        )
 
         escape_baseline = StateStore().load(self.workflow_id)
         escaped = self.mutation(
             "node-update", 16, "reject-obligation-skip", "--node-id", "grandchild-proof",
             "--status", "skipped", expected=2,
         )
-        self.assertIn("cannot discard carried obligations", escaped["data"]["message"])
+        self.assertIn("invalid node transition", escaped["data"]["message"])
         remove_plan = {
             "reason": "A carried acceptance obligation cannot disappear",
             "operations": [{"op": "remove", "node_id": "grandchild-proof"}],
@@ -945,7 +1392,7 @@ class DurableStateTests(unittest.TestCase):
             "graph-replan", 16, "reject-obligation-remove", "--plan-json", json.dumps(remove_plan),
             expected=2,
         )
-        self.assertIn("cannot remove a node with carried obligations", removed["data"]["message"])
+        self.assertIn("unsupported operation", removed["data"]["message"])
         self.assertEqual(StateStore().load(self.workflow_id), escape_baseline)
 
         nonrewritable_supersede = {
@@ -973,10 +1420,11 @@ class DurableStateTests(unittest.TestCase):
             "--plan-json", json.dumps(supersede_plan),
         )
         transferred = StateStore().load(self.workflow_id)
-        self.assertEqual(
-            transferred["nodes"]["obligation-replacement"]["lineage"]["obligations"],
-            carried,
+        replacement_effective = effective_obligations(
+            transferred["nodes"]["obligation-replacement"]
         )
+        for field in OBLIGATION_FIELDS:
+            self.assertTrue(set(source_effective[field]).issubset(replacement_effective[field]))
         self.assertEqual(
             transferred["nodes"]["obligation-replacement"]["assessment"]["state"],
             "stale",
@@ -1087,7 +1535,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "requirement-set", 31, "change-stale-split-requirement", "--requirement-id", "req-stale-split",
-            "--text", "Keep split accounting current", "--source", "task", "--status", "satisfied",
+            "--text", "Keep revised split accounting current", "--source", "task", "--status", "satisfied",
             "--evidence", "requirement changed after failure",
         )
         stale_failed_split = {
@@ -1129,7 +1577,11 @@ class DurableStateTests(unittest.TestCase):
         self.assertIn("current parent assessment", rejected_stale["data"]["message"])
         self.assertEqual(StateStore().load(self.workflow_id), stale_baseline)
 
-        self.add("refinement-split-parent", 32, "add-refinement-split-parent", "--ambiguity", "2")
+        self.add(
+            "refinement-split-parent", 32, "add-refinement-split-parent",
+            "--ambiguity-objective", "2",
+            "--open-question", "Which bounded split is correct?",
+        )
         refinement_split = {
             "parent_id": "refinement-split-parent",
             "reason": "Ambiguity must be resolved before decomposition",
@@ -1258,15 +1710,30 @@ class DurableStateTests(unittest.TestCase):
         ))
         self.assertEqual(over_budget, state["nodes"]["upstream"]["assessment"]["dimensions"])
 
-    def test_node_split_prunes_terminal_success_dependents_without_replacements(self) -> None:
+    def test_supersede_preserves_prerequisite_when_parent_is_later_split(self) -> None:
         self.add("P", 1, "add-cancelled-dependent-parent", "--breadth", "4")
         self.add("D", 2, "add-cancelled-dependent", "--dependency", "P")
+        self.add("D-replacement", 3, "add-cancelled-dependent-replacement")
+        supersede = {
+            "reason": "D is replaced atomically without discarding its work",
+            "operations": [{"op": "supersede", "node_id": "D", "replacement": "D-replacement"}],
+        }
         self.mutation(
-            "node-update", 3, "skip-cancelled-dependent", "--node-id", "D", "--status", "skipped",
+            "graph-replan", 4, "supersede-dependent", "--plan-json", json.dumps(supersede),
+        )
+        superseded = StateStore().load(self.workflow_id)
+        self.assertEqual(superseded["nodes"]["D-replacement"]["dependencies"], ["P"])
+        forged = copy.deepcopy(superseded)
+        forged["nodes"]["D-replacement"]["dependencies"] = []
+        with self.assertRaisesRegex(StateError, "loses prerequisite"):
+            validate_state(forged)
+        self.mutation(
+            "block", 5, "block-dependent-replacement", "--node-id", "D-replacement",
+            "--reason", "replacement is outside this split example", "--needed", "later reassessment",
         )
         split = {
             "parent_id": "P",
-            "reason": "Terminal-success dependent D no longer needs a live replacement edge",
+            "reason": "The live replacement keeps D's prerequisite through the split",
             "children": [
                 split_child(
                     "P-a",
@@ -1286,11 +1753,11 @@ class DurableStateTests(unittest.TestCase):
                 "outputs": {"P implementation": ["P-a"]},
                 "acceptance": {"focused test passes": ["P-b"]},
             },
-            "dependent_replacements": {},
+            "dependent_replacements": {"D-replacement": ["P-a", "P-b"]},
         }
-        self.mutation("node-split", 4, "split-after-dependent-cancellation", "--plan-json", json.dumps(split))
+        self.mutation("node-split", 6, "split-after-dependent-cancellation", "--plan-json", json.dumps(split))
         state = StateStore().load(self.workflow_id)
-        self.assertEqual(state["revision"], 5)
+        self.assertEqual(state["revision"], 7)
         self.assertEqual(state["nodes"]["D"]["dependencies"], [])
         self.assertEqual(
             (
@@ -1304,6 +1771,7 @@ class DurableStateTests(unittest.TestCase):
             {state["nodes"][node_id]["assessment"]["state"] for node_id in ("P-a", "P-b")},
             {"executable"},
         )
+        self.assertEqual(state["nodes"]["D-replacement"]["dependencies"], ["P-a", "P-b"])
         self.assertEqual(set(ready_nodes(state)), {"P-a", "P-b"})
 
     def test_node_split_prerequisite_coverage_uses_final_rewired_graph_atomically(self) -> None:
@@ -1348,7 +1816,16 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(StateStore().load(self.workflow_id), baseline)
 
         self.add("X", 4, "add-retained-node", "--dependency", "D")
-        self.mutation("node-update", 5, "skip-retained-node", "--node-id", "X", "--status", "skipped")
+        self.add("X-replacement", 5, "add-retained-replacement")
+        supersede = {
+            "reason": "Retain X's obligations through an explicit replacement",
+            "operations": [{"op": "supersede", "node_id": "X", "replacement": "X-replacement"}],
+        }
+        self.mutation("graph-replan", 6, "supersede-retained-node", "--plan-json", json.dumps(supersede))
+        self.mutation(
+            "block", 7, "block-retained-replacement", "--node-id", "X-replacement",
+            "--reason", "replacement is outside prerequisite coverage", "--needed", "later reassessment",
+        )
         retained_plan = {
             "parent_id": "P",
             "reason": "A retained terminal node cannot witness the parent's prerequisite",
@@ -1376,7 +1853,7 @@ class DurableStateTests(unittest.TestCase):
         }
         retained_baseline = StateStore().load(self.workflow_id)
         retained_rejection = self.mutation(
-            "node-split", 6, "reject-retained-prerequisite-bypass",
+            "node-split", 8, "reject-retained-prerequisite-bypass",
             "--plan-json", json.dumps(retained_plan), expected=2,
         )
         self.assertIn(
@@ -1385,54 +1862,27 @@ class DurableStateTests(unittest.TestCase):
         )
         self.assertEqual(StateStore().load(self.workflow_id), retained_baseline)
         self.mutation(
-            "block", 6, "defer-unresolved-parent", "--node-id", "P",
+            "block", 8, "defer-unresolved-parent", "--node-id", "P",
             "--reason", "invalid prerequisite coverage", "--needed", "a valid child-only witness",
         )
         dispatch = planning_diagnostics(StateStore().load(self.workflow_id))["dispatch_order"]
         self.assertEqual(dispatch, ["D"])
         self.assertNotIn("P-via-X", StateStore().load(self.workflow_id)["nodes"])
 
-    def test_terminal_bridge_severs_live_scope_and_critical_path_reachability(self) -> None:
-        self.add("U", 1, "add-live-upstream", "--priority", "10", scope="src/shared")
-        self.add("X", 2, "add-terminal-bridge", "--dependency", "U")
-        self.mutation("node-update", 3, "skip-terminal-bridge", "--node-id", "X", "--status", "skipped")
-
-        add_baseline = StateStore().load(self.workflow_id)
-        rejected_add = self.add(
-            "Y", 4, "reject-parallel-scope-through-terminal-bridge",
-            "--dependency", "X", "--priority", "90", scope="src/shared", expected=2,
-        )
-        self.assertIn("write_scope_collisions", rejected_add["data"]["message"])
-        self.assertEqual(StateStore().load(self.workflow_id), add_baseline)
-
-        self.add("Y", 4, "add-nonoverlapping-downstream", "--dependency", "X", "--priority", "90")
-        state = StateStore().load(self.workflow_id)
-        diagnostics = planning_diagnostics(state)
-        self.assertEqual(diagnostics["critical_path_load"], {"U": 5, "X": 0, "Y": 5})
-        self.assertEqual(diagnostics["dispatch_order"], ["Y", "U"])
-        self.assertEqual(ready_nodes(state), ["Y", "U"])
-        self.assertEqual(
-            [
-                node_id
-                for node_id in diagnostics["dispatch_order"]
-                if "src/shared" in state["nodes"][node_id]["write_scopes"]
-            ],
-            ["U"],
-        )
-
-        y = state["nodes"]["Y"]
-        colliding_refinement = {
-            "spec": copy.deepcopy(y["spec"]),
-            "acceptance": list(y["acceptance"]),
-            "write_scopes": ["src/shared"],
-            "assessment": assessment_inputs(rationale="Only the proposed scope changes"),
+    def test_superseded_nodes_cannot_gain_new_dependents(self) -> None:
+        self.add("source", 1, "add-superseded-source")
+        self.add("replacement", 2, "add-superseded-replacement")
+        supersede = {
+            "reason": "Transfer the source's full effective work",
+            "operations": [{"op": "supersede", "node_id": "source", "replacement": "replacement"}],
         }
-        rejected_refinement = self.mutation(
-            "node-refine", 5, "reject-refined-parallel-scope", "--node-id", "Y",
-            "--refinement-json", json.dumps(colliding_refinement), expected=2,
+        self.mutation("graph-replan", 3, "supersede-source", "--plan-json", json.dumps(supersede))
+        baseline = StateStore().load(self.workflow_id)
+        rejected = self.add(
+            "dependent", 4, "reject-superseded-dependency", "--dependency", "source", expected=2,
         )
-        self.assertIn("write_scope_collisions", rejected_refinement["data"]["message"])
-        self.assertEqual(StateStore().load(self.workflow_id), state)
+        self.assertIn("superseded but still has dependents", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
 
     def test_supersede_cycle_cannot_discharge_carried_work(self) -> None:
         self.add("cycle-parent", 1, "add-cycle-parent", "--breadth", "4")
@@ -1464,6 +1914,7 @@ class DurableStateTests(unittest.TestCase):
         split_state = StateStore().load(self.workflow_id)
         self.assertEqual(set(ready_nodes(split_state)), {"cycle-a", "cycle-b"})
         obligations = copy.deepcopy(split_state["nodes"]["cycle-a"]["lineage"]["obligations"])
+        source_effective = effective_obligations(split_state["nodes"]["cycle-a"])
         self.assertTrue(obligations["outputs"] and obligations["acceptance"])
 
         forward = {
@@ -1473,7 +1924,9 @@ class DurableStateTests(unittest.TestCase):
         self.mutation("graph-replan", 3, "supersede-cycle-a", "--plan-json", json.dumps(forward))
         transferred = StateStore().load(self.workflow_id)
         self.assertEqual(transferred["nodes"]["cycle-a"]["superseded_by"], "cycle-b")
-        self.assertEqual(transferred["nodes"]["cycle-b"]["lineage"]["obligations"], obligations)
+        replacement_effective = effective_obligations(transferred["nodes"]["cycle-b"])
+        for field in OBLIGATION_FIELDS:
+            self.assertTrue(set(source_effective[field]).issubset(replacement_effective[field]))
         self.assertEqual(transferred["nodes"]["cycle-b"]["assessment"]["state"], "stale")
 
         replacement = transferred["nodes"]["cycle-b"]
@@ -1488,6 +1941,7 @@ class DurableStateTests(unittest.TestCase):
             "--refinement-json", json.dumps(refinement),
         )
         baseline = StateStore().load(self.workflow_id)
+        baseline_obligations = baseline["nodes"]["cycle-b"]["lineage"]["obligations"]
         reverse = {
             "reason": "A reverse transfer must not form a supersede cycle",
             "operations": [{"op": "supersede", "node_id": "cycle-b", "replacement": "cycle-a"}],
@@ -1500,12 +1954,12 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(StateStore().load(self.workflow_id), baseline)
         self.assertEqual(
             (baseline["nodes"]["cycle-b"]["status"], baseline["nodes"]["cycle-b"]["lineage"]["obligations"]),
-            ("pending", obligations),
+            ("pending", baseline_obligations),
         )
 
         self.mutation(
             "finish", 5, "reject-unexecuted-carried-work", "--summary", "not executed",
-            "--validation", "not run", "--commit", "a" * 40, expected=2,
+            "--validation", "not run", expected=2,
         )
         self.assertEqual(StateStore().load(self.workflow_id), baseline)
 
@@ -1521,14 +1975,95 @@ class DurableStateTests(unittest.TestCase):
         unresolved = copy.deepcopy(forged_cycle)
         unresolved["nodes"]["cycle-b"]["superseded_by"] = None
         with self.assertRaisesRegex(
-            StateError, "superseded_by chain must terminate in resolvable work"
+            StateError, "skipped/cancelled work must be decomposed or superseded"
         ):
             validate_state(unresolved)
 
+    def test_stored_supersede_cannot_drop_native_obligations(self) -> None:
+        self.add("source", 1, "add-native-source")
+        self.add("replacement", 2, "add-native-replacement")
+        forged = StateStore().load(self.workflow_id)
+        forged["nodes"]["source"].update({
+            "status": "skipped",
+            "result": "superseded",
+            "evidence": "forged transfer",
+            "superseded_by": "replacement",
+        })
+        with self.assertRaisesRegex(StateError, "loses effective obligations"):
+            validate_state(forged)
+
+        source_effective = effective_obligations(forged["nodes"]["source"])
+        forged["nodes"]["replacement"]["lineage"]["obligations"] = source_effective
+        forged["nodes"]["replacement"]["assessment"]["state"] = "stale"
+        validate_state(forged)
+
+    def test_supersede_resolves_carried_obligation_already_native_to_replacement(self) -> None:
+        self.add("parent", 1, "add-native-overlap-parent", "--output", "shared", "--breadth", "4")
+        plan = {
+            "parent_id": "parent",
+            "reason": "Carry the parent's shared work to one bounded child",
+            "children": [
+                split_child(
+                    "carrier",
+                    acceptance=["focused test passes"],
+                    outputs=["shared"],
+                    requirement_ids=[],
+                ),
+                split_child(
+                    "sibling",
+                    acceptance=["sibling proof"],
+                    outputs=["sibling output"],
+                    requirement_ids=[],
+                ),
+            ],
+            "coverage": {
+                "requirements": {},
+                "outputs": {
+                    "parent implementation": ["carrier"],
+                    "shared": ["carrier"],
+                },
+                "acceptance": {"focused test passes": ["carrier"]},
+            },
+            "dependent_replacements": {},
+        }
+        self.mutation("node-split", 2, "split-native-overlap-parent", "--plan-json", json.dumps(plan))
+        self.add(
+            "replacement", 3, "add-native-overlap-replacement",
+            "--output", "parent implementation", "--output", "shared",
+        )
+        replan = {
+            "reason": "The replacement already declares every carried obligation natively",
+            "operations": [
+                {"op": "supersede", "node_id": "carrier", "replacement": "replacement"}
+            ],
+        }
+        self.mutation(
+            "graph-replan", 4, "supersede-native-overlap-carrier",
+            "--plan-json", json.dumps(replan),
+        )
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["nodes"]["carrier"]["superseded_by"], "replacement")
+        self.assertEqual(
+            {
+                field: state["nodes"]["replacement"]["lineage"]["obligations"][field]
+                for field in COVERAGE_FIELDS
+            },
+            {field: [] for field in COVERAGE_FIELDS},
+        )
+
     def test_supersede_cannot_cycle_carried_obligations_through_decomposition(self) -> None:
         self.add("G", 1, "add-provenance-root", "--output", "O", "--breadth", "4")
-        split_required = {name: (4 if name == "breadth" else 0) for name in DIMENSIONS}
-        bounded = {"breadth": 0, "change_surface": 0, "coupling": 1, "novelty": 1, "verification": 1}
+        split_required = {
+            name: (4 if name == "breadth" else 1 if name == "change_surface" else 0)
+            for name in DIMENSIONS
+        }
+        bounded = {
+            "breadth": 0,
+            "change_surface": 1,
+            "coupling": 1,
+            "novelty": 1,
+            "verification": 1,
+        }
         root_split = {
             "parent_id": "G",
             "reason": "Carry every root obligation into P while leaving Q obligation-free",
@@ -1559,11 +2094,10 @@ class DurableStateTests(unittest.TestCase):
         first_split = StateStore().load(self.workflow_id)
         self.assertIn("O", first_split["nodes"]["P"]["spec"]["outputs"])
         self.assertIn("O", first_split["nodes"]["P"]["lineage"]["obligations"]["outputs"])
-        self.assertEqual(
-            first_split["nodes"]["Q"]["lineage"]["obligations"],
-            {"requirements": [], "outputs": [], "acceptance": []},
-        )
-        self.mutation("node-update", 3, "cancel-zero-obligation-Q", "--node-id", "Q", "--status", "cancelled")
+        self.assertTrue(all(
+            not first_split["nodes"]["Q"]["lineage"]["obligations"][field]
+            for field in COVERAGE_FIELDS
+        ))
 
         child_split = {
             "parent_id": "P",
@@ -1591,15 +2125,13 @@ class DurableStateTests(unittest.TestCase):
             },
             "dependent_replacements": {},
         }
-        self.mutation("node-split", 4, "split-obligated-P", "--plan-json", json.dumps(child_split))
+        self.mutation("node-split", 3, "split-obligated-P", "--plan-json", json.dumps(child_split))
         second_split = StateStore().load(self.workflow_id)
         self.assertIn("O", second_split["nodes"]["A"]["lineage"]["obligations"]["outputs"])
-        self.assertEqual(
-            second_split["nodes"]["B"]["lineage"]["obligations"],
-            {"requirements": [], "outputs": [], "acceptance": []},
-        )
-        self.mutation("node-update", 5, "cancel-zero-obligation-B", "--node-id", "B", "--status", "cancelled")
-
+        self.assertTrue(all(
+            not second_split["nodes"]["B"]["lineage"]["obligations"][field]
+            for field in COVERAGE_FIELDS
+        ))
         baseline = StateStore().load(self.workflow_id)
         self.assertIsNone(baseline["nodes"]["A"]["superseded_by"])
         self.assertIsNone(baseline["nodes"]["P"]["superseded_by"])
@@ -1608,18 +2140,18 @@ class DurableStateTests(unittest.TestCase):
             "operations": [{"op": "supersede", "node_id": "A", "replacement": "P"}],
         }
         rejected = self.mutation(
-            "graph-replan", 6, "reject-provenance-cycle",
+            "graph-replan", 4, "reject-provenance-cycle",
             "--plan-json", json.dumps(provenance_cycle), expected=2,
         )
-        self.assertIn("obligation", rejected["data"]["message"])
+        self.assertIn("supersede replacement requires", rejected["data"]["message"])
         self.assertEqual(StateStore().load(self.workflow_id), baseline)
         self.assertEqual(
             (baseline["nodes"]["A"]["status"], baseline["nodes"]["A"]["attempts"]),
             ("pending", []),
         )
         self.mutation(
-            "finish", 6, "reject-unexecuted-provenance-cycle", "--summary", "not executed",
-            "--validation", "not run", "--commit", "b" * 40, expected=2,
+            "finish", 4, "reject-unexecuted-provenance-cycle", "--summary", "not executed",
+            "--validation", "not run", expected=2,
         )
         self.assertEqual(StateStore().load(self.workflow_id), baseline)
 
@@ -1644,7 +2176,7 @@ class DurableStateTests(unittest.TestCase):
                 self.add(
                     "raw-capacity", 2, "add-ambiguous-raw-capacity",
                     "--requirement-id", "req-raw-capacity", "--breadth", "4",
-                    "--ambiguity", "2", "--open-question", "Which bounded split applies?",
+                    "--ambiguity-objective", "2", "--open-question", "Which bounded split applies?",
                 )
                 refinement_required = StateStore().load(self.workflow_id)
                 raw_node = refinement_required["nodes"]["raw-capacity"]
@@ -1660,7 +2192,7 @@ class DurableStateTests(unittest.TestCase):
 
                 self.mutation(
                     "requirement-set", 3, "stale-raw-capacity", "--requirement-id", "req-raw-capacity",
-                    "--text", "Keep accounting current", "--source", "task", "--status", "satisfied",
+                    "--text", "Keep revised accounting current", "--source", "task", "--status", "satisfied",
                     "--evidence", "accounting input changed",
                 )
                 stale = StateStore().load(self.workflow_id)
@@ -1778,7 +2310,10 @@ class DurableStateTests(unittest.TestCase):
                         acceptance=["depth A proof"],
                         outputs=["depth A artifact"],
                         requirement_ids=[],
-                        dimensions={name: (4 if name == "breadth" else 0) for name in DIMENSIONS},
+                        dimensions={
+                            name: (4 if name == "breadth" else 1 if name == "change_surface" else 0)
+                            for name in DIMENSIONS
+                        },
                     ),
                     split_child(
                         "depth-one-b",
@@ -1810,7 +2345,7 @@ class DurableStateTests(unittest.TestCase):
             ambiguous_over_budget_at_limit["reason"] = (
                 "Ambiguity must not hide raw over-budget work at the depth limit"
             )
-            ambiguous_over_budget_at_limit["children"][0]["assessment"]["ambiguity"] = 2
+            ambiguous_over_budget_at_limit["children"][0]["assessment"]["ambiguity_factors"]["objective"] = 2
             ambiguous_over_budget_at_limit["children"][0]["spec"]["open_questions"] = [
                 "Which final bounded leaf owns this work?"
             ]
@@ -1847,7 +2382,10 @@ class DurableStateTests(unittest.TestCase):
                 "acceptance": child["acceptance"],
                 "write_scopes": child["write_scopes"],
                 "assessment": assessment_inputs(
-                    dimensions={name: (4 if name == "breadth" else 0) for name in DIMENSIONS},
+                    dimensions={
+                        name: (4 if name == "breadth" else 1 if name == "change_surface" else 0)
+                        for name in DIMENSIONS
+                    },
                     rationale="This refinement would require another split",
                 ),
             }
@@ -1864,6 +2402,7 @@ class DurableStateTests(unittest.TestCase):
             self.workflow_id = original_workflow
 
     def test_revision_receipts_and_invalid_graph_changes_are_atomic(self) -> None:
+        (self.repo / "dirty-after-init.txt").write_text("existing receipt must win\n", encoding="utf-8")
         replayed_init = self.cli(
             "init", "--repo", str(self.repo), "--task", "Coordinate durable work",
             "--session-file", str(self.session), "--mutation-id", "init-001",
@@ -1900,6 +2439,11 @@ class DurableStateTests(unittest.TestCase):
         plan = json.dumps({"reason": "try cycle", "operations": [{"op": "dependency_add", "node_id": "a", "dependency": "b"}]})
         self.mutation("graph-replan", 3, "cycle", "--plan-json", plan, expected=2)
         self.add("collision", 3, "scope-collision", scope="src/a/file.py", expected=2)
+        for index, scope in enumerate(("../outside", "/absolute", "C:/absolute", "src/\0artifact"), start=1):
+            rejected = self.add(
+                f"invalid-scope-{index}", 3, f"invalid-scope-{index}", scope=scope, expected=2,
+            )
+            self.assertEqual(rejected["code"], "invalid_state")
         state = StateStore().load(self.workflow_id)
         self.assertEqual(state["revision"], 3)
         self.assertEqual(set(state["nodes"]), {"a", "b"})
@@ -1936,6 +2480,33 @@ class DurableStateTests(unittest.TestCase):
         state["status"] = "blocked"
         self.assertEqual(ready_nodes(state), [])
 
+    def test_claimed_launch_cannot_be_stranded_by_a_blocked_or_pending_status(self) -> None:
+        self.add("work", 1, "add-claim-state-work")
+        self.route("work", 2, "route-claim-state-work")
+        self.mutation(
+            "node-update", 3, "claim-state-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-claim-state",
+        )
+
+        rejected = self.mutation(
+            "node-update", 4, "block-claimed-work", "--node-id", "work",
+            "--status", "blocked", expected=2,
+        )
+        self.assertIn("blocked transition requires an unclaimed launch", rejected["data"]["message"])
+        persisted = StateStore().load(self.workflow_id)["nodes"]["work"]
+        self.assertEqual((persisted["status"], persisted["launch"]["state"]), ("ready", "claimed"))
+
+        state = StateStore().load(self.workflow_id)
+        for status in ("pending", "blocked"):
+            with self.subTest(status=status):
+                forged = copy.deepcopy(state)
+                forged["nodes"]["work"]["status"] = status
+                with self.assertRaisesRegex(
+                    StateError,
+                    "pending/blocked status cannot retain an active launch",
+                ):
+                    validate_state(forged)
+
     def test_inline_fallback_binds_a_maximum_length_request_identifier(self) -> None:
         self.add("work", 1, "add-work")
         self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
@@ -1951,6 +2522,14 @@ class DurableStateTests(unittest.TestCase):
             "--launch-state", "bound", "--child-id", inline_id,
         )
         self.mutation("node-update", 6, "run-inline", "--node-id", "work", "--status", "running")
+        rejected = self.mutation(
+            "node-update", 7, "finish-inline-missing-scope", "--node-id", "work", "--status", "done",
+            "--result", "implemented inline", "--evidence", "focused test passed", expected=2,
+        )
+        self.assertIn("no materialized file or directory", rejected["data"]["message"])
+        work_scope = self.repo / "src" / "work"
+        work_scope.parent.mkdir(parents=True)
+        work_scope.write_text("inline implementation\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-inline", "--node-id", "work", "--status", "done",
             "--result", "implemented inline", "--evidence", "focused test passed",
@@ -1985,13 +2564,13 @@ class DurableStateTests(unittest.TestCase):
             StateStore().load(self.workflow_id)["nodes"]["work"]["assessment"]
         )
         self.mutation(
-            "requirement-set", 9, "change-recovery-requirement", "--requirement-id", "req-recovery",
-            "--text", "Use the current recovery input", "--source", "task", "--status", "satisfied",
-            "--evidence", "recovery input changed", session=second_session,
+            "node-update", 9, "safe-retry", "--node-id", "work", "--launch-state", "unclaimed",
+            "--reconciliation", "provider confirms no child", session=second_session,
         )
         self.mutation(
-            "node-update", 10, "safe-retry", "--node-id", "work", "--launch-state", "unclaimed",
-            "--reconciliation", "provider confirms no child", session=second_session,
+            "requirement-set", 10, "change-recovery-requirement", "--requirement-id", "req-recovery",
+            "--text", "Use the revised recovery input", "--source", "task", "--status", "satisfied",
+            "--evidence", "recovery input changed", session=second_session,
         )
         state = StateStore().load(self.workflow_id)
         node = state["nodes"]["work"]
@@ -2038,6 +2617,100 @@ class DurableStateTests(unittest.TestCase):
         relaunched = StateStore().load(self.workflow_id)["nodes"]["work"]
         self.assertEqual([attempt["number"] for attempt in relaunched["attempts"]], [1, 2])
         self.assertEqual(relaunched["attempts"][0]["outcome"], "provider confirmed not launched")
+
+    def test_takeover_reconciles_claimed_bound_and_running_launches_before_resume(self) -> None:
+        for revision, node_id in enumerate(("claimed", "bound", "running"), start=1):
+            self.add(node_id, revision, f"add-{node_id}")
+        for revision, node_id in enumerate(("claimed", "bound", "running"), start=4):
+            self.route(node_id, revision, f"route-{node_id}")
+        self.mutation(
+            "node-update", 7, "claim-claimed", "--node-id", "claimed",
+            "--launch-state", "claimed", "--request-id", "request-claimed",
+        )
+        self.mutation(
+            "node-update", 8, "claim-bound", "--node-id", "bound",
+            "--launch-state", "claimed", "--request-id", "request-bound",
+        )
+        self.mutation(
+            "node-update", 9, "bind-bound", "--node-id", "bound",
+            "--launch-state", "bound", "--child-id", "child-bound",
+        )
+        self.mutation(
+            "node-update", 10, "claim-running", "--node-id", "running",
+            "--launch-state", "claimed", "--request-id", "request-running",
+        )
+        self.mutation(
+            "node-update", 11, "bind-running", "--node-id", "running",
+            "--launch-state", "bound", "--child-id", "child-running",
+        )
+        self.mutation(
+            "node-update", 12, "run-running", "--node-id", "running", "--status", "running",
+        )
+
+        second_session = self.base / "private" / "takeover-active.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(second_session))
+        self.mutation("controller-takeover", 13, "takeover-active", session=second_session)
+        taken = StateStore().load(self.workflow_id)
+        self.assertEqual(
+            {node_id: taken["nodes"][node_id]["launch"]["state"] for node_id in taken["nodes"]},
+            {"claimed": "reconcile_required", "bound": "reconcile_required", "running": "reconcile_required"},
+        )
+        self.assertEqual(taken["nodes"]["running"]["status"], "running")
+        self.mutation(
+            "resume", 14, "resume-active", "--message", "begin provider reconciliation",
+            session=second_session,
+        )
+        self.mutation(
+            "node-update", 15, "clear-claimed", "--node-id", "claimed",
+            "--launch-state", "unclaimed", "--reconciliation", "provider confirms no child",
+            session=second_session,
+        )
+        self.mutation(
+            "node-update", 16, "restore-bound", "--node-id", "bound",
+            "--launch-state", "bound", "--child-id", "child-bound",
+            "--reconciliation", "provider confirms bound child", session=second_session,
+        )
+        self.mutation(
+            "node-update", 17, "restore-running", "--node-id", "running",
+            "--launch-state", "running", "--child-id", "child-running",
+            "--reconciliation", "provider confirms running child", session=second_session,
+        )
+        recovered = StateStore().load(self.workflow_id)
+        self.assertEqual(recovered["controller"]["recovery_status"], "clean")
+        self.assertEqual(recovered["nodes"]["bound"]["launch"]["child_id"], "child-bound")
+        self.assertEqual(recovered["nodes"]["running"]["launch"]["child_id"], "child-running")
+
+    def test_init_idempotency_is_scoped_to_the_origin_session(self) -> None:
+        same_session = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Coordinate durable work",
+            "--session-file", str(self.session), "--mutation-id", "init-001",
+        )
+        self.assertEqual(same_session["data"]["workflow_id"], self.workflow_id)
+        conflict = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Different task",
+            "--session-file", str(self.session), "--mutation-id", "init-001", expected=20,
+        )
+        self.assertEqual(conflict["code"], "mutation_conflict")
+
+        second_session = self.base / "private" / "new-origin.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(second_session))
+        independent = self.cli(
+            "init", "--repo", str(self.repo), "--task", "Coordinate durable work",
+            "--session-file", str(second_session), "--mutation-id", "init-001",
+        )
+        self.assertNotEqual(independent["data"]["workflow_id"], self.workflow_id)
+
+        other_repo = self.base / "other-repo"
+        other_repo.mkdir()
+        (other_repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+        other_session = self.base / "private" / "other-origin.json"
+        self.cli("session-open", "--repo", str(other_repo), "--session-file", str(other_session))
+        unrelated = self.cli(
+            "init", "--repo", str(other_repo), "--task", "Coordinate durable work",
+            "--session-file", str(other_session), "--mutation-id", "init-001",
+        )
+        self.assertNotEqual(unrelated["data"]["workflow_id"], self.workflow_id)
+
 
     def test_failed_attempt_can_be_routed_and_relaunched_without_losing_history(self) -> None:
         self.add("work", 1, "add-work")
@@ -2337,73 +3010,499 @@ class DurableStateTests(unittest.TestCase):
         )
         self.assertEqual(StateStore().load(self.workflow_id)["revision"], 14)
 
-    def test_finish_requires_commit_checkpoint_and_terminal_workflow_cannot_reopen(self) -> None:
+
+
+
+
+    def test_direct_skip_or_cancel_cannot_create_an_unresolvable_root(self) -> None:
         self.add("work", 1, "add-work")
-        self.mutation(
-            "finish", 2, "finish-short", "--summary", "done", "--validation", "passed", "--commit", "abc", expected=2
+        blank_summary = self.mutation(
+            "finish", 2, "finish-blank-summary", "--summary", "   ",
+            "--validation", "passed", expected=2,
         )
-        commit = "a" * 40
-        self.mutation("node-update", 2, "skip-work", "--node-id", "work", "--status", "skipped")
-        self.mutation(
-            "node-update", 3, "claim-skipped", "--node-id", "work",
-            "--launch-state", "claimed", "--request-id", "request-1", expected=2,
+        self.assertIn("finish summary", blank_summary["data"]["message"])
+        blank_validation = self.mutation(
+            "finish", 2, "finish-blank-validation", "--summary", "done",
+            "--validation", "\t", expected=2,
         )
-        malformed = StateStore().load(self.workflow_id)
-        node = malformed["nodes"]["work"]
-        node["launch"].update({
-            "state": "claimed", "request_id": "request-1", "claimed_at": malformed["updated_at"],
-        })
-        node["route"]["attempt"] = 1
-        node["attempts"].append({
-            "number": 1, "started_at": malformed["updated_at"], "finished_at": None, "outcome": None,
-        })
-        with self.assertRaisesRegex(StateError, "terminal status cannot retain an active launch"):
-            validate_state(malformed)
-        self.mutation(
-            "finish", 3, "finish-valid", "--summary", "done", "--validation", "passed", "--commit", commit
+        self.assertIn("finish validation", blank_validation["data"]["message"])
+        baseline = StateStore().load(self.workflow_id)
+        for status in ("skipped", "cancelled"):
+            rejected = self.mutation(
+                "node-update", 2, f"reject-{status}-work", "--node-id", "work",
+                "--status", status, expected=2,
+            )
+            self.assertIn("invalid node transition", rejected["data"]["message"])
+            self.assertEqual(StateStore().load(self.workflow_id), baseline)
+            forged = copy.deepcopy(baseline)
+            forged["nodes"]["work"]["status"] = status
+            with self.assertRaisesRegex(
+                StateError, "skipped/cancelled work must be decomposed or superseded"
+            ):
+                validate_state(forged)
+
+
+
+
+
+
+    def test_scope_presence_and_change_surface_are_structurally_coupled(self) -> None:
+        initial = StateStore().load(self.workflow_id)
+        unscoped_artifact = self.add(
+            "unscoped-artifact", 1, "reject-unscoped-artifact",
+            "--change-surface", "1", evidence_only=True, expected=2,
         )
-        self.mutation("resume", 4, "reopen", "--message", "reopen", expected=2)
+        self.assertIn(
+            "evidence-only work requires assessment.dimensions.change_surface=0",
+            unscoped_artifact["data"]["message"],
+        )
+        scoped_read_only = self.add(
+            "scoped-read-only", 1, "reject-scoped-read-only",
+            "--change-surface", "0", expected=2,
+        )
+        self.assertIn(
+            "artifact-scoped work requires assessment.dimensions.change_surface at least 1",
+            scoped_read_only["data"]["message"],
+        )
+        self.assertEqual(StateStore().load(self.workflow_id), initial)
+
+        self.add("review", 1, "add-read-only-review", evidence_only=True)
+        valid = StateStore().load(self.workflow_id)
+        forged = copy.deepcopy(valid)
+        forged_assessment = forged["nodes"]["review"]["assessment"]
+        forged_assessment["dimensions"]["change_surface"] = 1
+        forged_assessment["total"] += 1
+        with self.assertRaisesRegex(
+            StateError,
+            "evidence-only work requires assessment.dimensions.change_surface=0",
+        ):
+            validate_state(forged)
+
+        review = valid["nodes"]["review"]
+        mismatched_refinement = {
+            "spec": copy.deepcopy(review["spec"]),
+            "acceptance": list(review["acceptance"]),
+            "write_scopes": ["src/review"],
+            "assessment": assessment_inputs(
+                dimensions={**DIMENSIONS, "change_surface": 0}
+            ),
+        }
+        rejected_refinement = self.mutation(
+            "node-refine", 2, "reject-scoped-read-only-refinement",
+            "--node-id", "review",
+            "--refinement-json", json.dumps(mismatched_refinement), expected=2,
+        )
+        self.assertIn(
+            "artifact-scoped work requires assessment.dimensions.change_surface at least 1",
+            rejected_refinement["data"]["message"],
+        )
+        self.assertEqual(StateStore().load(self.workflow_id), valid)
+
+    def test_completion_requires_attempt_scoped_evidence_for_artifact_scopes(self) -> None:
+        self.add("work", 1, "add-work", scope="preexisting.txt")
+        self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
+        self.route("work", 3, "route-work")
+        self.mutation(
+            "node-update", 4, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-work",
+        )
+        self.mutation(
+            "node-update", 5, "bind-work", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", "child-work",
+        )
+        self.mutation("node-update", 6, "run-work", "--node-id", "work", "--status", "running")
+        unchanged = self.mutation(
+            "node-update", 7, "finish-work", "--node-id", "work", "--status", "done",
+            "--result", "implemented work", "--evidence", "focused test passed",
+            expected=2,
+        )
+        self.assertIn("no attempt-scoped change", unchanged["data"]["message"])
+
+        (self.repo / "preexisting.txt").write_text("implemented work\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-work-changed", "--node-id", "work", "--status", "done",
+            "--result", "implemented work", "--evidence", "focused test passed",
+        )
+        (self.repo / "preexisting.txt").unlink()
+        missing_at_finish = self.mutation(
+            "finish", 8, "reject-missing-scope-at-finish", "--summary", "done",
+            "--validation", "passed", expected=2,
+        )
+        self.assertIn("remain materialized", missing_at_finish["data"]["message"])
+        (self.repo / "preexisting.txt").write_text("implemented work\n", encoding="utf-8")
+        self.mutation(
+            "finish", 8, "finish-with-materialized-scope", "--summary", "done",
+            "--validation", "passed",
+        )
+        completed = StateStore().load(self.workflow_id)
+        scope_evidence = completed["nodes"]["work"]["attempts"][-1]["scope_evidence"]["preexisting.txt"]
+        self.assertNotEqual(scope_evidence["before"], scope_evidence["after"])
+        self.assertEqual(completed["status"], "completed")
+
+    def test_evidence_only_work_can_finish_without_artifact_changes(self) -> None:
+        self.add("review", 1, "add-review", evidence_only=True)
+        self.mutation("node-update", 2, "ready-review", "--node-id", "review", "--status", "ready")
+        self.route("review", 3, "route-review", role="reviewer")
+        self.mutation(
+            "node-update", 4, "claim-review", "--node-id", "review",
+            "--launch-state", "claimed", "--request-id", "request-review",
+        )
+        self.mutation(
+            "node-update", 5, "bind-review", "--node-id", "review",
+            "--launch-state", "bound", "--child-id", "child-review",
+        )
+        self.mutation("node-update", 6, "run-review", "--node-id", "review", "--status", "running")
+        self.mutation(
+            "node-update", 7, "finish-review", "--node-id", "review", "--status", "done",
+            "--result", "recommendation recorded", "--evidence", "review evidence persisted",
+        )
+        self.mutation(
+            "finish", 8, "finish-read-only", "--summary", "review complete",
+            "--validation", "evidence reviewed",
+        )
+        completed = StateStore().load(self.workflow_id)
+        self.assertNotIn("git", completed)
+        self.assertEqual(completed["nodes"]["review"]["write_scopes"], [])
+        self.assertEqual(completed["nodes"]["review"]["attempts"][-1]["scope_evidence"], {})
+
+    def test_declared_directory_allows_an_unrelated_internal_symlink(self) -> None:
+        if os.name == "nt":
+            self.skipTest("symlink creation is not reliably available on Windows CI")
+        directory = self.repo / "src" / "package"
+        directory.mkdir(parents=True)
+        (directory / "target.txt").write_text("tracked target\n", encoding="utf-8")
+        (directory / "link.txt").symlink_to("target.txt")
+
+        self.add("package", 1, "add-package", scope="src/package")
+        self.mutation("node-update", 2, "ready-package", "--node-id", "package", "--status", "ready")
+        self.route("package", 3, "route-package")
+        self.mutation(
+            "node-update", 4, "claim-package", "--node-id", "package",
+            "--launch-state", "claimed", "--request-id", "request-package",
+        )
+        self.mutation(
+            "node-update", 5, "bind-package", "--node-id", "package",
+            "--launch-state", "bound", "--child-id", "child-package",
+        )
+        self.mutation("node-update", 6, "run-package", "--node-id", "package", "--status", "running")
+        (directory / "target.txt").write_text("updated target\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-package", "--node-id", "package", "--status", "done",
+            "--result", "package updated", "--evidence", "focused check passed",
+        )
+
+    def test_scope_fingerprint_frames_tree_records_unambiguously(self) -> None:
+        tree_a = self.repo / "tree-a"
+        tree_b = self.repo / "tree-b"
+        tree_a.mkdir(mode=0o700)
+        tree_b.mkdir(mode=0o700)
+        prefix = b"prefix"
+        suffix = b"suffix"
+        forged_record_boundary = b"\x00file\x00b\x00600\x00"
+        (tree_a / "a").write_bytes(prefix + forged_record_boundary + suffix)
+        (tree_b / "a").write_bytes(prefix)
+        (tree_b / "b").write_bytes(suffix)
+        for path in (tree_a / "a", tree_b / "a", tree_b / "b"):
+            path.chmod(0o600)
+
+        self.assertNotEqual(
+            state_owner._scope_fingerprint(str(self.repo), "tree-a"),
+            state_owner._scope_fingerprint(str(self.repo), "tree-b"),
+        )
+
+    def test_scope_fingerprint_accepts_posix_byte_filenames(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX byte filenames are not available on Windows")
+        raw_directory = os.path.join(os.fsencode(self.repo), b"byte-tree")
+        os.mkdir(raw_directory, mode=0o700)
+        raw_file = os.path.join(raw_directory, b"bad-\xff-name")
+        descriptor = os.open(raw_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(b"content")
+
+        fingerprint = state_owner._scope_fingerprint(str(self.repo), "byte-tree")
+        self.assertIsNotNone(fingerprint)
+        self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+
+    def test_scope_evidence_rejects_repository_root_replacement_atomically(self) -> None:
+        running = self.start_scoped_work()
+        original = self.base / "original-repository"
+        self.repo.rename(original)
+        self.repo.mkdir()
+        replacement_scope = self.repo / "src" / "work"
+        replacement_scope.parent.mkdir()
+        replacement_scope.write_text("forged replacement artifact\n", encoding="utf-8")
+        try:
+            rejected = self.mutation(
+                "node-update", 7, "reject-replaced-root", "--node-id", "work",
+                "--status", "done", "--result", "forged result",
+                "--evidence", "forged evidence", expected=20,
+            )
+            self.assertEqual(rejected["code"], "invalid_repository")
+            self.assertIn("repository object changed", rejected["data"]["message"])
+            self.assertEqual(StateStore().load(self.workflow_id), running)
+        finally:
+            replacement_scope.unlink()
+            replacement_scope.parent.rmdir()
+            self.repo.rmdir()
+            original.rename(self.repo)
+
+    def test_scope_evidence_rejects_repository_root_symlink_atomically(self) -> None:
+        if os.name == "nt":
+            self.skipTest("symlink creation is not reliably available on Windows CI")
+        running = self.start_scoped_work()
+        original = self.base / "original-repository"
+        outside = self.base / "outside-repository"
+        outside_scope = outside / "src" / "work"
+        outside_scope.parent.mkdir(parents=True)
+        outside_scope.write_text("forged outside artifact\n", encoding="utf-8")
+        self.repo.rename(original)
+        self.repo.symlink_to(outside, target_is_directory=True)
+        try:
+            rejected = self.mutation(
+                "node-update", 7, "reject-symlinked-root", "--node-id", "work",
+                "--status", "done", "--result", "forged result",
+                "--evidence", "forged evidence", expected=20,
+            )
+            self.assertEqual(rejected["code"], "invalid_repository")
+            self.assertEqual(StateStore().load(self.workflow_id), running)
+        finally:
+            self.repo.unlink()
+            original.rename(self.repo)
+
+    def test_scope_canonicalization_blocks_filesystem_aliases(self) -> None:
+        self.add("composed-owner", 1, "add-composed-owner", scope="src/\u00e9")
+        unicode_alias = self.add(
+            "decomposed-owner", 2, "reject-decomposed-owner",
+            scope="src/e\u0301", expected=2,
+        )
+        self.assertIn("write_scope_collisions", unicode_alias["data"]["message"])
+
+        for scope in (
+            "src/foo.",
+            "src/foo ",
+            "src/CON.txt",
+            "src/COM¹.log",
+            "src/name:stream",
+        ):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(StateError, "non-portable path segment"):
+                    state_owner._canonical_scope(scope, "test scope", platform="nt")
+
         state = StateStore().load(self.workflow_id)
-        self.assertEqual((state["status"], state["phase"], state["git"]["checkpoint"]), ("completed", "completed", commit))
-        state["status"] = "running"
-        with self.assertRaisesRegex(StateError, "completed workflow phase"):
+        forged = copy.deepcopy(state)
+        forged["conventions"]["platform"] = "nt" if os.name != "nt" else "posix"
+        with self.assertRaisesRegex(StateError, "different filesystem platform"):
+            validate_state(forged)
+
+    def test_case_insensitive_repository_rejects_case_alias_scopes(self) -> None:
+        case_session = self.base / "private" / "case-session.json"
+        self.cli("session-open", "--repo", str(self.repo), "--session-file", str(case_session))
+        with mock.patch.object(
+            state_owner, "_repository_case_sensitive", return_value=False
+        ) as case_probe:
+            created = self.cli(
+                "init", "--repo", str(self.repo), "--task", "Coordinate case aliases",
+                "--session-file", str(case_session), "--mutation-id", "init-case-aliases",
+            )
+        case_probe.assert_called_once_with(str(self.repo))
+        self.workflow_id = created["data"]["workflow_id"]
+        self.session = case_session
+        self.assertFalse(
+            StateStore().load(self.workflow_id)["conventions"]["write_scope_case_sensitive"]
+        )
+
+        self.add("upper-owner", 1, "add-upper-owner", scope="src/Foo")
+        rejected = self.add(
+            "lower-owner", 2, "reject-lower-owner", scope="src/foo", expected=2
+        )
+        self.assertIn("write_scope_collisions", rejected["data"]["message"])
+
+    def test_repository_case_probe_cleans_up_after_close_error(self) -> None:
+        before = set(self.repo.iterdir())
+        real_close = os.close
+
+        def close_then_fail(descriptor: int) -> None:
+            real_close(descriptor)
+            raise OSError("delayed close failure")
+
+        with mock.patch.object(state_owner.os, "close", side_effect=close_then_fail):
+            with self.assertRaisesRegex(StateError, "unable to close repository case-sensitivity probe"):
+                state_owner._repository_case_sensitive(str(self.repo))
+        self.assertEqual(set(self.repo.iterdir()), before)
+
+    def test_finish_bounds_the_combined_event_message(self) -> None:
+        summary = "s" * 4096
+        exact_validation = "v" * (MAX_TEXT - len(summary) - len(FINISH_EVENT_SEPARATOR))
+        accepted_length = self.mutation(
+            "finish", 1, "finish-exact-event-size", "--summary", summary,
+            "--validation", exact_validation, expected=2,
+        )
+        self.assertIn("all visible nodes", accepted_length["data"]["message"])
+
+        rejected = self.mutation(
+            "finish", 1, "finish-oversize-event", "--summary", summary,
+            "--validation", exact_validation + "v", expected=2,
+        )
+        self.assertIn("finish validation must be a non-blank string no longer than", rejected["data"]["message"])
+
+    def test_malformed_supersede_dependency_is_reported_as_state_error(self) -> None:
+        self.add("source", 1, "add-malformed-source")
+        self.add("replacement", 2, "add-malformed-replacement")
+        state = StateStore().load(self.workflow_id)
+        source = state["nodes"]["source"]
+        replacement = state["nodes"]["replacement"]
+        source["dependencies"] = ["missing-prerequisite"]
+        source["status"] = "skipped"
+        source["result"] = "superseded"
+        source["evidence"] = "forged malformed record"
+        source["superseded_by"] = "replacement"
+        for field, values in effective_obligations(source).items():
+            replacement["lineage"]["obligations"][field] = list(values)
+
+        with self.assertRaisesRegex(StateError, "loses prerequisite.*missing-prerequisite"):
             validate_state(state)
 
-    def test_state_lock_removes_only_proven_stale_evidence(self) -> None:
+    def test_deletion_only_work_requires_a_materialized_scope(self) -> None:
+        self.add("work", 1, "add-work", scope="preexisting.txt")
+        self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
+        self.route("work", 3, "route-work")
+        self.mutation(
+            "node-update", 4, "claim-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-work",
+        )
+        self.mutation(
+            "node-update", 5, "bind-work", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", "child-work",
+        )
+        self.mutation("node-update", 6, "run-work", "--node-id", "work", "--status", "running")
+        (self.repo / "preexisting.txt").unlink()
+        rejected = self.mutation(
+            "node-update", 7, "finish-deletion", "--node-id", "work", "--status", "done",
+            "--result", "obsolete artifact deleted", "--evidence", "focused deletion test passed",
+            expected=2,
+        )
+        self.assertIn("no materialized file or directory", rejected["data"]["message"])
+        (self.repo / "preexisting.txt").write_text("replacement artifact\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-replacement", "--node-id", "work", "--status", "done",
+            "--result", "obsolete artifact replaced", "--evidence", "focused replacement check passed",
+        )
+        self.mutation(
+            "finish", 8, "finish-replacement-workflow", "--summary", "done",
+            "--validation", "passed",
+        )
+
+    def test_claim_atomically_promotes_routed_pending_work_to_ready(self) -> None:
+        self.add("work", 1, "add-atomic-ready-work")
+        self.route("work", 2, "route-atomic-ready-work")
+        self.mutation(
+            "node-update", 3, "claim-atomic-ready-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-atomic-ready",
+        )
+        node = StateStore().load(self.workflow_id)["nodes"]["work"]
+        self.assertEqual((node["status"], node["launch"]["state"]), ("ready", "claimed"))
+
+    def test_requirement_semantics_are_immutable_during_and_after_execution(self) -> None:
+        self.mutation(
+            "requirement-set", 1, "add-immutable-requirement",
+            "--requirement-id", "req-immutable", "--text", "Build the original contract",
+            "--source", "task", "--status", "active",
+        )
+        self.add("work", 2, "add-immutable-work", "--requirement-id", "req-immutable")
+        self.route("work", 3, "route-immutable-work")
+        self.mutation(
+            "node-update", 4, "claim-immutable-work", "--node-id", "work",
+            "--launch-state", "claimed", "--request-id", "request-immutable",
+        )
+        self.mutation(
+            "node-update", 5, "bind-immutable-work", "--node-id", "work",
+            "--launch-state", "bound", "--child-id", "child-immutable",
+        )
+        self.mutation("node-update", 6, "run-immutable-work", "--node-id", "work", "--status", "running")
+        active = StateStore().load(self.workflow_id)
+        rejected_active = self.mutation(
+            "requirement-set", 7, "rewrite-active-requirement",
+            "--requirement-id", "req-immutable", "--text", "Build a different contract",
+            "--source", "task", "--status", "satisfied", "--evidence", "changed late",
+            expected=2,
+        )
+        self.assertIn("immutable after work starts or completes", rejected_active["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), active)
+
+        scope = self.repo / "src" / "work"
+        scope.parent.mkdir(parents=True)
+        scope.write_text("completed original contract\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-immutable-work", "--node-id", "work", "--status", "done",
+            "--result", "original contract built", "--evidence", "focused test passed",
+        )
+        done = StateStore().load(self.workflow_id)
+        rejected_done = self.mutation(
+            "requirement-set", 8, "rewrite-done-requirement",
+            "--requirement-id", "req-immutable", "--text", "Build a different contract",
+            "--source", "task", "--status", "satisfied", "--evidence", "changed after completion",
+            expected=2,
+        )
+        self.assertIn("immutable after work starts or completes", rejected_done["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), done)
+        forged = copy.deepcopy(done)
+        forged["requirements"]["req-immutable"]["text"] = "Forged replacement contract"
+        with self.assertRaisesRegex(StateError, "stale for active or completed work"):
+            validate_state(forged)
+        self.mutation(
+            "requirement-set", 8, "satisfy-immutable-requirement",
+            "--requirement-id", "req-immutable", "--text", "Build the original contract",
+            "--source", "task", "--status", "satisfied", "--evidence", "original contract verified",
+        )
+
+
+    def test_state_lock_is_advisory_persistent_exclusive_and_released_on_exit(self) -> None:
         store = StateStore()
-        store._ensure_private_directory(store.locks)
         lock = store.locks / "probe.lock"
-        stale = json.dumps({"pid": 999999, "nonce": "a" * 32, "created_at": state_owner.now_iso()}).encode()
-        lock.write_bytes(stale)
-        os.chmod(lock, 0o600)
-        with mock.patch.object(state_owner, "_process_is_proven_dead", return_value=True):
-            with store._lock("probe"):
-                self.assertNotEqual(lock.read_bytes(), stale)
-        self.assertFalse(lock.exists())
-
-        live = json.dumps({"pid": os.getpid(), "nonce": "b" * 32, "created_at": state_owner.now_iso()}).encode()
-        lock.write_bytes(live)
-        os.chmod(lock, 0o600)
-        with self.assertRaisesRegex(StateError, "locked"):
-            with store._lock("probe"):
-                pass
-        self.assertEqual(lock.read_bytes(), live)
-
-        lock.write_bytes(b"{")
-        before = lock.read_bytes()
-        with mock.patch.object(state_owner, "_process_is_proven_dead", return_value=True):
+        with store._lock("probe"):
+            first_payload = json.loads(lock.read_text(encoding="utf-8"))
+            self.assertEqual(first_payload["pid"], os.getpid())
             with self.assertRaisesRegex(StateError, "locked"):
                 with store._lock("probe"):
                     pass
-        self.assertEqual(lock.read_bytes(), before)
+        self.assertTrue(lock.is_file())
 
-        with (
-            mock.patch.object(state_owner.os, "name", "nt"),
-            mock.patch.object(state_owner, "_windows_process_is_proven_dead", return_value=True) as query,
-            mock.patch.object(state_owner.os, "kill", side_effect=AssertionError("Windows must not call os.kill")),
-        ):
-            self.assertTrue(state_owner._process_is_proven_dead(123))
-        query.assert_called_once_with(123)
+        with store._lock("probe"):
+            second_payload = json.loads(lock.read_text(encoding="utf-8"))
+        self.assertNotEqual(first_payload["nonce"], second_payload["nonce"])
+        self.assertTrue(lock.is_file())
+
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,sys,time; "
+                    "from coordinator.state.store import StateStore; "
+                    "lock=StateStore(pathlib.Path(sys.argv[1]))._lock('crash'); "
+                    "lock.__enter__(); print('locked', flush=True); time.sleep(30)"
+                ),
+                str(store.root),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "locked")
+            with self.assertRaisesRegex(StateError, "locked"):
+                with store._lock("crash"):
+                    pass
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+            child.stderr.close()
+        with store._lock("crash"):
+            pass
+        self.assertTrue((store.locks / "crash.lock").is_file())
 
 
 if __name__ == "__main__":
