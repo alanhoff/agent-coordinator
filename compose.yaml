@@ -1,0 +1,59 @@
+services:
+  coordinator:
+    image: ghcr.io/openai/codex-universal@sha256:905e512f36460e1be4cfedb30928a8a28299edb0fcd5de7998ceaa72d27fe304
+    environment:
+      CODEX_ENV_NODE_VERSION: "22"
+      CODEX_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set in .env}
+      PYTHONPATH: /coordinator-src
+    working_dir: /workspace
+    volumes:
+      - ./data/project:/workspace
+      - ./data/.codex:/root/.codex
+      - ./data/.agent-coordinator:/root/.agent-coordinator
+      - ./skill:/root/.agents/skills/coordinator:ro
+      - ./src:/coordinator-src:ro
+      - ./prompt.md:/prompt.md:ro
+    command:
+      - -c
+      - |
+        set -e
+        host_uid=$$(stat -c %u /prompt.md)
+        host_gid=$$(stat -c %g /prompt.md)
+        chown -R root:root /root/.agent-coordinator
+        chmod -R go-rwx /root/.agent-coordinator
+        restore_host_ownership() {
+          chown -R "$$host_uid:$$host_gid" /root/.codex /root/.agent-coordinator /workspace
+        }
+        trap restore_host_ownership EXIT
+        unexpected_entry=$$(find /workspace -mindepth 1 -maxdepth 1 ! -name .nvmrc -print -quit)
+        test -z "$$unexpected_entry"
+        test ! -e /workspace/.nvmrc || { test -f /workspace/.nvmrc && test ! -L /workspace/.nvmrc; }
+        npx --yes @openai/codex@0.149.1 exec \
+          --ignore-user-config \
+          --model gpt-5.6-luna \
+          --config model_reasoning_effort=max \
+          --config agents.default_subagent_model=gpt-5.6-luna \
+          --config agents.default_subagent_reasoning_effort=max \
+          --dangerously-bypass-approvals-and-sandbox \
+          --cd /workspace \
+          - < /prompt.md
+
+  backend:
+    image: ghcr.io/openai/codex-universal@sha256:905e512f36460e1be4cfedb30928a8a28299edb0fcd5de7998ceaa72d27fe304
+    environment:
+      CODEX_ENV_NODE_VERSION: "22"
+      TODO_DB_PATH: /data/todos.db
+    working_dir: /workspace
+    volumes:
+      - ./data/project:/workspace:ro
+      - ./data/sqlite:/data
+    ports:
+      - "3000:3000"
+    command:
+      - -c
+      - |
+        set -e
+        test -e "$$TODO_DB_PATH" || touch "$$TODO_DB_PATH"
+        chown -R "$$(stat -c %u /workspace/backend):$$(stat -c %g /workspace/backend)" /data
+        cd /workspace/backend
+        exec npm start

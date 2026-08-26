@@ -6,7 +6,16 @@ import argparse
 from typing import Any, Sequence
 
 from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocation
-from coordinator.state.store import LAUNCH_STATES, NODE_STATUSES, ROLES, StateError, StateStore, execute_command
+from coordinator.state.store import (
+    AMBIGUITY_FACTORS,
+    LAUNCH_STATES,
+    ROLES,
+    StateError,
+    StateStore,
+    execute_command,
+)
+
+NODE_UPDATE_STATUSES = ("pending", "ready", "running", "blocked", "done", "failed")
 
 
 def _add_mutation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -45,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "context"):
         target = _subcommand(sub, name)
         target.add_argument("--workflow-id", required=True)
-    reconcile = _subcommand(sub, "reconcile-commit")
+    reconcile = _subcommand(sub, "reconcile-mutation")
     reconcile.add_argument("--workflow-id", required=True)
     reconcile.add_argument("--mutation-id", required=True)
     reconcile.add_argument("--digest")
@@ -59,13 +68,37 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--stage", required=True)
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--dependency", action="append", default=[])
-    add.add_argument("--write-scope", action="append", required=True)
+    add.add_argument("--write-scope", action="append", default=[])
     add.add_argument("--role", choices=ROLES, required=True)
     add.add_argument("--model")
     add.add_argument("--effort")
     add.add_argument("--acceptance", action="append", required=True)
     add.add_argument("--rationale", required=True)
     add.add_argument("--estimated-cost", type=float)
+    add.add_argument("--objective", required=True)
+    add.add_argument("--input", action="append", default=[])
+    add.add_argument("--output", action="append", required=True)
+    add.add_argument("--constraint", action="append", default=[])
+    add.add_argument("--non-goal", action="append", default=[])
+    add.add_argument("--requirement-id", action="append", default=[])
+    add.add_argument("--open-question", action="append", default=[])
+    add.add_argument("--breadth", type=int, required=True)
+    add.add_argument("--change-surface", type=int, required=True)
+    add.add_argument("--coupling", type=int, required=True)
+    add.add_argument("--novelty", type=int, required=True)
+    add.add_argument("--verification", type=int, required=True)
+    for factor in AMBIGUITY_FACTORS:
+        add.add_argument(f"--ambiguity-{factor}", dest=f"ambiguity_{factor}", type=int, required=True)
+    add.add_argument("--complexity-rationale", required=True)
+    refine = _subcommand(sub, "node-refine", mutate=True)
+    refine.add_argument("--node-id", required=True)
+    refinement = refine.add_mutually_exclusive_group(required=True)
+    refinement.add_argument("--refinement-json")
+    refinement.add_argument("--refinement-file")
+    split = _subcommand(sub, "node-split", mutate=True)
+    split_plan = split.add_mutually_exclusive_group(required=True)
+    split_plan.add_argument("--plan-json")
+    split_plan.add_argument("--plan-file")
     route = _subcommand(sub, "node-route", mutate=True)
     route.add_argument("--node-id", required=True)
     route.add_argument("--role", choices=ROLES, required=True)
@@ -74,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--rationale", required=True)
     update = _subcommand(sub, "node-update", mutate=True)
     update.add_argument("--node-id", required=True)
-    update.add_argument("--status", choices=NODE_STATUSES)
+    update.add_argument("--status", choices=NODE_UPDATE_STATUSES)
     update.add_argument("--launch-state", choices=LAUNCH_STATES)
     update.add_argument("--request-id")
     update.add_argument("--child-id")
@@ -112,7 +145,6 @@ def build_parser() -> argparse.ArgumentParser:
     finish = _subcommand(sub, "finish", mutate=True)
     finish.add_argument("--summary", required=True)
     finish.add_argument("--validation", required=True)
-    finish.add_argument("--commit", required=True)
     abort = _subcommand(sub, "abort", mutate=True)
     abort.add_argument("--reason", required=True)
     return parser

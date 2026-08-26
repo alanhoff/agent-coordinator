@@ -1,28 +1,166 @@
 # Workflow state and recovery
 
-Coordinator stores one bounded schema-v3 JSON document per workflow under
-`~/.agent-coordinator/workflows`. The state owner validates the complete document on every read and
-before every commit. It rejects unknown fields, unsafe identifiers and write paths, missing or cyclic
-dependencies, concurrent scope collisions, invalid transitions, inconsistent execution state, and
-capacity violations.
+Coordinator stores one bounded `schema-v6` JSON document with `schema_version` equal to 6 per
+workflow under `~/.agent-coordinator/workflows`. The state owner validates the complete document on
+every read and before every persisted mutation. It rejects unknown fields, unsafe identifiers and write paths,
+missing or cyclic dependencies, concurrent scope collisions, invalid transitions, inconsistent
+execution state, and capacity violations.
+
+## Planning policy and node records
+
+Workflow `conventions` contains the execution capacity settings plus these integer planning limits:
+
+- `node_complexity_split_threshold` defaults to 6.
+- `dimension_complexity_split_threshold` defaults to 3.
+- `node_ambiguity_refine_threshold` defaults to 4.
+- `factor_ambiguity_refine_threshold` defaults to 2.
+- `max_refinement_depth` defaults to 8.
+
+All four split/refinement thresholds are inclusive. A value at a threshold is not executable.
+
+Every node contains `spec`, `assessment`, and `lineage` alongside its execution fields. Exact-key
+validation applies at every level. `write_scopes` contains zero through 32 repository-relative paths;
+an empty list declares evidence-only work with no repository artifact change.
+
+`spec` contains `objective`, `inputs`, `outputs`, `constraints`, `non_goals`, `requirement_ids`, and
+`open_questions`. `assessment` contains `rubric_version`, `dimensions`, `total`,
+`ambiguity_factors`, `ambiguity_total`, `ambiguity_peak`, `rationale`, `input_digest`, and `state`.
+Rubric version 2 dimensions are integer `breadth`, `change_surface`, `coupling`, `novelty`, and
+`verification`, each 0 through 4; `total` is their derived sum. Ambiguity factors are integer
+`objective`, `inputs`, `boundaries`, `dependencies`, and `acceptance`, each 0 through 4;
+`ambiguity_total` and `ambiguity_peak` are derived. Assessment state is exactly `executable`,
+`split_required`, `refinement_required`, `stale`, or `decomposed`.
+At least one ambiguity factor is 2–4 exactly when `open_questions` is non-empty; scores 0 and 1
+describe resolved facts and bounded assumptions, not unresolved implementation choices.
+
+`lineage` contains exactly nullable `parent_id`, integer `depth`, `child_ids`, nullable `split_reason`,
+and `obligations`. `obligations` contains exactly `objectives`, `requirements`, `inputs`, `outputs`,
+`constraints`, `non_goals`, `acceptance`, and `write_scopes` lists. New
+roots start with depth 0 and empty carried obligations; supersede may later add source obligations to a
+rewritable root replacement. A successful split records all child IDs and the reason on the parent,
+gives every child the parent ID and next depth, materializes its coverage assignments as carried
+obligations, and makes the parent `decomposed` and ineligible for execution.
+
+A node's effective specification and ownership are ordered unions of its native objective,
+requirements, inputs, outputs, constraints, non-goals, acceptance, and write scopes with the
+corresponding carried obligations.
+Refinement replaces native fields and current write scopes but first adds all prior effective obligations
+to carried lineage; old broad scopes are historical context, not current collision ownership. Recursive splitting covers native
+plus carried items; supersede transfers every missing source effective item (native plus carried) into a
+rewritable replacement's carried obligations and preserves every source prerequisite directly or
+transitively. Direct skip/cancel is not a legal ordinary transition;
+those statuses arise only through atomic decomposition, supersede, or abort. Obligations participate in assessment digests,
+requirement invalidation, effective dependency outputs, and specialist task packets.
+
+Supersede chains are always acyclic. Outside aborted recovery, they must terminate in resolvable work,
+and each carried obligation's combined decomposition-coverage and supersede graph must have an acyclic
+path to a live leaf, active launch, repairable failed leaf, or `done` resolver. A dead end or cycle-only
+resolution is invalid.
+
+`input_digest` is derived from native specification and acceptance, carried obligations and linked
+effective requirement text/source, write scopes, dimension and ambiguity inputs, planning conventions, and each
+dependency's identity, effective outputs, normalized terminal disposition, result, and evidence. A
+dependency disposition is its exact `done`, `failed`, `skipped`, or `cancelled` status, or
+`nonterminal` for every other status. Nonterminal status transitions do not change the digest; output
+changes, terminal disposition/result/evidence, and retry from failure can stale direct dependents.
+
+An assessable leaf has no children and is either pending, ready, or blocked with an `unclaimed` launch,
+or `failed` with an `unclaimed` or `terminal` launch. A digest mismatch makes such a leaf `stale`; stale
+work cannot be ready, routed, or claimed. Changed effective requirement text/source stales every
+affected assessable leaf. Those semantic fields are immutable once a referenced resolution endpoint
+is active or done; status/evidence resolves the separate workflow requirement gate without redefining
+completed work.
+
+For a split, `dependent_replacements` names exactly the parent's current rewritable assessable direct
+dependents; each is explicitly rewired and staled. Direct terminal-success dependents (`done`, `skipped`,
+or `cancelled`) are omitted and must not map to children: their obsolete parent edge is atomically
+pruned. Any other current direct dependent rejects the split.
 
 Each node stores one specialist role. Model and effort are bounded strings supplied by the active
-runtime, or `null` to inherit the parent route; Coordinator has no built-in model catalog.
+runtime, or `null` to inherit the parent route; Coordinator has no built-in model catalog. A non-blocked
+assessable leaf with a current `executable` assessment may be routed at the global fixed point; routing
+a failed leaf resets it for retry. `ready_nodes` and claim additionally require an unclaimed future
+leaf with satisfied dependencies. Claiming a routed `pending` frontier leaf atomically promotes its
+status to `ready` before persisting `claimed`. Textual scope overlap prevents concurrent owners; path
+containment is checked for each concrete declared scope without recursively banning unrelated entries
+inside a broad directory.
 
-Each mutation supplies a unique mutation ID and expected prior revision. A committed receipt makes
+The workflow planning fixed point requires every non-blocked assessable leaf to have a current
+`executable` assessment. Node-scoped blocked leaves remain in planning diagnostics but do not fence
+independent dispatch. A workflow-level blocker still empties the frontier. At
+`max_refinement_depth`, an assessable leaf cannot have current recorded at-threshold or over-threshold total or dimension
+scores. State validation reserves two unused node records for every assessable leaf with those raw
+scores, even if its derived assessment state is `stale` or `refinement_required`. Add, refine, and split
+mutations reject candidate states that leave too few node records for the required children.
+
+Planning diagnostics expose `split_required_nodes`, `ambiguous_nodes`, `refinement_required_nodes`,
+`stale_nodes`, and `decomposed_nodes`. `ambiguity_scores` exposes every assessable leaf's factor map,
+derived total, and peak instead of collapsing uncertainty to Boolean membership. Diagnostics also expose
+`frontier_width`, `available_parallelism`,
+`usable_parallelism`, the node-to-load map `critical_path_load`, and `dispatch_order`; graph validation
+retains `ready_nodes` as an alias. Dispatch order is descending critical-path load, then priority, then
+node ID. Critical-path load measures remaining work. Terminal-success and decomposed nodes contribute
+zero and sever the bridge to downstream dependents; a repairable failed leaf retains its assessment
+complexity. Other remaining leaves contribute their assessment total plus the greatest reachable
+downstream dependent load. `usable_parallelism` is
+`max_parallel - reserve`; `available_parallelism` is the smaller of frontier width and usable capacity
+remaining after active launches. These diagnostics do not relax dependencies, write-scope exclusion,
+reserve, or actual runtime capacity. They describe graph capacity, not guaranteed executors. The
+controller must cap its selected claim batch at one when no delegation tool is callable and must finish
+that inline attempt before claiming another.
+
+Write-scope comparison first normalizes Unicode to NFC and, on Windows, rejects Win32-trimmed,
+reserved, control, and special-character path segments. It then follows case behavior probed from the repository
+filesystem at initialization; when probing is unavailable, the result is treated conservatively as
+case-insensitive. Write-scope ordering uses live dependency reachability. Traversal stops at a `done`, `skipped`, or
+`cancelled` bridge because its downstream work is concurrently runnable; overlapping scopes between
+those live peers remain a collision.
+
+Node add and split create route attempt 0; refinement sets the route attempt to the number of completed
+attempts. Both forms are provisional and invalid for the next claim. After the latest assessment and
+global fixed point, an explicit `node-route` must persist the next attempt number. Routing a failed
+retry resets its disposition to nonterminal and can stale direct dependents before claim.
+
+Each mutation supplies a unique mutation ID and expected prior revision. A persisted receipt makes
 retry reconciliation idempotent; reuse of an ID for different content and stale revisions are rejected.
 Atomic replacement and durability flushing ensure readers observe a complete old or new snapshot.
-`reconcile-commit` distinguishes a recorded mutation from one absent from committed state.
+Receipts stay in that snapshot up to its explicit bound; `reconcile-mutation` distinguishes a recorded
+mutation from one absent from persisted state. Capacity exhaustion is explicit rather than hidden behind
+a second persistence format.
 
-One controller session owns an epoch. Bearer values exist only in the caller-selected private file and
-private session registry, never in workflow state or command output. A takeover advances the epoch,
-fences the old controller, and requires explicit `resume`.
+One controller session owns an epoch, while immutable `origin_session_id` scopes initialization replay.
+Bearer values exist only in the caller-selected private file and private session registry, never in
+workflow state or command output. A takeover advances the epoch, fences the old controller, converts
+every claimed, bound, or running launch to `reconcile_required`, and requires explicit `resume`.
 
 Launch states distinguish `unclaimed`, `claimed`, `reconcile_required`, `bound`, `running`, and
-`terminal`. Commit `claimed` before execution. A delegated executor binds its returned child ID; an
+`terminal`. Persist `claimed` before execution. A delegated executor binds its returned child ID; an
 inline executor binds `inline-` plus the lowercase SHA-256 digest of the request ID, keeping the
 derived identifier within the state limit. An uncertain delegation becomes `reconcile_required` and
-must be reconciled before binding or retrying.
+must be reconciled before binding or retrying. Nodes retain up to 32 attempt records; reaching that
+explicit bound requires operator resolution rather than archival. `pending` and `blocked` nodes
+must have an unclaimed launch, and a transition to `blocked` is rejected once a launch is active.
+
+Each attempt records `scope_baseline`, mapping the node's current declared scopes to either a SHA-256
+filesystem fingerprint or `null` when the scope did not exist at claim time. A successful artifact
+attempt records `scope_evidence` with distinct before/after fingerprints for every declared scope.
+The after value exists only for a materialized regular file or directory; directory fingerprints cover
+its deterministic structure, file contents, modes, and link targets without following links. Fields
+are length-framed, file contents enter as fixed-size digests, and filesystem names use their native byte
+encoding, so valid trees have an unambiguous representation. Workflow completion rechecks that every
+done artifact scope remains materialized. Repository identity combines the canonical path with the
+filesystem object's stable device and file identity. Every snapshot checks that identity; POSIX
+fingerprinting opens the root without following links and traverses relative to that anchored
+descriptor, so replacing or redirecting the repository pathname cannot attribute outside artifacts
+to an attempt. Platforms without descriptor-relative traversal check object identity before and after
+the snapshot. A node with no write scopes is explicitly evidence-only,
+must have `assessment.dimensions.change_surface` equal to 0, and uses empty scope maps. Conversely, a
+positive change-surface score requires a scope, and any scope requires a positive score. This relation
+is validated for added, refined, split, and stored nodes. The runtime never invokes or inspects a
+version-control system. The combined finish summary,
+separator, and validation text must fit the event-size bound. Skipped and cancelled nodes do not claim artifact evidence. Only a
+`skipped` decomposed parent or `skipped` superseded leaf resolves without runtime completion; a
+`cancelled` node never satisfies workflow completion.
 
 Read-only `list`, `status`, and `context` operations never create, lock, repair, normalize, cache, or
 clean state.
