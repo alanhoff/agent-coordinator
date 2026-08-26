@@ -3,7 +3,6 @@
 .env.*
 !.env.example
 !.env.sample
-/GATES.md
 /data/
 
 # Python bytecode and native extensions
