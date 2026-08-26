@@ -9,12 +9,13 @@ from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocatio
 from coordinator.state.store import (
     AMBIGUITY_FACTORS,
     LAUNCH_STATES,
-    NODE_STATUSES,
     ROLES,
     StateError,
     StateStore,
     execute_command,
 )
+
+NODE_UPDATE_STATUSES = ("pending", "ready", "running", "blocked", "done", "failed")
 
 
 def _add_mutation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -106,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--rationale", required=True)
     update = _subcommand(sub, "node-update", mutate=True)
     update.add_argument("--node-id", required=True)
-    update.add_argument("--status", choices=NODE_STATUSES)
+    update.add_argument("--status", choices=NODE_UPDATE_STATUSES)
     update.add_argument("--launch-state", choices=LAUNCH_STATES)
     update.add_argument("--request-id")
     update.add_argument("--child-id")

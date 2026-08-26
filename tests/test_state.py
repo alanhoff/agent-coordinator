@@ -407,7 +407,7 @@ class DurableStateTests(unittest.TestCase):
                 "node-update", 3, f"reject-threshold-{status}", "--node-id", "threshold",
                 "--status", status, expected=2,
             )
-            self.assertIn("invalid node transition", rejected["data"]["message"])
+            self.assertEqual(rejected["data"]["message"], "invalid command line")
         supersede = {
             "reason": "An exact-threshold node must not disappear into replacement work",
             "operations": [{"op": "supersede", "node_id": "threshold", "replacement": "replacement"}],
@@ -859,7 +859,7 @@ class DurableStateTests(unittest.TestCase):
             "node-update", 11, "reject-ordinary-skip", "--node-id", "upstream",
             "--status", "skipped", expected=2,
         )
-        self.assertIn("invalid node transition", skipped["data"]["message"])
+        self.assertEqual(skipped["data"]["message"], "invalid command line")
         self.assertEqual(StateStore().load(self.workflow_id), skip_baseline)
 
         self.mutation(
@@ -1383,7 +1383,7 @@ class DurableStateTests(unittest.TestCase):
             "node-update", 16, "reject-obligation-skip", "--node-id", "grandchild-proof",
             "--status", "skipped", expected=2,
         )
-        self.assertIn("invalid node transition", escaped["data"]["message"])
+        self.assertEqual(escaped["data"]["message"], "invalid command line")
         remove_plan = {
             "reason": "A carried acceptance obligation cannot disappear",
             "operations": [{"op": "remove", "node_id": "grandchild-proof"}],
@@ -3032,7 +3032,7 @@ class DurableStateTests(unittest.TestCase):
                 "node-update", 2, f"reject-{status}-work", "--node-id", "work",
                 "--status", status, expected=2,
             )
-            self.assertIn("invalid node transition", rejected["data"]["message"])
+            self.assertEqual(rejected["data"]["message"], "invalid command line")
             self.assertEqual(StateStore().load(self.workflow_id), baseline)
             forged = copy.deepcopy(baseline)
             forged["nodes"]["work"]["status"] = status
