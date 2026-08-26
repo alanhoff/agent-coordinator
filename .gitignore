@@ -4,6 +4,7 @@
 !.env.example
 !.env.sample
 /GATES.md
+/data/
 
 # Python bytecode and native extensions
 __pycache__/

@@ -77,6 +77,26 @@ python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py context --work
 
 On Windows, use `python` and paths under `%USERPROFILE%`.
 
+## Docker demo
+
+The demo uses OpenAI's official Codex universal image and the `OPENAI_API_KEY` already stored in the
+ignored root `.env` file. Generate the backend with Coordinator:
+
+```sh
+docker compose run --rm coordinator
+```
+
+All mutable output stays under the ignored `data/` directory: the generated application is in
+`data/backend/`, while Codex sessions, Coordinator's complete workflow graph, and SQLite data use
+their own sibling subdirectories. Run the backend's tests or start the API:
+
+```sh
+docker compose run --rm backend -c 'cd /workspace/backend && npm test'
+docker compose up backend
+```
+
+The API is then available at `http://localhost:3000`; its SQLite database persists under `data/`.
+
 ## Current-user footprint
 
 | Location | Contents |
