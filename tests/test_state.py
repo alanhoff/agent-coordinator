@@ -3219,7 +3219,10 @@ class DurableStateTests(unittest.TestCase):
         raw_directory = os.path.join(os.fsencode(self.repo), b"byte-tree")
         os.mkdir(raw_directory, mode=0o700)
         raw_file = os.path.join(raw_directory, b"bad-\xff-name")
-        descriptor = os.open(raw_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            descriptor = os.open(raw_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            self.skipTest(f"filesystem rejects non-UTF-8 byte filenames: {exc}")
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(b"content")
 
@@ -3322,6 +3325,8 @@ class DurableStateTests(unittest.TestCase):
         self.assertIn("write_scope_collisions", rejected["data"]["message"])
 
     def test_repository_case_probe_cleans_up_after_close_error(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows case sensitivity is determined without a probe file")
         before = set(self.repo.iterdir())
         real_close = os.close
 
@@ -3464,15 +3469,16 @@ class DurableStateTests(unittest.TestCase):
         store = StateStore()
         lock = store.locks / "probe.lock"
         with store._lock("probe"):
-            first_payload = json.loads(lock.read_text(encoding="utf-8"))
-            self.assertEqual(first_payload["pid"], os.getpid())
             with self.assertRaisesRegex(StateError, "locked"):
                 with store._lock("probe"):
                     pass
+        first_payload = json.loads(lock.read_text(encoding="utf-8"))
+        self.assertEqual(first_payload["pid"], os.getpid())
         self.assertTrue(lock.is_file())
 
         with store._lock("probe"):
-            second_payload = json.loads(lock.read_text(encoding="utf-8"))
+            pass
+        second_payload = json.loads(lock.read_text(encoding="utf-8"))
         self.assertNotEqual(first_payload["nonce"], second_payload["nonce"])
         self.assertTrue(lock.is_file())
 
