@@ -2439,7 +2439,10 @@ class DurableStateTests(unittest.TestCase):
         plan = json.dumps({"reason": "try cycle", "operations": [{"op": "dependency_add", "node_id": "a", "dependency": "b"}]})
         self.mutation("graph-replan", 3, "cycle", "--plan-json", plan, expected=2)
         self.add("collision", 3, "scope-collision", scope="src/a/file.py", expected=2)
-        for index, scope in enumerate(("../outside", "/absolute", "C:/absolute", "src/\0artifact"), start=1):
+        for index, scope in enumerate(
+            (".", "../outside", "/absolute", "C:/absolute", "src/\0artifact"),
+            start=1,
+        ):
             rejected = self.add(
                 f"invalid-scope-{index}", 3, f"invalid-scope-{index}", scope=scope, expected=2,
             )

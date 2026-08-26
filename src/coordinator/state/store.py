@@ -673,7 +673,7 @@ def scopes_overlap(
     sensitive = os.name != "nt" if case_sensitive is None else case_sensitive
     a = _scope(left, "write scope", case_sensitive=sensitive, platform=platform)
     b = _scope(right, "write scope", case_sensitive=sensitive, platform=platform)
-    return a == b or a.startswith(b + "/") or b.startswith(a + "/") or a == "." or b == "."
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def _text_list(
