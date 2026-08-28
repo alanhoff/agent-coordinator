@@ -1,57 +1,132 @@
-# Agent Coordinator
+<h1 align="center">Agent Coordinator</h1>
+<p align="center"><strong>Give Codex a complex job. Get a clear plan and a checked result.</strong></p>
+<p align="center">Keep long jobs understandable, make progress easy to follow, and return to a checked result after an interruption.</p>
+<p align="center">
+  <img src=".github/readme/agent-coordinator-hero.png" width="880" alt="Illustration of one complex request moving through several bounded work paths with checkpoints and returning as one checked result.">
+</p>
+<p align="center">
+  <a href="#install-in-one-prompt"><strong>Install in one prompt</strong></a>
+  ·
+  <a href="#see-it-on-an-everyday-task">See an everyday example</a>
+</p>
+<p align="center"><sub>MIT licensed · Installs for your user account · Does not change Codex settings</sub></p>
 
-Agent Coordinator turns complex Codex work into a bounded workflow with durable state, explicit
-ownership, evidence-based routing, and recovery. It delegates to specialist subagents when the active
-runtime supports them and performs the same work inline when it does not.
+## What you get
 
-## Install
+- A clear plan you can follow from the request to the finish.
+- Accountable parts, each with a clear purpose and owner.
+- A checked, recoverable result that can survive interruptions.
 
-Ask your agent exactly:
+## Is Agent Coordinator a fit?
 
-> `Install https://github.com/alanhoff/agent-coordinator by following INSTALL.md`
+| Use it when | You probably do not need it when |
+|---|---|
+| The work has multiple dependent steps, files, or specialties. | The task is one small, obvious step. |
+| Several independent pieces can move ahead safely. | One quick answer or tiny edit is enough. |
+| An interruption would make progress hard to reconstruct. | You could easily restart from the original prompt. |
 
-The agent-facing procedure in [INSTALL.md](INSTALL.md) places one self-contained Coordinator skill in
-the current-user skill directory. It does not change Codex settings or register global agent profiles.
+## See it on an everyday task
 
-## Why Coordinator
+> Add saved search to my app without breaking checkout.
 
-- **Recovery is part of the protocol.** Atomic, revisioned snapshots record an execution claim before
-  work starts, require reconciliation after uncertain delegation, and fence replaced controllers.
-- **Ownership is explicit.** Every dependency node carries acceptance criteria, one specialist role,
-  and zero or more repository-relative write scopes. No scopes explicitly means evidence-only work;
-  it is valid only with a zero change-surface score. Artifact scopes require a positive change-surface
-  score and participate in overlap checks using normalized platform-safe paths and the repository's
-  detected case behavior. Completion proof is anchored to the original repository filesystem object.
-- **Work is bounded before launch.** A versioned complexity and ambiguity assessment forces future
-  work through refinement or coverage-checked decomposition without exhausting split depth or state
-  capacity before it can be routed or claimed.
-- **Routing follows current evidence.** The router ranks arbitrary model/effort candidates advertised
-  by the runtime. Without a current catalog, execution inherits the parent model and effort.
-- **Delegation is optional.** Role profiles ship inside the skill and travel in each delegated task.
-  If no subagent tool is callable, the controller applies that profile and executes the node inline.
-- **Your project stays clean.** Coordinator code and profiles live in its skill directory; workflow
-  state lives in a private current-user state directory.
+1. **Make the finish line clear:** identify the saved-search behavior, the checkout safeguard, and how each will be checked.
+2. **Keep progress understandable:** separate discovery, the focused change, and the regression check so every part has a clear purpose.
+3. **Check before finishing:** review the changed files and verification evidence; after an interruption, continue from recorded progress instead of starting over.
 
-## Give Codex a controller brief
+The task is finished only when saved search meets its acceptance check and the existing checkout checks still pass.
 
-Each prompt explicitly invokes `$coordinator`. Coordinator derives the smallest useful dependency
-graph and delegates only where bounded ownership helps.
+## Install in one prompt
+
+Ask Codex to follow the [repository-owned installer](INSTALL.md):
 
 ```text
-$coordinator Ship the saved-search feature. Inspect repository instructions, persist the acceptance
-criteria, build the smallest dependency graph, parallelize only independent write scopes, validate
-the integrated behavior, and finish only with materialized attempt evidence.
+Install https://github.com/alanhoff/agent-coordinator by following INSTALL.md
+```
+
+The procedure clones the repository to a temporary directory, records its commit, assembles a fresh skill, installs it for the current user, removes the temporary checkout, and reports the installed path and source commit. It replaces an existing destination only when that destination identifies itself as Coordinator.
+
+Running Coordinator requires Python 3.11 or newer and no third-party runtime packages. Installation does not edit Codex settings or register global custom-agent profiles.
+
+| Current-user location | What goes there |
+|---|---|
+| `~/.agents/skills/coordinator` | The skill, role profiles, references, Python adapters, and bundled runtime code |
+| `~/.agent-coordinator` | Private sessions, locks, recovery data, and workflow state |
+
+## Try a first task
+
+In a project, send this starter prompt:
+
+```text
+$coordinator Review this project's README for confusing setup steps. Do not edit files.
+Return the three highest-impact fixes, cite the evidence for each, and confirm that no files changed.
+```
+
+A successful response meets three conditions:
+
+1. Three fixes are ranked by impact.
+2. Each fix cites evidence from the project.
+3. The response confirms that no files changed.
+
+## How it works
+
+Coordinator follows the same four steps for each job:
+
+1. **Understand:** make the requested outcome, constraints, and proof of success explicit.
+2. **Divide:** break the job into the smallest useful parts, with clear boundaries and dependencies.
+3. **Do:** work through ready parts in a safe order. Specialist agents are optional; when they are unavailable, Coordinator performs each part inline through the same process.
+4. **Check and recover:** inspect the result and its evidence, reconcile uncertain work before retrying, and finish only after requirements and blockers are resolved.
+
+## Common questions
+
+<details>
+<summary>Does this require multiple agents?</summary>
+
+No. When extra agent capacity is available, Coordinator can send independent pieces to separate workers; otherwise it completes them inline, one at a time.
+
+</details>
+
+<details>
+<summary>Do I need to invoke it explicitly?</summary>
+
+Yes. The documented prompt pattern starts each coordinated task with `$coordinator`; installation itself only places the skill and changes no settings.
+
+</details>
+
+<details>
+<summary>What does it add to my project or settings?</summary>
+
+It adds no persistent Coordinator-owned file to the target project and does not edit Codex settings or global custom-agent profiles. During initialization, it creates and removes one private-name file solely to detect the repository filesystem's case behavior; Windows determines this without a probe file.
+
+</details>
+
+<details>
+<summary>What happens if work is interrupted?</summary>
+
+A new Coordinator run can resume from private state. It marks work that may still be active for reconciliation before retrying, preserves completed evidence, and avoids starting an uncertain step twice.
+
+</details>
+
+## Reference
+
+<details>
+<summary>Prompt patterns</summary>
+
+Use an explicit `$coordinator` prefix and state the finish line. These patterns cover implementation, diagnosis, recovery, and evidence-only comparison.
+
+```text
+$coordinator Ship the saved-search feature. Inspect repository instructions, preserve the acceptance
+criteria, separate only independent work, validate the integrated behavior, and finish with material
+evidence.
 ```
 
 ```text
 $coordinator Reproduce and diagnose the intermittent checkout test before changing production. Keep
-diagnosis, the smallest owner-layer fix, and independent validation as bounded dependent work.
+diagnosis, the smallest owner-layer fix, and independent validation as dependent parts.
 ```
 
 ```text
-$coordinator Resume the interrupted schema migration workflow. Reconcile the repository and every
-uncertain delegation before retrying, preserve completed evidence, and validate rollback and forward
-migration behavior before finishing.
+$coordinator Resume the interrupted schema migration workflow. Reconcile uncertain work before
+retrying, preserve completed evidence, and validate rollback and forward migration behavior.
 ```
 
 ```text
@@ -60,32 +135,39 @@ boundaries and requirements. State tradeoffs and missing evidence, then recommen
 implementing either option.
 ```
 
-## Operate
+</details>
 
-The installed `SKILL.md` is the controller protocol. In compact form, future work moves through
-**assess → refine or split → route → claim → execute → validate → reassess** before the
-workflow can finish:
+<details>
+<summary>Assessment and lifecycle</summary>
 
-1. The controller scores five 0–4 complexity dimensions and five 0–4 ambiguity factors. Inclusive
-   thresholds (a default total-complexity threshold of 6) force it to refine or coverage-split every
-   non-blocked assessable leaf until all are current and executable. Node-scoped blocked leaves remain
-   diagnosed without fencing independent dispatch.
-2. Node addition, refinement, and splitting leave routing provisional. Only after the latest assessment
-   does the controller persist an explicit route, read the role profile, and delegate or execute inline.
-   Active work is never rewritten.
-3. It fills genuine available capacity with dependency- and write-scope-safe leaves, ordered by
-   remaining-work critical-path load. Terminal-success bridges no longer serialize runnable downstream
-   work; repairable failures retain their load. The controller checks delegation capability before
-   selecting claims; without it, runtime capacity is one and inline work is claimed sequentially.
-4. It inspects artifacts and validation evidence, reconciles uncertain delegation before retrying, and
-   reassesses work staled by effective dependency outputs, terminal disposition, results, or evidence.
-5. Workflow completion requires resolved requirements and blockers, runtime-done nodes plus only
-   skipped decomposed parents or skipped superseded leaves. Every declared artifact scope must remain
-   materialized and contain an attempt-scoped fingerprint change; evidence-only nodes declare no scopes.
-   Scope presence and the change-surface score must agree, so artifact work cannot opt out of evidence.
-   Coordinator does not invoke or inspect a version-control system.
+Coordinator records five 0–4 complexity dimensions: breadth, change surface, coupling, novelty, and verification. It separately records 0–4 ambiguity factors for the objective, inputs, boundaries, dependencies, and acceptance.
 
-Read-only state inspection is available through the state adapter:
+Default limits are inclusive: complexity total 6 or any dimension 3 requires splitting, while ambiguity total 4 or any factor 2 requires refinement. The default maximum refinement depth is 8.
+
+```text
+assess → refine or split → route → claim → execute → validate → reassess
+```
+
+Every non-blocked assessable leaf must be current and executable before routing begins. Changed requirements or effective dependency results can make later work stale, so the fixed-point check repeats after relevant evidence changes.
+
+</details>
+
+<details>
+<summary>Ownership, routing, and completion</summary>
+
+- Each executable part has acceptance criteria, one role, and zero or more normalized repository-relative `write_scopes`.
+- Empty scopes mean evidence-only work and require `change_surface=0`. Artifact work requires a positive change-surface score and at least one scope.
+- Independent live work cannot overlap scopes. Case comparison follows behavior detected from the target filesystem.
+- Routing ranks only candidates advertised by the active runtime. If no current catalog is available or selection fails, execution inherits the parent model and effort.
+- A claim records a SHA-256 baseline for every artifact scope. Completion requires each declared scope to remain materialized and to have changed during that attempt.
+- Workflow completion requires resolved requirements and blockers, valid evidence, and only allowed terminal states. Coordinator does not invoke or inspect a version-control system.
+
+</details>
+
+<details>
+<summary>State inspection, including Windows</summary>
+
+Persisted schema-v6 workflow documents live under `~/.agent-coordinator/workflows`. These commands are read-only and never create, lock, repair, normalize, cache, or clean state.
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py list --json
@@ -93,46 +175,47 @@ python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py status --workf
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py context --workflow-id WORKFLOW --json
 ```
 
-On Windows, use `python` and paths under `%USERPROFILE%`.
+In Windows Command Prompt, use `python` and the current-user path:
 
-## Docker demo
+```bat
+python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" list --json
+python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" status --workflow-id WORKFLOW --json
+python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" context --workflow-id WORKFLOW --json
+```
 
-The demo uses OpenAI's official Codex universal image and the `OPENAI_API_KEY` already stored in the
-ignored root `.env` file. Generate the backend with Coordinator:
+Windows state lives under `%USERPROFILE%\.agent-coordinator\workflows`.
+
+</details>
+
+<details>
+<summary>Docker demo</summary>
+
+The demo uses a pinned OpenAI Codex universal image and requires `OPENAI_API_KEY` in the ignored root `.env` file. Skill and source mounts are read-only; mutable output stays under the ignored `data/` directory.
+
+Generate the backend with Coordinator:
 
 ```sh
 docker compose run --rm coordinator
 ```
 
-All mutable output stays under the ignored `data/` directory: the generated application is in
-`data/project/` (the backend itself is `data/project/backend/`), while Codex
-sessions, Coordinator's complete workflow graph, and SQLite data use sibling subdirectories. The
-demo output is intentionally left for manual evaluation and is not part of the repository's automated
-verification or Lean gate. The generator requires a fresh `data/project/`; clear `data/` before a new
-run. A person may manually start the generated backend:
+`data/project/` must be fresh; an existing regular `.nvmrc` is the only allowed top-level entry. Preserve anything you need before clearing `data/` for another run.
+
+The generated application is in `data/project/`, with its backend in `data/project/backend/`. Codex sessions, Coordinator state, and SQLite data use sibling directories, and the generated application remains outside automated repository verification.
+
+Start the generated backend manually:
 
 ```sh
 docker compose up backend
 ```
 
-The API is then available at `http://localhost:3000`; its SQLite database persists under `data/`.
+The API is then available at `http://localhost:3000`, and its SQLite database persists at `data/sqlite/todos.db`.
 
-## Current-user footprint
-
-| Location | Contents |
-|---|---|
-| `~/.agents/skills/coordinator` | Skill, role profiles, references, adapters, and Python runtime |
-| `~/.agent-coordinator` | Private sessions, locks, recovery data, and workflow state |
-
-No persistent Coordinator-owned file or state is placed in repositories it orchestrates. Initialization
-creates and removes one private-name file solely to probe the filesystem's case behavior.
+</details>
 
 ## Project
 
-Agent Coordinator is MIT licensed. Contributions and focused reports are welcome:
-
-- [Contributing](CONTRIBUTING.md)
+- [MIT license](LICENSE)
+- [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
-- [License](LICENSE)
 - [GitHub repository](https://github.com/alanhoff/agent-coordinator)
-- [Public issues](https://github.com/alanhoff/agent-coordinator/issues)
+- [Public issue tracker](https://github.com/alanhoff/agent-coordinator/issues)

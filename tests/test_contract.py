@@ -189,8 +189,8 @@ class PublicContractTests(unittest.TestCase):
         prompt = "Install https://github.com/alanhoff/agent-coordinator by following INSTALL.md"
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         instructions = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
-        section = readme.split("## Install\n", 1)[1].split("\n## ", 1)[0]
-        self.assertIn(f"> `{prompt}`", section)
+        section = readme.split("## Install in one prompt\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(f"```text\n{prompt}\n```", section)
         self.assertEqual(readme.count(prompt), 1)
         for required in (
             "~/.agents/skills/coordinator",
