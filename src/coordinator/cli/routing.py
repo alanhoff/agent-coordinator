@@ -11,13 +11,37 @@ from typing import Any, Sequence
 from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocation
 from coordinator.routing.selector import RoutingError, choose
 
+MAX_JSON_BYTES = 4 * 1024 * 1024
+
 
 def _json_file(path: str) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise RoutingError(f"JSON input contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    def constant(value: str) -> None:
+        raise RoutingError(f"JSON input contains non-standard numeric constant {value}")
+
     try:
-        text = sys.stdin.read() if path == "-" else pathlib.Path(path).read_text(encoding="utf-8")
-        return json.loads(text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RoutingError(f"unable to read valid JSON from {path}") from exc
+        if path == "-":
+            text = sys.stdin.read(MAX_JSON_BYTES + 1)
+            size = len(text.encode("utf-8"))
+        else:
+            with pathlib.Path(path).open("rb") as handle:
+                raw = handle.read(MAX_JSON_BYTES + 1)
+            size = len(raw)
+            text = raw.decode("utf-8")
+        if size > MAX_JSON_BYTES:
+            raise RoutingError(f"JSON input exceeds {MAX_JSON_BYTES} UTF-8 bytes")
+        return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    except RoutingError:
+        raise
+    except (OSError, UnicodeDecodeError, UnicodeEncodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise RoutingError(f"unable to read valid UTF-8 JSON from {path}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:

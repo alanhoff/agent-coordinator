@@ -69,6 +69,26 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaises(RoutingError):
             choose(task(complexity=6))
 
+    def test_router_rejects_duplicate_constants_and_oversized_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            task_path = base / "task.json"
+            invalid_documents = (
+                '{"summary":"one","summary":"two"}',
+                '{"summary":NaN}',
+                ' ' * (routing_cli.MAX_JSON_BYTES + 1),
+            )
+            for document in invalid_documents:
+                with self.subTest(prefix=document[:20]):
+                    task_path.write_text(document, encoding="utf-8")
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        code = routing_cli.main(
+                            ["choose", "--task-file", str(task_path), "--json"]
+                        )
+                    payload = json.loads(output.getvalue())
+                    self.assertEqual((code, payload["code"]), (2, "invalid_routing_input"))
+
     def test_malformed_structured_inputs_return_stable_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)

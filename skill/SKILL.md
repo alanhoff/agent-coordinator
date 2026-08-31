@@ -33,9 +33,24 @@ run `reconcile-mutation` with the same mutation ID before deciding whether to re
 
 ## Build a bounded graph
 
-Create the smallest useful dependency graph. Each node has an execution specification, acceptance
-criteria, zero or more repository-relative write scopes, one role, and a rubric-v2 assessment. Omit
-write scopes only for evidence-only work that will not change repository artifacts, and score its
+Create the smallest useful dependency graph. Prefer one file-backed `plan-apply` mutation for the
+initial requirements and nodes: it validates the complete manifest, permits forward dependency
+references inside that manifest, and publishes either the whole plan or none of it. The top-level JSON
+object has exactly `requirements` and `nodes`; each requirement has `id`, `text`, and `source`, and each
+node uses the same strict fields as a split child. Use `node-add` only for a genuinely incremental node
+or as an advanced fallback.
+
+```sh
+python3 "$SKILL_DIR/scripts/coordinator_state.py" plan-apply \
+  --workflow-id WORKFLOW --session-file /private/path/session.json \
+  --mutation-id plan-001 --expected-revision REVISION \
+  --plan-file /private/path/plan.json --json
+```
+
+Each node has an execution specification, acceptance criteria, zero or more repository-relative write
+scopes, one role, and a rubric-v2 assessment. Valid stages are `architecture`, `design`,
+`documentation`, `fix`, `implementation`, `integration`, `research`, `review`, and `validation`.
+Omit write scopes only for evidence-only work that will not change repository artifacts, and score its
 `change_surface` as 0. Any positive `change_surface` requires at least one scope, and any declared
 scope requires a positive `change_surface`; the state owner rejects mismatches. The workflow's
 schema-v6 conventions default `node_complexity_split_threshold` to 6,
@@ -59,7 +74,7 @@ python3 "$SKILL_DIR/scripts/coordinator_state.py" node-add \
 ```
 
 `node-add` records an invalid provisional route attempt. It does not authorize a claim, even when a
-role, model, or effort was supplied; run an explicit `node-route` after the latest assessment.
+role, model, or effort was supplied; run `node-route-auto` after the latest assessment, or use manual `node-route` only as an advanced override.
 
 Before routing anything, repeatedly inspect planning diagnostics and repair every non-blocked
 assessable leaf whose assessment is `stale`, `refinement_required`, or `split_required`:
@@ -105,12 +120,19 @@ after each semantic mutation. See
 
 Only a non-blocked leaf with a current `executable` assessment at the global fixed point may be routed,
 returned as ready, or claimed. `node-add`, `node-refine`, and `node-split` leave the next route attempt
-invalid; after the latest assessment, build the existing `model_router.py choose` request from that
-persisted assessment and persist an explicit `node-route`. Do not invent a second complexity score or
-change the router API. Rank only model/effort candidates the active runtime currently advertises; never
-invent a catalog or probe models. If the runtime exposes no catalog or route selection is unavailable
-or fails, keep model and effort unset so the executor inherits the parent route. The exact adapter is
-in `references/model-routing.md`.
+invalid. Normally run `node-route-auto`: it derives the router's 1–5 request from the persisted
+assessment, validates caller-supplied `criticality` and `determinism`, calls the existing selector, and
+persists the selected route in one fenced mutation. Supply `--profile-file` only from the active
+runtime's advertised candidates. Never invent a catalog, probe models, or author a second complexity
+score. With no candidate catalog, model and effort remain unset so execution inherits the parent route.
+Keep manual `node-route` only for an explicit advanced override. See `references/model-routing.md`.
+
+```sh
+python3 "$SKILL_DIR/scripts/coordinator_state.py" node-route-auto \
+  --workflow-id WORKFLOW --session-file /private/path/session.json \
+  --mutation-id route-NODE-001 --expected-revision REVISION --node-id NODE \
+  --criticality 3 --determinism 4 --json
+```
 
 A claim may consume a routed `pending` frontier leaf directly; the state owner atomically promotes it
 to `ready` before recording `claimed`, so `pending+claimed` is never persisted. Scope overlap is checked
@@ -120,7 +142,12 @@ repository filesystem object; unrelated pre-existing entries below a declared di
 
 ## Execute adaptively
 
-Planning diagnostics order ready work by descending critical-path load, then priority, then node ID.
+After every material mutation, call read-only `next --workflow-id WORKFLOW --json`. Treat its compact
+action as an oracle for the next legal action class, then supply the required semantic inputs; it never
+contains secrets or shell-escaped commands. On a newly initialized workflow with no nodes, `plan`
+means apply one non-empty `plan-apply` manifest rather than attempting closeout. Planning diagnostics
+order ready work by descending critical-path load, then priority, then node ID.
+
 Inspect the current tool surface before selecting a claim batch. If no delegation tool is callable,
 runtime capacity is one: select and claim exactly one inline node, then take it terminal before claiming
 another. Never preclaim work for later inline execution. Otherwise fill all genuinely available
@@ -138,20 +165,23 @@ a real slot idle when a compliant leaf can run. For every selected node:
    do not depend on a globally registered agent.
 2. Confirm the current tool surface. Treat delegation as enabled only when a subagent creation or
    delegation tool is callable. Do not infer it from a settings file or a configured maximum.
-3. Persist a unique launch claim before execution. If delegation is enabled, pass the task packet in the
-   tool's task/message argument. Pass the routed `model` and map `effort` to the tool's reasoning-effort
-   argument only when each value is set and the tool schema accepts it; otherwise omit it so the child
-   inherits its parent.
-4. Bind the returned child ID. If no delegation tool is callable, or a call definitively creates no
-   child, bind `inline-` followed by the lowercase SHA-256 digest of the request ID, then execute the
-   same packet in the parent under the same role instructions. Inline execution is a full node attempt,
-   not weaker acceptance.
-5. If a delegation result could have created a child, persist `reconcile_required` and inspect the
-   provider edge. Bind the existing child if found; bind the inline executor only after proving no
-   child exists. Never duplicate uncertain work.
-6. Mark the bound executor running, inspect its actual outputs, run the node's acceptance checks, and
-   persist result and evidence. Reassess affected assessable work to the fixed point before its next
-   route.
+3. Run `node-claim` before execution. It atomically promotes a routed frontier node when necessary,
+   fingerprints its scopes, and returns a deterministic request ID plus a suggested child ID. If
+   delegation is enabled, pass the task packet in the tool's task/message argument. Pass the routed
+   `model` and map `effort` to the tool's reasoning-effort argument only when each value is set and the
+   tool schema accepts it; otherwise omit it so the child inherits its parent.
+4. After a child is definitely created, run `node-start --child-id RETURNED_ID`; this atomically binds
+   that unique child and marks the attempt running. If no delegation tool is callable, or a call
+   definitively creates no child, bind `inline-` followed by the lowercase SHA-256 digest of the request
+   ID and execute the same packet in the parent. Inline execution is a full node attempt, not weaker
+   acceptance.
+5. If a delegation result could have created a child, use the low-level reconciliation fields of
+   `node-update` to persist `reconcile_required` and inspect the provider edge. Bind the existing child
+   if found; bind the inline executor only after proving no child exists. Never duplicate uncertain work.
+6. Inspect actual outputs and run the node acceptance checks. Then use `node-complete` with `succeeded`
+   or `failed`, file-backed result/evidence when multiline, and optional actual cost. It validates scope
+   evidence and records the terminal attempt in one mutation. Reassess affected work to the fixed point
+   before its next route.
 
 Monitor delegated work according to expected duration. Inline nodes run sequentially in the parent;
 do not count them as parallel. Serialize overlapping write ownership in both modes. A reported frontier
@@ -160,26 +190,40 @@ width is not permission to exceed actual tool capacity or the capacity-safe, non
 ## Complete or recover
 
 Use node-scoped blockers when independent work can continue. A satisfied or superseded requirement
-needs concrete evidence. `finish` succeeds only when every runtime node is `done`, every decomposed
-parent is `skipped`, every superseded leaf is `skipped`, and no ordinary `cancelled` node remains; all
-requirements and blockers are resolved, validation is recorded, and all artifact evidence remains valid.
+needs concrete evidence. Prefer one `workflow-complete` payload that exactly covers every active
+requirement with evidence and supplies the integrated summary and validation; it resolves requirements
+and completes the workflow atomically without resupplying immutable requirement text or source. Keep
+`requirement-set` plus `finish` for incremental or advanced recovery. Completion succeeds only when
+every runtime node is `done`, every decomposed parent is `skipped`, every superseded leaf is `skipped`,
+and no ordinary `cancelled` node remains; all requirements and blockers are resolved, validation is
+recorded, and all artifact evidence remains valid.
 A node can become blocked only before its launch is claimed; pending and blocked nodes never retain an
 active launch.
 When a launch is claimed, the state owner fingerprints every declared artifact scope. A `done`
 transition requires each declared scope to be a materialized regular file or directory whose fingerprint
 changed during that attempt; the before/after evidence remains in the attempt record. Each snapshot
 is rooted in the persisted repository filesystem identity, using anchored descriptor traversal where
-supported. `finish` rechecks that every done artifact scope remains materialized. Evidence-only nodes declare no write scopes and
+supported. Both `workflow-complete` and `finish` recheck that every done artifact scope remains materialized. Evidence-only nodes declare no write scopes and
 must have `change_surface=0`; they finish using their persisted result and evidence. Coordinator does not invoke or inspect a
 version-control system. An explicitly deleted path cannot itself be a completed scope; deletion work
 must declare a containing directory that remains materialized or be modeled as evidence-only work.
 
+Review must converge on evidence. Default to one integrated review wave after implementation and
+focused validation. Add another fix/revalidation wave only for a concrete acceptance-relevant finding
+with file or test evidence; reviewing a clean review is not itself a reason to spawn more judges.
+Parallel judges are justified only by explicitly distinct risk surfaces, and their findings must be
+merged before deciding on another wave. On an explicit user stop or acceptance instruction, stop
+spawning immediately, reconcile or interrupt active providers, and close with already-completed
+evidence—never reinterpret “finish” as permission for another quality wave.
+
 A replacement controller uses `controller-takeover`, which marks every claimed, bound, or running
-launch `reconcile_required`, then `resume` before provider reconciliation and ordinary mutation.
+launch `reconcile_required`, then `resume` before provider reconciliation and ordinary mutation. An
+aborted workflow is not reported as cleanly done while any launch remains `reconcile_required` or a
+discovered child remains `bound`; use `next` until every provider outcome is terminal or proven absent.
 Mutation receipts and up to 32 attempts per node remain in the atomic workflow snapshot; exhaustion is
 reported instead of adding a second persistence system. Close the private session file with
-`session-close` after completion. Read-only `list`, `status`, and `context` commands inspect persisted
-state without mutation.
+`session-close` after completion. Read-only `list`, `status`, `context`, and `next` commands inspect
+persisted state without mutation.
 
 See `references/workflow-protocol.md`, `references/complexity-accounting.md`,
 `references/state-schema.md`, and `references/model-routing.md` for the stable contracts.

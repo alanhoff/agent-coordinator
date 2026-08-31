@@ -6,6 +6,7 @@ import argparse
 from typing import Any, Sequence
 
 from coordinator.cli.outcome import OutcomeArgumentParser, emit, parse_invocation
+from coordinator.routing.selector import STAGES
 from coordinator.state.store import (
     AMBIGUITY_FACTORS,
     LAUNCH_STATES,
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--mutation-id", required=True)
     listed = _subcommand(sub, "list")
     listed.add_argument("--repo")
-    for name in ("status", "context"):
+    for name in ("status", "context", "next"):
         target = _subcommand(sub, name)
         target.add_argument("--workflow-id", required=True)
     reconcile = _subcommand(sub, "reconcile-mutation")
@@ -62,10 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     resume = _subcommand(sub, "resume", mutate=True)
     resume.add_argument("--message", required=True)
 
+    apply_plan = _subcommand(sub, "plan-apply", mutate=True)
+    manifest = apply_plan.add_mutually_exclusive_group(required=True)
+    manifest.add_argument("--plan-json")
+    manifest.add_argument("--plan-file")
+
     add = _subcommand(sub, "node-add", mutate=True)
     add.add_argument("--node-id", required=True)
     add.add_argument("--title", required=True)
-    add.add_argument("--stage", required=True)
+    add.add_argument("--stage", choices=tuple(sorted(STAGES)), required=True)
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--dependency", action="append", default=[])
     add.add_argument("--write-scope", action="append", default=[])
@@ -105,6 +111,26 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--model")
     route.add_argument("--effort")
     route.add_argument("--rationale", required=True)
+    auto_route = _subcommand(sub, "node-route-auto", mutate=True)
+    auto_route.add_argument("--node-id", required=True)
+    auto_route.add_argument("--criticality", type=int, required=True)
+    auto_route.add_argument("--determinism", type=int, required=True)
+    auto_route.add_argument("--profile-file")
+    claim = _subcommand(sub, "node-claim", mutate=True)
+    claim.add_argument("--node-id", required=True)
+    start = _subcommand(sub, "node-start", mutate=True)
+    start.add_argument("--node-id", required=True)
+    start.add_argument("--child-id", required=True)
+    complete_node = _subcommand(sub, "node-complete", mutate=True)
+    complete_node.add_argument("--node-id", required=True)
+    complete_node.add_argument("--outcome", choices=("succeeded", "failed"), required=True)
+    result = complete_node.add_mutually_exclusive_group(required=True)
+    result.add_argument("--result")
+    result.add_argument("--result-file")
+    evidence = complete_node.add_mutually_exclusive_group(required=True)
+    evidence.add_argument("--evidence")
+    evidence.add_argument("--evidence-file")
+    complete_node.add_argument("--actual-cost", type=float)
     update = _subcommand(sub, "node-update", mutate=True)
     update.add_argument("--node-id", required=True)
     update.add_argument("--status", choices=NODE_UPDATE_STATUSES)
@@ -145,6 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish = _subcommand(sub, "finish", mutate=True)
     finish.add_argument("--summary", required=True)
     finish.add_argument("--validation", required=True)
+    complete_workflow = _subcommand(sub, "workflow-complete", mutate=True)
+    completion = complete_workflow.add_mutually_exclusive_group(required=True)
+    completion.add_argument("--completion-json")
+    completion.add_argument("--completion-file")
     abort = _subcommand(sub, "abort", mutate=True)
     abort.add_argument("--reason", required=True)
     return parser

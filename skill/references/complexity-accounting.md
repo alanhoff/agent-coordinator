@@ -130,7 +130,7 @@ change must have at least one declared scope, and the replacement assessment's `
 match that choice. Newly added roots start with empty carried obligations, while split and supersede may add
 more. `rubric_version`, `total`, `input_digest`, and
 state are derived and must not be supplied. Refinement clears model/effort and leaves the next route
-attempt invalid until an explicit `node-route` follows the latest assessment. A claimed,
+attempt invalid until `node-route-auto` (or an advanced manual `node-route`) follows the latest assessment. A claimed,
 `reconcile_required`, bound, or running node is active and cannot be refined. A `failed` leaf can be
 refined when its launch is `unclaimed` or `terminal`; its attempt history is retained.
 A leaf whose current derived state is `split_required` cannot use refinement to lower its score; it
@@ -269,7 +269,7 @@ total or dimension scores are at or beyond policy. That raw over-budget test app
 is `stale` or `refinement_required`; ambiguity cannot hide split liveness. Such a leaf cannot be at
 `max_refinement_depth`. Children must have NFC-normalized platform-safe scopes and coherent dependencies, and each child's derived
 total must be strictly lower than the parent's. Split children also start with a provisional route
-attempt and require explicit `node-route`. The mutation records parent and child lineage, preserves any
+attempt and require `node-route-auto` (or an advanced manual `node-route`). The mutation records parent and child lineage, preserves any
 failed attempt record, rewires and stales eligible dependents, prunes terminal-success edges, and
 validates the complete DAG atomically.
 
