@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import os
@@ -13,6 +14,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from coordinator.cli.state import build_parser as build_state_parser  # noqa: E402
 from coordinator.state.store import new_state  # noqa: E402
 
 EXPECTED_ROLES = {
@@ -209,6 +211,39 @@ class PublicContractTests(unittest.TestCase):
         self.assertNotIn("config" + ".toml", combined)
         self.assertNotIn("coordinator-" + "architect.toml", combined)
         self.assertNotIn("installed " + "adapter", combined.casefold())
+
+    def test_high_level_orchestration_and_review_convergence_contract(self) -> None:
+        parser = build_state_parser()
+        subparsers = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        expected = {
+            "plan-apply",
+            "next",
+            "node-route-auto",
+            "node-claim",
+            "node-start",
+            "node-complete",
+            "workflow-complete",
+        }
+        self.assertTrue(expected.issubset(subparsers.choices))
+
+        protocol = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (ROOT / "skill" / "references" / "workflow-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((protocol + "\n" + workflow).split())
+        for command in sorted(expected):
+            self.assertIn(f"`{command}`", combined)
+        for required in (
+            "Default to one integrated review wave",
+            "no new concrete finding, no new wave",
+            "explicit user stop or acceptance instruction",
+            "stop spawning immediately",
+            "merged before deciding",
+        ):
+            self.assertIn(required.casefold(), combined.casefold())
+        self.assertIn("low-level reconciliation fields of `node-update`", " ".join(protocol.split()))
 
     def test_adaptive_execution_contract(self) -> None:
         protocol = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")

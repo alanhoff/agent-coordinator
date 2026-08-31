@@ -28,8 +28,9 @@ budget. With no profile or an empty candidate list, it returns `null` model and 
 or inline executor inherits the parent route. If optional route selection cannot complete, the
 controller uses the same inherited route instead of blocking the node. Node add, split, and refine
 leave a provisional route whose attempt is invalid for claim. After the latest assessment and global
-planning fixed point, the controller persists a fresh explicit `node-route` immediately before each
-attempt and omits unset model/effort arguments from delegated invocations.
+planning fixed point, the controller normally runs `node-route-auto`, which performs this translation and persists the selected
+route in the same revision-fenced mutation immediately before each attempt. Manual `node-route` remains
+an advanced override. Omit unset model/effort arguments from delegated invocations.
 
 Route only a non-blocked assessable leaf whose persisted assessment is current and `executable`, and
 only when every other non-blocked assessable leaf is also current and executable. Keep the router API

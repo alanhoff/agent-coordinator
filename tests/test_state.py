@@ -116,6 +116,37 @@ def split_child(
     }
 
 
+def plan_node(
+    node_id: str,
+    *,
+    dependencies: list[str] | None = None,
+    requirement_ids: list[str] | None = None,
+    scope: str | None = None,
+    stage: str = "implementation",
+    role: str = "implementer",
+) -> dict:
+    evidence_only = scope is None
+    dimensions = dict(DIMENSIONS)
+    if evidence_only:
+        dimensions["change_surface"] = 0
+    return {
+        "id": node_id,
+        "title": node_id,
+        "stage": stage,
+        "priority": 50,
+        "dependencies": dependencies or [],
+        "write_scopes": [] if evidence_only else [scope],
+        "role": role,
+        "model": None,
+        "effort": None,
+        "acceptance": ["focused check passes"],
+        "route_rationale": "provisional manifest route",
+        "estimated_cost": None,
+        "spec": specification(node_id, requirement_ids=requirement_ids),
+        "assessment": assessment_inputs(dimensions=dimensions),
+    }
+
+
 def effective_obligations(node: dict) -> dict[str, list[str]]:
     carried = node["lineage"]["obligations"]
     return {
@@ -3463,6 +3494,668 @@ class DurableStateTests(unittest.TestCase):
             "--requirement-id", "req-immutable", "--text", "Build the original contract",
             "--source", "task", "--status", "satisfied", "--evidence", "original contract verified",
         )
+
+
+    def test_node_creation_rejects_unsupported_stage_at_every_public_path(self) -> None:
+        baseline = StateStore().load(self.workflow_id)
+        rejected_add = self.add(
+            "bad-stage",
+            1,
+            "reject-bad-stage-add",
+            "--stage",
+            "verification",
+            expected=2,
+        )
+        self.assertEqual(rejected_add["code"], "invalid_invocation")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        self.add("split-parent", 1, "add-split-parent", "--breadth", "4")
+        split = {
+            "parent_id": "split-parent",
+            "reason": "Separate implementation and proof into bounded leaves",
+            "children": [
+                split_child(
+                    "split-code",
+                    acceptance=["code proof"],
+                    outputs=["split-parent implementation"],
+                    requirement_ids=[],
+                ),
+                split_child(
+                    "split-proof",
+                    acceptance=["focused test passes"],
+                    outputs=["proof artifact"],
+                    requirement_ids=[],
+                ),
+            ],
+            "coverage": {
+                "requirements": {},
+                "outputs": {"split-parent implementation": ["split-code"]},
+                "acceptance": {"focused test passes": ["split-proof"]},
+            },
+            "dependent_replacements": {},
+        }
+        split["children"][1]["stage"] = "verification"
+        before_split = StateStore().load(self.workflow_id)
+        rejected_split = self.mutation(
+            "node-split",
+            2,
+            "reject-bad-stage-split",
+            "--plan-json",
+            json.dumps(split),
+            expected=2,
+        )
+        self.assertIn("node stage is not supported", rejected_split["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before_split)
+
+    def test_structured_command_input_is_strict_and_bounded(self) -> None:
+        duplicate = self.base / "duplicate-plan.json"
+        duplicate.write_text('{"requirements":[],"requirements":[],"nodes":[]}', encoding="utf-8")
+        rejected = self.mutation(
+            "plan-apply", 1, "duplicate-plan", "--plan-file", str(duplicate), expected=2
+        )
+        self.assertEqual(rejected["code"], "invalid_state")
+        self.assertEqual(StateStore().load(self.workflow_id)["revision"], 1)
+
+        oversized = self.base / "oversized-plan.json"
+        oversized.write_bytes(b" " * (state_owner.MAX_COMMAND_BYTES + 1))
+        rejected = self.mutation(
+            "plan-apply", 1, "oversized-plan", "--plan-file", str(oversized), expected=2
+        )
+        self.assertEqual(rejected["code"], "input_too_large")
+        self.assertEqual(StateStore().load(self.workflow_id)["revision"], 1)
+
+    def test_plan_apply_rejects_semantic_noop_without_consuming_revision(self) -> None:
+        baseline = StateStore().load(self.workflow_id)
+        rejected = self.mutation(
+            "plan-apply",
+            1,
+            "reject-empty-plan",
+            "--plan-json",
+            json.dumps({"requirements": [], "nodes": []}),
+            expected=2,
+        )
+        self.assertIn("must add at least one", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+        self.assertNotIn("reject-empty-plan", baseline["receipts"])
+
+    def test_plan_apply_is_atomic_supports_forward_dependencies_and_replay(self) -> None:
+        plan = {
+            "requirements": [
+                {"id": "req-plan", "text": "Plan must remain atomic", "source": "task"}
+            ],
+            "nodes": [
+                plan_node(
+                    "consumer",
+                    dependencies=["producer"],
+                    requirement_ids=["req-plan"],
+                ),
+                plan_node("producer", requirement_ids=["req-plan"]),
+            ],
+        }
+        applied = self.mutation(
+            "plan-apply", 1, "plan-001", "--plan-json", json.dumps(plan)
+        )
+        self.assertEqual(applied["code"], "plan_applied")
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["revision"], 2)
+        self.assertEqual(set(state["nodes"]), {"consumer", "producer"})
+        self.assertEqual(state["nodes"]["consumer"]["dependencies"], ["producer"])
+        self.assertEqual(state["requirements"]["req-plan"]["status"], "active")
+        self.assertEqual(state["nodes"]["consumer"]["assessment"]["state"], "executable")
+        self.assertEqual(ready_nodes(state), ["producer"])
+
+        replay = self.mutation(
+            "plan-apply", 1, "plan-001", "--plan-json", json.dumps(plan)
+        )
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        self.assertEqual(StateStore().load(self.workflow_id), state)
+
+        invalid = copy.deepcopy(plan)
+        invalid["nodes"] = [plan_node("broken", dependencies=["missing"])]
+        rejected = self.mutation(
+            "plan-apply", 2, "plan-invalid", "--plan-json", json.dumps(invalid), expected=2
+        )
+        self.assertIn("already exist", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), state)
+
+        unresolved = {
+            "requirements": [],
+            "nodes": [plan_node("broken", dependencies=["missing"])],
+        }
+        rejected = self.mutation(
+            "plan-apply", 2, "plan-unresolved", "--plan-json", json.dumps(unresolved), expected=2
+        )
+        self.assertIn("unresolved dependencies", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), state)
+
+    def test_plan_apply_rejects_cycle_and_unknown_fields_without_partial_state(self) -> None:
+        cycle = {
+            "requirements": [],
+            "nodes": [
+                plan_node("left", dependencies=["right"]),
+                plan_node("right", dependencies=["left"]),
+            ],
+        }
+        original = StateStore().load(self.workflow_id)
+        rejected = self.mutation(
+            "plan-apply", 1, "plan-cycle", "--plan-json", json.dumps(cycle), expected=2
+        )
+        self.assertIn("invalid workflow graph", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), original)
+
+        malformed = {"requirements": [], "nodes": [], "unknown": True}
+        rejected = self.mutation(
+            "plan-apply", 1, "plan-unknown", "--plan-json", json.dumps(malformed), expected=2
+        )
+        self.assertIn("unknown unknown", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), original)
+
+    def test_node_route_auto_translates_persisted_assessment_and_selects_profile(self) -> None:
+        self.add(
+            "route-auto", 1, "add-route-auto",
+            "--breadth", "0", "--coupling", "0", "--novelty", "0", "--verification", "0",
+            evidence_only=True,
+        )
+        profile = self.base / "profile.json"
+        profile.write_text(
+            json.dumps(
+                {
+                    "budget": "quality",
+                    "candidates": [
+                        {
+                            "model": "runtime/small",
+                            "effort": None,
+                            "capacity": 1.0,
+                            "relative_cost": 1.0,
+                        },
+                        {
+                            "model": "runtime/strong",
+                            "effort": "high",
+                            "capacity": 5.0,
+                            "relative_cost": 2.0,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        routed = self.mutation(
+            "node-route-auto", 2, "auto-route-001",
+            "--node-id", "route-auto", "--criticality", "3", "--determinism", "4",
+            "--profile-file", str(profile),
+        )
+        selection = routed["data"]["routing"]
+        self.assertEqual(selection["inputs"]["complexity"], 1)
+        self.assertEqual(selection["inputs"]["ambiguity"], 1)
+        self.assertEqual(selection["inputs"]["coupling"], 1)
+        self.assertEqual(selection["inputs"]["novelty"], 1)
+        self.assertEqual(selection["route"]["model"], "runtime/strong")
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual(state["nodes"]["route-auto"]["route"]["attempt"], 1)
+
+        rejected = self.mutation(
+            "node-route-auto", 3, "auto-route-invalid",
+            "--node-id", "route-auto", "--criticality", "0", "--determinism", "4",
+            expected=2,
+        )
+        self.assertEqual(rejected["code"], "invalid_routing_input")
+        self.assertEqual(StateStore().load(self.workflow_id), state)
+
+    def test_node_route_auto_returns_compact_profile_diagnostics(self) -> None:
+        self.add("route-compact", 1, "add-route-compact", evidence_only=True)
+        candidates = [
+            {
+                "model": f"runtime/model-{index:03d}",
+                "effort": None,
+                "capacity": 5.0,
+                "relative_cost": float(index + 1),
+            }
+            for index in range(128)
+        ]
+        profile = self.base / "large-profile.json"
+        profile.write_text(
+            json.dumps({"budget": "balanced", "candidates": candidates}),
+            encoding="utf-8",
+        )
+        routed = self.mutation(
+            "node-route-auto",
+            2,
+            "route-compact-profile",
+            "--node-id",
+            "route-compact",
+            "--criticality",
+            "3",
+            "--determinism",
+            "3",
+            "--profile-file",
+            str(profile),
+        )
+        routing = routed["data"]["routing"]
+        self.assertEqual(routing["profile"], {"budget": "balanced", "candidate_count": 128})
+        self.assertNotIn("candidates", routing["profile"])
+        self.assertLessEqual(len(routing["alternatives"]), 5)
+        self.assertEqual(len(routing["task_digest"]), 64)
+        self.assertLess(len(json.dumps(routed, ensure_ascii=False)), 20_000)
+
+    def test_claim_identifiers_preserve_full_sha256_digest_with_maximum_node_id(self) -> None:
+        node_id = "n" * 128
+        self.add(node_id, 1, "add-max-id", evidence_only=True)
+        self.mutation(
+            "node-route-auto",
+            2,
+            "route-max-id",
+            "--node-id",
+            node_id,
+            "--criticality",
+            "3",
+            "--determinism",
+            "3",
+        )
+        claimed = self.mutation(
+            "node-claim",
+            3,
+            "claim-max-id",
+            "--node-id",
+            node_id,
+        )
+        for field in ("request_id", "suggested_child_id"):
+            identifier = claimed["data"][field]
+            self.assertLessEqual(len(identifier), 128)
+            self.assertRegex(identifier, r"-[0-9a-f]{64}$")
+        replay = self.mutation(
+            "node-claim",
+            3,
+            "claim-max-id",
+            "--node-id",
+            node_id,
+        )
+        self.assertEqual(
+            (replay["data"]["request_id"], replay["data"]["suggested_child_id"]),
+            (claimed["data"]["request_id"], claimed["data"]["suggested_child_id"]),
+        )
+
+    def test_high_level_lifecycle_generates_ids_starts_and_completes_scoped_work(self) -> None:
+        self.add("facade", 1, "add-facade", scope="src/facade")
+        self.mutation(
+            "node-route-auto", 2, "route-facade", "--node-id", "facade",
+            "--criticality", "3", "--determinism", "4",
+        )
+        claimed = self.mutation("node-claim", 3, "claim-facade", "--node-id", "facade")
+        request_id = claimed["data"]["request_id"]
+        suggested_child = claimed["data"]["suggested_child_id"]
+        self.assertRegex(request_id, state_owner.ID_RE)
+        self.assertRegex(suggested_child, state_owner.ID_RE)
+        self.assertEqual(claimed["data"]["attempt"], 1)
+        after_claim = StateStore().load(self.workflow_id)
+        self.assertEqual(after_claim["nodes"]["facade"]["launch"]["state"], "claimed")
+        self.assertEqual(
+            set(after_claim["nodes"]["facade"]["attempts"][0]["scope_baseline"]),
+            {"src/facade"},
+        )
+
+        replay = self.mutation("node-claim", 3, "claim-facade", "--node-id", "facade")
+        self.assertEqual(replay["data"]["request_id"], request_id)
+        self.assertEqual(replay["data"]["suggested_child_id"], suggested_child)
+        self.assertEqual(StateStore().load(self.workflow_id), after_claim)
+
+        started = self.mutation(
+            "node-start", 4, "start-facade", "--node-id", "facade",
+            "--child-id", suggested_child,
+        )
+        self.assertEqual(started["code"], "node_started")
+        scope = self.repo / "src" / "facade"
+        scope.parent.mkdir(parents=True)
+        scope.write_text("implemented\n", encoding="utf-8")
+        completed = self.mutation(
+            "node-complete", 5, "complete-facade", "--node-id", "facade",
+            "--outcome", "succeeded", "--result", "feature implemented",
+            "--evidence", "focused test passed", "--actual-cost", "1.25",
+        )
+        self.assertEqual(completed["code"], "node_completed")
+        state = StateStore().load(self.workflow_id)
+        node = state["nodes"]["facade"]
+        self.assertEqual((node["status"], node["launch"]["state"]), ("done", "terminal"))
+        self.assertEqual(node["attempts"][0]["outcome"], "succeeded")
+        self.assertEqual(node["actual_cost"], 1.25)
+        self.assertEqual(set(node["attempts"][0]["scope_evidence"]), {"src/facade"})
+
+    def test_node_complete_rejects_two_standard_input_consumers_before_reading(self) -> None:
+        self.add("stdin-complete", 1, "add-stdin-complete", evidence_only=True)
+        self.mutation(
+            "node-route-auto",
+            2,
+            "route-stdin-complete",
+            "--node-id",
+            "stdin-complete",
+            "--criticality",
+            "3",
+            "--determinism",
+            "3",
+        )
+        claim = self.mutation(
+            "node-claim",
+            3,
+            "claim-stdin-complete",
+            "--node-id",
+            "stdin-complete",
+        )
+        self.mutation(
+            "node-start",
+            4,
+            "start-stdin-complete",
+            "--node-id",
+            "stdin-complete",
+            "--child-id",
+            claim["data"]["suggested_child_id"],
+        )
+        baseline = StateStore().load(self.workflow_id)
+        standard_input = io.StringIO("one stream cannot encode two unframed documents")
+        with mock.patch.object(sys, "stdin", standard_input):
+            rejected = self.mutation(
+                "node-complete",
+                5,
+                "reject-dual-stdin",
+                "--node-id",
+                "stdin-complete",
+                "--outcome",
+                "succeeded",
+                "--result-file",
+                "-",
+                "--evidence-file",
+                "-",
+                expected=2,
+            )
+        self.assertEqual(rejected["code"], "invalid_invocation")
+        self.assertIn("cannot both read from standard input", rejected["data"]["message"])
+        self.assertEqual(standard_input.tell(), 0)
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+    def test_high_level_lifecycle_rejects_reused_child_and_unchanged_scope_atomically(self) -> None:
+        self.add("first", 1, "add-first", evidence_only=True)
+        self.add("second", 2, "add-second", evidence_only=True)
+        self.mutation(
+            "node-route-auto", 3, "route-first", "--node-id", "first",
+            "--criticality", "3", "--determinism", "3",
+        )
+        first_claim = self.mutation("node-claim", 4, "claim-first", "--node-id", "first")
+        child_id = first_claim["data"]["suggested_child_id"]
+        self.mutation(
+            "node-start", 5, "start-first", "--node-id", "first", "--child-id", child_id,
+        )
+        self.mutation(
+            "node-complete", 6, "complete-first", "--node-id", "first",
+            "--outcome", "succeeded", "--result", "done", "--evidence", "checked",
+        )
+        self.mutation(
+            "node-route-auto", 7, "route-second", "--node-id", "second",
+            "--criticality", "3", "--determinism", "3",
+        )
+        self.mutation("node-claim", 8, "claim-second", "--node-id", "second")
+        before_reuse = StateStore().load(self.workflow_id)
+        rejected = self.mutation(
+            "node-start", 9, "start-second-reuse", "--node-id", "second",
+            "--child-id", child_id, expected=2,
+        )
+        self.assertIn("already used", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before_reuse)
+
+        # Complete this test's claimed node with a fresh valid child before creating scoped work.
+        self.mutation(
+            "node-start", 9, "start-second", "--node-id", "second",
+            "--child-id", "child-second-valid",
+        )
+        self.mutation(
+            "node-complete", 10, "complete-second", "--node-id", "second",
+            "--outcome", "succeeded", "--result", "done", "--evidence", "checked",
+        )
+        self.add("unchanged", 11, "add-unchanged", scope="preexisting.txt")
+        self.mutation(
+            "node-route-auto", 12, "route-unchanged", "--node-id", "unchanged",
+            "--criticality", "3", "--determinism", "3",
+        )
+        claim = self.mutation("node-claim", 13, "claim-unchanged", "--node-id", "unchanged")
+        self.mutation(
+            "node-start", 14, "start-unchanged", "--node-id", "unchanged",
+            "--child-id", claim["data"]["suggested_child_id"],
+        )
+        before_complete = StateStore().load(self.workflow_id)
+        rejected = self.mutation(
+            "node-complete", 15, "complete-unchanged", "--node-id", "unchanged",
+            "--outcome", "succeeded", "--result", "claimed done",
+            "--evidence", "no actual change", expected=2,
+        )
+        self.assertIn("no attempt-scoped change", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before_complete)
+
+    def test_next_action_prioritizes_post_abort_provider_reconciliation(self) -> None:
+        self.add("abort-recovery", 1, "add-abort-recovery", evidence_only=True)
+        self.mutation(
+            "node-route-auto",
+            2,
+            "route-abort-recovery",
+            "--node-id",
+            "abort-recovery",
+            "--criticality",
+            "3",
+            "--determinism",
+            "3",
+        )
+        self.mutation(
+            "node-claim",
+            3,
+            "claim-abort-recovery",
+            "--node-id",
+            "abort-recovery",
+        )
+        self.mutation(
+            "abort",
+            4,
+            "abort-with-provider-uncertainty",
+            "--reason",
+            "operator stopped",
+        )
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "reconcile")
+        self.assertEqual(selected["node_ids"], ["abort-recovery"])
+
+        self.mutation(
+            "node-update",
+            5,
+            "recover-discovered-child",
+            "--node-id",
+            "abort-recovery",
+            "--launch-state",
+            "bound",
+            "--child-id",
+            "child-abort-recovery",
+            "--reconciliation",
+            "provider reports a created child",
+        )
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "reconcile")
+        self.assertIn("attempt_outcome", selected["required"])
+
+        self.mutation(
+            "node-update",
+            6,
+            "recover-terminal-child",
+            "--node-id",
+            "abort-recovery",
+            "--launch-state",
+            "terminal",
+            "--reconciliation",
+            "provider confirms the child stopped",
+            "--attempt-outcome",
+            "stopped after abort",
+        )
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "done")
+        self.assertIn("no unresolved provider outcomes", selected["reason"])
+
+    def test_next_action_requests_planning_for_an_empty_workflow(self) -> None:
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "plan")
+        self.assertEqual(selected["command"], "plan-apply")
+        self.assertEqual(selected["required"], ["plan_file"])
+        self.assertNotEqual(selected["action"], "finish")
+
+        self.mutation(
+            "requirement-set",
+            1,
+            "add-unplanned-requirement",
+            "--requirement-id",
+            "req-unplanned",
+            "--text",
+            "Create executable work",
+            "--source",
+            "task",
+            "--status",
+            "active",
+        )
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "plan")
+        self.assertEqual(selected["requirement_ids"], ["req-unplanned"])
+
+    def test_next_action_never_recommends_more_claims_than_available_capacity(self) -> None:
+        node_ids = [f"parallel-{index}" for index in range(6)]
+        plan = {
+            "requirements": [],
+            "nodes": [plan_node(node_id) for node_id in node_ids],
+        }
+        self.mutation(
+            "plan-apply",
+            1,
+            "plan-parallel-capacity",
+            "--plan-json",
+            json.dumps(plan),
+        )
+        revision = 2
+        for node_id in node_ids:
+            self.mutation(
+                "node-route-auto",
+                revision,
+                f"route-{node_id}",
+                "--node-id",
+                node_id,
+                "--criticality",
+                "3",
+                "--determinism",
+                "3",
+            )
+            revision += 1
+
+        selected = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(selected["action"], "claim")
+        self.assertEqual(selected["available_parallelism"], 3)
+        self.assertEqual(selected["node_ids"], ready_nodes(StateStore().load(self.workflow_id))[:3])
+        self.assertLessEqual(
+            len(selected["node_ids"]),
+            selected["available_parallelism"],
+        )
+
+    def test_next_action_tracks_route_claim_start_wait_closeout_and_terminal(self) -> None:
+        plan = {
+            "requirements": [
+                {"id": "req-next", "text": "Exercise the action oracle", "source": "test"}
+            ],
+            "nodes": [plan_node("next-work", requirement_ids=["req-next"])],
+        }
+        self.mutation("plan-apply", 1, "plan-next", "--plan-json", json.dumps(plan))
+        selected = self.cli("next", "--workflow-id", self.workflow_id)
+        self.assertEqual((selected["code"], selected["data"]["action"]), ("next_action_selected", "route"))
+        self.assertEqual(selected["data"]["node_ids"], ["next-work"])
+
+        self.mutation(
+            "node-route-auto", 2, "route-next", "--node-id", "next-work",
+            "--criticality", "3", "--determinism", "3",
+        )
+        self.assertEqual(
+            self.cli("next", "--workflow-id", self.workflow_id)["data"]["action"],
+            "claim",
+        )
+        claim = self.mutation("node-claim", 3, "claim-next", "--node-id", "next-work")
+        self.assertEqual(
+            self.cli("next", "--workflow-id", self.workflow_id)["data"]["action"],
+            "spawn_and_start",
+        )
+        self.mutation(
+            "node-start", 4, "start-next", "--node-id", "next-work",
+            "--child-id", claim["data"]["suggested_child_id"],
+        )
+        self.assertEqual(
+            self.cli("next", "--workflow-id", self.workflow_id)["data"]["action"],
+            "wait",
+        )
+        self.mutation(
+            "node-complete", 5, "complete-next", "--node-id", "next-work",
+            "--outcome", "succeeded", "--result", "finished", "--evidence", "checked",
+        )
+        closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(closeout["action"], "complete_requirements")
+        self.assertEqual(closeout["requirement_ids"], ["req-next"])
+
+        completion = {
+            "summary": "all work completed",
+            "validation": "focused check passed",
+            "requirements": {"req-next": "node next-work completed with evidence"},
+        }
+        completed = self.mutation(
+            "workflow-complete", 6, "workflow-complete-next",
+            "--completion-json", json.dumps(completion),
+        )
+        self.assertEqual(completed["code"], "workflow_completed")
+        terminal = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(terminal["action"], "done")
+
+    def test_workflow_complete_requires_exact_requirement_evidence_atomically(self) -> None:
+        plan = {
+            "requirements": [
+                {"id": "req-a", "text": "A", "source": "test"},
+                {"id": "req-b", "text": "B", "source": "test"},
+            ],
+            "nodes": [plan_node("closeout", requirement_ids=["req-a", "req-b"])],
+        }
+        self.mutation("plan-apply", 1, "plan-closeout", "--plan-json", json.dumps(plan))
+        self.mutation(
+            "node-route-auto", 2, "route-closeout", "--node-id", "closeout",
+            "--criticality", "3", "--determinism", "3",
+        )
+        claim = self.mutation("node-claim", 3, "claim-closeout", "--node-id", "closeout")
+        self.mutation(
+            "node-start", 4, "start-closeout", "--node-id", "closeout",
+            "--child-id", claim["data"]["suggested_child_id"],
+        )
+        self.mutation(
+            "node-complete", 5, "complete-closeout", "--node-id", "closeout",
+            "--outcome", "succeeded", "--result", "done", "--evidence", "validated",
+        )
+        before = StateStore().load(self.workflow_id)
+        incomplete = {
+            "summary": "done",
+            "validation": "validated",
+            "requirements": {"req-a": "covered"},
+        }
+        rejected = self.mutation(
+            "workflow-complete", 6, "workflow-complete-missing",
+            "--completion-json", json.dumps(incomplete), expected=2,
+        )
+        self.assertIn("missing req-b", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before)
+
+        exact = {
+            "summary": "done",
+            "validation": "validated",
+            "requirements": {"req-a": "covered A", "req-b": "covered B"},
+        }
+        self.mutation(
+            "workflow-complete", 6, "workflow-complete-exact",
+            "--completion-json", json.dumps(exact),
+        )
+        state = StateStore().load(self.workflow_id)
+        self.assertEqual((state["status"], state["phase"]), ("completed", "completed"))
+        self.assertEqual(state["requirements"]["req-a"]["text"], "A")
+        self.assertEqual(state["requirements"]["req-b"]["source"], "test")
+        self.assertEqual(state["requirements"]["req-a"]["status"], "satisfied")
 
 
     def test_state_lock_is_advisory_persistent_exclusive_and_released_on_exit(self) -> None:

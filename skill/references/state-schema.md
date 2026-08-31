@@ -118,7 +118,7 @@ those live peers remain a collision.
 
 Node add and split create route attempt 0; refinement sets the route attempt to the number of completed
 attempts. Both forms are provisional and invalid for the next claim. After the latest assessment and
-global fixed point, an explicit `node-route` must persist the next attempt number. Routing a failed
+global fixed point, `node-route-auto` normally persists the next attempt number; manual `node-route` remains an advanced override. Routing a failed
 retry resets its disposition to nonterminal and can stale direct dependents before claim.
 
 Each mutation supplies a unique mutation ID and expected prior revision. A persisted receipt makes
@@ -162,5 +162,5 @@ separator, and validation text must fit the event-size bound. Skipped and cancel
 `skipped` decomposed parent or `skipped` superseded leaf resolves without runtime completion; a
 `cancelled` node never satisfies workflow completion.
 
-Read-only `list`, `status`, and `context` operations never create, lock, repair, normalize, cache, or
+Read-only `list`, `status`, `context`, and `next` operations never create, lock, repair, normalize, cache, or
 clean state.

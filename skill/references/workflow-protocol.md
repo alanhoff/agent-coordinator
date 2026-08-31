@@ -9,7 +9,9 @@ specialists never mutate the graph.
 
 1. Inspect repository instructions, require a readable target directory, and open private workflow
    state outside the repository.
-2. Record requirements and build the smallest useful DAG. Give every node a complete specification,
+2. Record requirements and build the smallest useful DAG with one atomic `plan-apply` manifest whenever
+   the initial graph is known. Forward references inside that manifest are valid; a malformed manifest
+   exposes no partial plan. Use `node-add` only for a later incremental node. Give every node a complete specification,
    acceptance criteria, and rubric-v2 complexity dimensions plus objective, input, boundary, dependency,
    and acceptance ambiguity factors. Declare artifact write scopes, or an empty scope list for
    evidence-only work. Score `change_surface` as 0 exactly when the scope list is empty; the state
@@ -23,9 +25,12 @@ specialists never mutate the graph.
    scores reach an inclusive split threshold counts even when `stale` or `refinement_required`. It cannot be at maximum
    depth, and two unused node records remain reserved for it.
 5. Treat routes created by add, refine, or split as provisional. After the latest assessment and global
-   fixed point, derive the existing router request, rank only runtime-advertised candidates, and persist
-   an explicit `node-route`; inherit the parent route when no candidate is available.
-6. Inspect the tool surface before selecting claims. With callable delegation, select a maximal
+   fixed point, use `node-route-auto` to derive the existing router request from persisted assessment,
+   rank only runtime-advertised candidates, and persist the route in the same mutation; inherit the
+   parent route when no candidate is available. Manual `node-route` is an advanced override.
+6. Read the compact, deterministic `next` action after each material mutation. An empty initialized
+   workflow returns `plan`, never `finish`; apply a non-empty manifest before dispatch. Then inspect the tool
+   surface before selecting claims. With callable delegation, select a maximal
    genuinely runnable subset of the ordered frontier: remaining capacity first, then dependency and
    write-scope safety. Without callable delegation, runtime capacity is one: select and claim one node,
    take that inline attempt terminal, and only then claim the next. Never preclaim an inline backlog.
@@ -34,16 +39,18 @@ specialists never mutate the graph.
    concurrently runnable. Recompute after each claim rather than assuming the original frontier remains
    safe.
 7. Read each selected role TOML. Include native specification, effective requirements/outputs/
-   acceptance, and lineage provenance in its task packet, then claim and delegate or execute inline.
-   Inline execution consumes the parent and is sequential.
+   acceptance, and lineage provenance in its task packet. Run `node-claim` before delegation, then
+   `node-start` after a child is definitely created, and `node-complete` only after inspecting outputs
+   and acceptance evidence. Inline execution uses the same lifecycle and consumes the parent sequentially.
 8. Reconcile an ambiguous delegation before inline fallback or retry. Never duplicate uncertain work.
 9. Persist terminal results and evidence, then reassess affected work. Dependency effective-output
    changes, normalized terminal disposition, result/evidence, or retry can stale direct assessable
    dependents; nonterminal status transitions cannot.
-10. Repeat refinement and execution until no runnable work remains. Resolve blockers and requirements,
-   validate the integrated result, confirm every declared artifact scope has attempt-scoped change
-   evidence anchored to the original repository filesystem object and remains materialized, finish
-   the workflow, and close the private session. Evidence-only
+10. Repeat refinement and execution until no runnable work remains. Resolve blockers, validate the
+   integrated result, confirm every declared artifact scope has attempt-scoped change evidence anchored
+   to the original repository filesystem object and remains materialized, then use one
+   `workflow-complete` payload to satisfy exactly the active requirements and finish atomically. Close
+   the private session. Evidence-only
    nodes use persisted result/evidence and empty scope maps.
 
 ## Mutation boundaries and recovery
@@ -58,7 +65,7 @@ active or done. Reconcile an uncertain launch back to rewritable work before cha
 semantics. Requirement status and evidence may still resolve the workflow-level requirement gate.
 
 When reconciliation returns uncertain active work to `unclaimed`, re-derive its assessment; changed
-inputs make it `stale`, requiring refinement and a fresh explicit route before retry.
+inputs make it `stale`, requiring refinement and a fresh `node-route-auto` (or advanced manual route) before retry.
 
 Refinement atomically replaces one eligible leaf's native specification, current scopes, and assessment
 inputs while first preserving its full prior effective specification and scope provenance as carried
@@ -88,4 +95,20 @@ not labels to reuse. Receipts and up to 32 attempts per node remain in the atomi
 explicit capacity exhaustion requires operator action instead of a second persistence layer. A revision
 conflict requires a fresh read and decision; it is never solved by overwriting newer state. Controller
 takeover converts every claimed, bound, or running launch to `reconcile_required`; resume does not waive
-provider reconciliation. Only an unclaimed future node may be blocked.
+provider reconciliation. Aborting the workflow also does not make an uncertain or discovered child
+terminal: `next` continues to select reconciliation until the provider outcome is terminal or absence is
+proved. Only an unclaimed future node may be blocked.
+
+
+## Review convergence and user control
+
+Default to one integrated review wave after implementation and focused validation. A new fix and
+revalidation wave requires a concrete acceptance-relevant finding backed by a file, behavior, or test;
+a clean review does not justify a replacement judge. Use parallel judges only for explicitly distinct
+risk surfaces, merge their findings into one set, and decide from that merged evidence whether another
+wave is warranted. There is no arbitrary numeric ceiling that hides a real defect, but there is a hard
+convergence rule: no new concrete finding, no new wave.
+
+An explicit user instruction to stop, accept, or finish overrides speculative quality expansion. Stop
+spawning immediately, reconcile or interrupt active providers, preserve completed evidence, and close
+without launching another review pass.

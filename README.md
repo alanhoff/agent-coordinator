@@ -1,4 +1,10 @@
 <h1 align="center">Agent Coordinator</h1>
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="README.pt-BR.md">Português (Brasil)</a> ·
+  <a href="README.es.md">Español</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
 <p align="center"><strong>Give Codex a complex job. Get a clear plan and a checked result.</strong></p>
 <p align="center">Keep long jobs understandable, make progress easy to follow, and return to a checked result after an interruption.</p>
 <p align="center">
@@ -75,6 +81,16 @@ Coordinator follows the same four steps for each job:
 2. **Divide:** break the job into the smallest useful parts, with clear boundaries and dependencies.
 3. **Do:** work through ready parts in a safe order. Specialist agents are optional; when they are unavailable, Coordinator performs each part inline through the same process.
 4. **Check and recover:** inspect the result and its evidence, reconcile uncertain work before retrying, and finish only after requirements and blockers are resolved.
+
+The durable command path compiles those steps into safe operations:
+
+```text
+plan-apply → next → node-route-auto → node-claim → node-start → node-complete
+           ↘ refine/split/reconcile as required ↗
+                         workflow-complete
+```
+
+`next` is read-only and reports the next legal action class without embedding the full workflow state.
 
 ## Common questions
 
@@ -173,6 +189,7 @@ Persisted schema-v6 workflow documents live under `~/.agent-coordinator/workflow
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py list --json
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py status --workflow-id WORKFLOW --json
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py context --workflow-id WORKFLOW --json
+python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py next --workflow-id WORKFLOW --json
 ```
 
 In Windows Command Prompt, use `python` and the current-user path:
@@ -181,6 +198,7 @@ In Windows Command Prompt, use `python` and the current-user path:
 python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" list --json
 python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" status --workflow-id WORKFLOW --json
 python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" context --workflow-id WORKFLOW --json
+python "%USERPROFILE%\.agents\skills\coordinator\scripts\coordinator_state.py" next --workflow-id WORKFLOW --json
 ```
 
 Windows state lives under `%USERPROFILE%\.agent-coordinator\workflows`.

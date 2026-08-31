@@ -17,8 +17,11 @@ import unicodedata
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
+from coordinator.routing.selector import STAGES, RoutingError, choose
+
 SCHEMA_VERSION = 6
 MAX_STATE_BYTES = 4 * 1024 * 1024
+MAX_COMMAND_BYTES = MAX_STATE_BYTES
 MAX_NODES = 128
 MAX_EVENTS = 512
 MAX_RECEIPTS = 2048
@@ -120,8 +123,15 @@ def _decode_json(data: bytes | str, field: str, *, exit_code: int = 20) -> Any:
             result[key] = value
         return result
 
+    def constant(value: str) -> None:
+        raise StateError(
+            f"{field} contains non-standard numeric constant {value}",
+            code="corrupt_state",
+            exit_code=exit_code,
+        )
+
     try:
-        return json.loads(data, object_pairs_hook=pairs)
+        return json.loads(data, object_pairs_hook=pairs, parse_constant=constant)
     except StateError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
@@ -2493,18 +2503,45 @@ def add_event(state: dict[str, Any], kind: str, message: str, node_id: str | Non
     return event
 
 
-def _read_command_text(value: str | None, path: str | None, name: str) -> str:
+def _read_command_text(
+    value: str | None,
+    path: str | None,
+    name: str,
+    *,
+    maximum: int = MAX_COMMAND_BYTES,
+) -> str:
     if (value is None) == (path is None):
         raise StateError(f"exactly one of --{name} or --{name}-file is required")
-    if value is not None:
-        result = value
-    elif path == "-":
-        result = sys.stdin.read()
-    else:
-        try:
-            result = pathlib.Path(path or "").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise StateError(f"unable to read {name} file", code="io_error", exit_code=20) from exc
+    try:
+        if value is not None:
+            result = value
+        elif path == "-":
+            result = sys.stdin.read(maximum + 1)
+        else:
+            with pathlib.Path(path or "").open("rb") as handle:
+                raw = handle.read(maximum + 1)
+            if len(raw) > maximum:
+                raise StateError(
+                    f"{name} exceeds {maximum} UTF-8 bytes",
+                    code="input_too_large",
+                    exit_code=2,
+                )
+            result = raw.decode("utf-8")
+        encoded_size = len(result.encode("utf-8"))
+    except StateError:
+        raise
+    except (OSError, UnicodeDecodeError, UnicodeEncodeError) as exc:
+        raise StateError(
+            f"unable to read {name} as UTF-8",
+            code="io_error",
+            exit_code=20,
+        ) from exc
+    if encoded_size > maximum:
+        raise StateError(
+            f"{name} exceeds {maximum} UTF-8 bytes",
+            code="input_too_large",
+            exit_code=2,
+        )
     if not result.strip():
         raise StateError(f"{name} must not be blank")
     return result
@@ -2578,6 +2615,9 @@ def _node_record(
     parent_id: str | None = None,
     depth: int = 0,
 ) -> dict[str, Any]:
+    stage = _identifier(stage, "node stage")
+    if stage not in STAGES:
+        raise StateError("node stage is not supported")
     checked_spec = _validate_spec(spec)
     return {
         "id": node_id,
@@ -2753,6 +2793,621 @@ def _refresh_recovery_status(state: dict[str, Any]) -> None:
         state["controller"]["recovery_status"] = "clean"
 
 
+PLAN_REQUIREMENT_KEYS = {"id", "text", "source"}
+
+
+def _plan_requirement_records(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 256:
+        raise StateError("plan.requirements must be a list with at most 256 entries")
+    result: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(value):
+        field = f"plan.requirements[{index}]"
+        requirement = _keys(raw, PLAN_REQUIREMENT_KEYS, field)
+        requirement_id = _identifier(requirement["id"], f"{field}.id")
+        if requirement_id in result:
+            raise StateError("plan requirement identifiers must be unique")
+        result[requirement_id] = {
+            "text": _text(requirement["text"], f"{field}.text"),
+            "source": _text(requirement["source"], f"{field}.source", maximum=256),
+            "status": "active",
+            "evidence": None,
+        }
+    return result
+
+
+def _plan_node_record(raw: Any, index: int) -> dict[str, Any]:
+    field = f"plan.nodes[{index}]"
+    node = _keys(raw, SPLIT_CHILD_KEYS, field)
+    node_id = _identifier(node["id"], f"{field}.id")
+    stage = _identifier(node["stage"], f"{field}.stage")
+    priority = node["priority"]
+    if (
+        not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or not 0 <= priority <= 100
+    ):
+        raise StateError(f"{field}.priority must be 0..100")
+    role = node["role"]
+    if role not in ROLES:
+        raise StateError(f"{field}.role is invalid")
+    model = node["model"]
+    effort = node["effort"]
+    if model is not None:
+        model = _text(model, f"{field}.model", maximum=256)
+    if effort is not None:
+        effort = _text(effort, f"{field}.effort", maximum=256)
+    estimated_cost = node["estimated_cost"]
+    if estimated_cost is not None and (
+        not isinstance(estimated_cost, (int, float))
+        or isinstance(estimated_cost, bool)
+        or not math.isfinite(estimated_cost)
+        or estimated_cost < 0
+    ):
+        raise StateError(f"{field}.estimated_cost must be non-negative or null")
+    return _node_record(
+        node_id=node_id,
+        title=_text(node["title"], f"{field}.title", maximum=1024),
+        stage=stage,
+        priority=priority,
+        dependencies=_text_list(
+            node["dependencies"], f"{field}.dependencies", identifiers=True
+        ),
+        write_scopes=_text_list(
+            node["write_scopes"], f"{field}.write_scopes", maximum=32
+        ),
+        role=role,
+        model=model,
+        effort=effort,
+        acceptance=_text_list(
+            node["acceptance"], f"{field}.acceptance", required=True
+        ),
+        route_rationale=_text(
+            node["route_rationale"], f"{field}.route_rationale", maximum=4096
+        ),
+        estimated_cost=estimated_cost,
+        spec=node["spec"],
+        assessment=node["assessment"],
+    )
+
+
+def _require_routable_node(state: dict[str, Any], node_id: str) -> dict[str, Any]:
+    node = state["nodes"].get(node_id)
+    future = bool(
+        node
+        and node["status"] in ("pending", "ready")
+        and node["launch"]["state"] == "unclaimed"
+    )
+    failed_retry = bool(
+        node
+        and node["status"] == "failed"
+        and node["launch"]["state"] in ("unclaimed", "terminal")
+    )
+    if (
+        not node
+        or not (future or failed_retry)
+        or not _assessment_is_current_executable(state, node_id)
+    ):
+        raise StateError(
+            "routing requires current executable future or failed leaf work"
+        )
+    if _workflow_dispatch_blocked(state) or node_id in _active_blocked_node_ids(state):
+        raise StateError("routing requires an unblocked workflow and node")
+    if not _planning_at_fixed_point(state):
+        raise StateError(PLANNING_FIXED_POINT_ERROR)
+    return node
+
+
+def _route_node(
+    state: dict[str, Any],
+    node_id: str,
+    *,
+    role: str,
+    model: str | None,
+    effort: str | None,
+    rationale: str,
+) -> dict[str, Any]:
+    node = _require_routable_node(state, node_id)
+    prior_dependency_snapshot = _dependency_snapshot(node_id, node)
+    _reset_failed_leaf(node)
+    if _dependency_snapshot(node_id, node) != prior_dependency_snapshot:
+        _invalidate_direct_dependents(state, node_id)
+    node.update({"role": role, "model": model, "effort": effort})
+    node["route"] = {
+        "rationale": rationale,
+        "routed_at": now_iso(),
+        "attempt": len(node["attempts"]) + 1,
+    }
+    return add_event(state, "node_routed", rationale, node_id)
+
+
+def _routing_task(
+    node: Mapping[str, Any],
+    *,
+    criticality: int,
+    determinism: int,
+) -> dict[str, Any]:
+    assessment = node["assessment"]
+    return {
+        "summary": node["spec"]["objective"],
+        "stage": node["stage"],
+        "complexity": max(1, min(5, math.ceil(assessment["total"] / 4))),
+        "ambiguity": max(1, min(5, assessment["ambiguity_total"] + 1)),
+        "criticality": criticality,
+        "coupling": assessment["dimensions"]["coupling"] + 1,
+        "novelty": assessment["dimensions"]["novelty"] + 1,
+        "determinism": determinism,
+    }
+
+
+def _compact_routing_selection(selection: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep routing diagnostics useful without echoing the full candidate catalog."""
+    profile = selection.get("profile")
+    profile = profile if isinstance(profile, Mapping) else {}
+    candidates = profile.get("candidates")
+    candidate_count = profile.get("candidate_count")
+    if not isinstance(candidate_count, int) or isinstance(candidate_count, bool):
+        candidate_count = len(candidates) if isinstance(candidates, list) else 0
+    alternatives = selection.get("alternatives")
+    return {
+        "task_digest": selection.get("task_digest"),
+        "route": copy.deepcopy(selection.get("route")),
+        "rationale": selection.get("rationale"),
+        "inputs": copy.deepcopy(selection.get("inputs")),
+        "profile": {
+            "budget": profile.get("budget"),
+            "candidate_count": candidate_count,
+        },
+        "alternatives": copy.deepcopy(alternatives[:5])
+        if isinstance(alternatives, list)
+        else [],
+        "caveat": selection.get("caveat"),
+    }
+
+
+def _launch_identifiers(
+    workflow_id: str,
+    node_id: str,
+    mutation_id: str,
+) -> tuple[str, str]:
+    seed = f"{workflow_id}\0{node_id}\0{mutation_id}".encode()
+    request_digest = hashlib.sha256(seed + b"\0request").hexdigest()
+    child_digest = hashlib.sha256(seed + b"\0child").hexdigest()
+    fragment = node_id[:48]
+    request_id = f"req-{fragment}-{request_digest}"
+    child_id = f"child-{fragment}-{child_digest}"
+    _identifier(request_id, "generated request_id")
+    _identifier(child_id, "generated child_id")
+    return request_id, child_id
+
+
+def _claim_node(
+    state: dict[str, Any],
+    node_id: str,
+    request_id: str,
+) -> dict[str, Any]:
+    node = state["nodes"].get(node_id)
+    if node is None:
+        raise StateError("unknown node")
+    if not _planning_at_fixed_point(state):
+        raise StateError(PLANNING_FIXED_POINT_ERROR)
+    if node_id not in ready_nodes(state):
+        raise StateError(
+            "node-claim requires ready, dependency-safe, unblocked future work"
+        )
+    _identifier(request_id, "request_id")
+    if node["attempts"] and node["attempts"][-1]["finished_at"] is None:
+        raise StateError("prior launch attempt must be reconciled before another claim")
+    if node["route"]["attempt"] != len(node["attempts"]) + 1:
+        raise StateError("persist a fresh node route for this launch attempt")
+    if len(node["attempts"]) >= MAX_ATTEMPTS:
+        raise StateError(
+            "node attempt limit reached", code="capacity_exceeded", exit_code=20
+        )
+    if node["status"] == "pending":
+        node["status"] = "ready"
+    claimed_at = now_iso()
+    node["launch"].update(
+        {
+            "state": "claimed",
+            "request_id": request_id,
+            "claimed_at": claimed_at,
+            "child_id": None,
+            "reconciliation": None,
+        }
+    )
+    node["attempts"].append(
+        {
+            "number": node["route"]["attempt"],
+            "request_id": request_id,
+            "child_id": None,
+            "started_at": claimed_at,
+            "finished_at": None,
+            "outcome": None,
+            "scope_baseline": _scope_snapshot(state, node),
+            "scope_evidence": {},
+        }
+    )
+    return add_event(state, "node_claimed", "launch claim persisted", node_id)
+
+
+def _start_node(state: dict[str, Any], node_id: str, child_id: str) -> dict[str, Any]:
+    node = state["nodes"].get(node_id)
+    if node is None:
+        raise StateError("unknown node")
+    if node["launch"]["state"] != "claimed" or node["status"] != "ready":
+        raise StateError("node-start requires a claimed ready node")
+    child_id = _identifier(child_id, "child_id")
+    historical = {
+        attempt["child_id"]
+        for other in state["nodes"].values()
+        for attempt in other["attempts"]
+        if attempt["child_id"] is not None
+    }
+    if child_id in historical:
+        raise StateError("child_id was already used by an earlier attempt")
+    if any(
+        state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES
+        for dependency in node["dependencies"]
+    ):
+        raise StateError("node dependencies are not terminal-successful")
+    node["launch"].update(
+        {
+            "state": "running",
+            "child_id": child_id,
+            "reconciliation": None,
+        }
+    )
+    node["attempts"][-1]["child_id"] = child_id
+    node["status"] = "running"
+    state["status"] = "running"
+    state["phase"] = node["stage"]
+    _refresh_recovery_status(state)
+    return add_event(state, "node_started", "child bound and running", node_id)
+
+
+def _complete_node(
+    state: dict[str, Any],
+    node_id: str,
+    *,
+    outcome: str,
+    result: str,
+    evidence: str,
+    actual_cost: float | None,
+) -> dict[str, Any]:
+    node = state["nodes"].get(node_id)
+    if node is None:
+        raise StateError("unknown node")
+    if node["status"] != "running" or node["launch"]["state"] != "running":
+        raise StateError("node-complete requires a running node and launch")
+    if outcome not in ("succeeded", "failed"):
+        raise StateError("node-complete outcome is invalid")
+    result = _text(result, "node result")
+    evidence = _text(evidence, "node evidence")
+    if actual_cost is not None and (
+        not isinstance(actual_cost, (int, float))
+        or isinstance(actual_cost, bool)
+        or not math.isfinite(actual_cost)
+        or actual_cost < 0
+    ):
+        raise StateError("actual_cost must be non-negative or null")
+    prior_dependency_snapshot = _dependency_snapshot(node_id, node)
+    if outcome == "succeeded":
+        node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
+            state, node
+        )
+        node["status"] = "done"
+    else:
+        node["status"] = "failed"
+    node["result"] = result
+    node["evidence"] = evidence
+    node["actual_cost"] = actual_cost
+    node["launch"]["state"] = "terminal"
+    node["attempts"][-1].update(
+        {"finished_at": now_iso(), "outcome": outcome}
+    )
+    if node["status"] == "failed" and _assessable_leaf(node):
+        _invalidate_assessment(state, node)
+    if _dependency_snapshot(node_id, node) != prior_dependency_snapshot:
+        _invalidate_direct_dependents(state, node_id)
+    return add_event(
+        state,
+        "node_completed",
+        f"node outcome={outcome}",
+        node_id,
+    )
+
+
+def _finish_workflow_state(
+    state: dict[str, Any],
+    *,
+    summary: str,
+    validation: str,
+) -> dict[str, Any]:
+    summary = _text(summary, "finish summary", maximum=4096)
+    validation = _text(
+        validation,
+        "finish validation",
+        maximum=MAX_TEXT - len(summary) - len(FINISH_EVENT_SEPARATOR),
+    )
+    if not state["nodes"] or any(
+        not _node_resolves_completion(node) for node in state["nodes"].values()
+    ):
+        raise StateError(
+            "all visible nodes must resolve through done work, decomposition, or supersede"
+        )
+    if any(item["status"] == "active" for item in state["requirements"].values()):
+        raise StateError("all requirements must be resolved")
+    if any(item["status"] == "active" for item in state["blockers"]):
+        raise StateError("all blockers must be resolved")
+    _verify_finish_scopes(state)
+    state["status"] = "completed"
+    state["phase"] = "completed"
+    return add_event(
+        state,
+        "workflow_finished",
+        summary + FINISH_EVENT_SEPARATOR + validation,
+    )
+
+
+def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one compact, deterministic controller action without mutating state."""
+    base: dict[str, Any] = {
+        "revision": state["revision"],
+        "workflow_status": state["status"],
+        "phase": state["phase"],
+        "available_parallelism": planning_diagnostics(state)[
+            "available_parallelism"
+        ],
+        "warnings": [],
+    }
+
+    def action(
+        name: str,
+        reason: str,
+        *,
+        command: str | None = None,
+        node_ids: list[str] | None = None,
+        required: list[str] | None = None,
+        blocker_ids: list[str] | None = None,
+        requirement_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            **base,
+            "action": name,
+            "reason": reason,
+            "command": command,
+            "node_ids": node_ids or [],
+            "blocker_ids": blocker_ids or [],
+            "requirement_ids": requirement_ids or [],
+            "required": required or [],
+        }
+
+    if state["status"] == "completed":
+        return action("done", "workflow is terminal")
+    if state["controller"]["resume_required"]:
+        return action(
+            "resume",
+            "controller takeover requires explicit resume",
+            command="resume",
+            required=["message"],
+        )
+    uncertain = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if node["launch"]["state"] == "reconcile_required"
+    )
+    if uncertain:
+        return action(
+            "reconcile",
+            "provider outcomes must be reconciled before retry or completion",
+            command="node-update",
+            node_ids=uncertain,
+            required=["launch_state", "reconciliation"],
+        )
+    aborted_bound = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if state["status"] == "aborted" and node["launch"]["state"] == "bound"
+    )
+    if aborted_bound:
+        return action(
+            "reconcile",
+            "aborted child outcomes must become terminal before recovery is clean",
+            command="node-update",
+            node_ids=aborted_bound,
+            required=["launch_state=terminal", "reconciliation", "attempt_outcome"],
+        )
+    if state["status"] == "aborted":
+        return action("done", "aborted workflow has no unresolved provider outcomes")
+    workflow_blockers = [
+        item
+        for item in state["blockers"]
+        if item["status"] == "active" and item["node_id"] is None
+    ]
+    if workflow_blockers:
+        return action(
+            "resolve_blocker",
+            "a workflow-level blocker prevents dispatch",
+            command="unblock",
+            blocker_ids=sorted(item["id"] for item in workflow_blockers),
+            required=["blocker_id", "resolution"],
+        )
+    if not state["nodes"]:
+        return action(
+            "plan",
+            "workflow has no work graph; apply a non-empty atomic plan",
+            command="plan-apply",
+            requirement_ids=sorted(
+                requirement_id
+                for requirement_id, requirement in state["requirements"].items()
+                if requirement["status"] == "active"
+            ),
+            required=["plan_file"],
+        )
+    blocked_nodes = _active_blocked_node_ids(state)
+    assessable = [
+        (node_id, node)
+        for node_id, node in state["nodes"].items()
+        if _assessable_leaf(node) and node_id not in blocked_nodes
+    ]
+    refinement = sorted(
+        node_id
+        for node_id, node in assessable
+        if _derived_assessment_state(state, node) == "refinement_required"
+    )
+    if refinement:
+        return action(
+            "refine",
+            "material ambiguity must be resolved before dispatch",
+            command="node-refine",
+            node_ids=refinement,
+            required=["refinement_file"],
+        )
+    split = sorted(
+        node_id
+        for node_id, node in assessable
+        if _derived_assessment_state(state, node) == "split_required"
+    )
+    if split:
+        return action(
+            "split",
+            "complexity policy requires bounded child work",
+            command="node-split",
+            node_ids=split,
+            required=["plan_file"],
+        )
+    stale = sorted(
+        node_id
+        for node_id, node in assessable
+        if _derived_assessment_state(state, node) == "stale"
+    )
+    if stale:
+        return action(
+            "reassess",
+            "assessment inputs changed and must be recalculated",
+            command="node-refine",
+            node_ids=stale,
+            required=["refinement_file"],
+        )
+    claimed = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if node["launch"]["state"] == "claimed"
+    )
+    if claimed:
+        return action(
+            "spawn_and_start",
+            "claimed work must be delegated and bound before execution",
+            command="node-start",
+            node_ids=claimed,
+            required=["child_id"],
+        )
+    bound = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if node["launch"]["state"] == "bound"
+    )
+    if bound:
+        return action(
+            "start",
+            "bound work must transition to running",
+            command="node-update",
+            node_ids=bound,
+            required=["status=running"],
+        )
+    dispatch = ready_nodes(state)
+    failed_retry = sorted(
+        node_id
+        for node_id, node in assessable
+        if node["status"] == "failed"
+        and _assessment_is_current_executable(state, node_id)
+    )
+    candidates = list(dict.fromkeys([*dispatch, *failed_retry]))
+    needs_route = [
+        node_id
+        for node_id in candidates
+        if state["nodes"][node_id]["route"]["attempt"]
+        != len(state["nodes"][node_id]["attempts"]) + 1
+    ]
+    if needs_route:
+        return action(
+            "route",
+            "ready work needs a fresh route for its next attempt",
+            command="node-route-auto",
+            node_ids=needs_route,
+            required=["node_id", "criticality", "determinism"],
+        )
+    if candidates and base["available_parallelism"] > 0:
+        capacity = base["available_parallelism"]
+        return action(
+            "claim",
+            "routed dependency-safe work is ready for launch within available capacity",
+            command="node-claim",
+            node_ids=candidates[:capacity],
+            required=["node_id"],
+        )
+    active = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if node["launch"]["state"] in ("bound", "running")
+    )
+    if active:
+        return action(
+            "wait",
+            "active attempts must return evidence before the next transition",
+            node_ids=active,
+        )
+    active_requirements = sorted(
+        requirement_id
+        for requirement_id, requirement in state["requirements"].items()
+        if requirement["status"] == "active"
+    )
+    unresolved_nodes = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if not _node_resolves_completion(node)
+    )
+    active_blockers = sorted(
+        item["id"] for item in state["blockers"] if item["status"] == "active"
+    )
+    if not unresolved_nodes and active_requirements and not active_blockers:
+        return action(
+            "complete_requirements",
+            "all work resolves; active requirements need evidence at closeout",
+            command="workflow-complete",
+            requirement_ids=active_requirements,
+            required=["summary", "validation", "requirements"],
+        )
+    if not unresolved_nodes and not active_requirements and not active_blockers:
+        return action(
+            "finish",
+            "all completion gates are resolved",
+            command="workflow-complete",
+            required=["summary", "validation", "requirements"],
+        )
+    node_blockers = [
+        item
+        for item in state["blockers"]
+        if item["status"] == "active" and item["node_id"] is not None
+    ]
+    if node_blockers:
+        return action(
+            "resolve_blocker",
+            "blocked nodes require external resolution",
+            command="unblock",
+            blocker_ids=sorted(item["id"] for item in node_blockers),
+            node_ids=sorted(
+                item["node_id"] for item in node_blockers if item["node_id"]
+            ),
+            required=["blocker_id", "resolution"],
+        )
+    return action(
+        "blocked",
+        "no legal automatic progress is available; inspect unresolved nodes",
+        node_ids=unresolved_nodes,
+    )
+
+
 def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[str]]:
     """Execute one parsed state command at the state owner boundary."""
     command = args.command
@@ -2783,8 +3438,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             identity = canonical_repository(pathlib.Path(args.repo))["identity"]
             states = [state for state in states if state["repository"]["identity"] == identity]
         return 0, "workflows_listed", [_public_state(state) for state in states], []
-    if command in ("status", "context"):
+    if command in ("status", "context", "next"):
         state = store.load(args.workflow_id)
+        if command == "next":
+            return 0, "next_action_selected", next_action(state), []
         return 0, "workflow_loaded", _public_state(state, full=command == "context"), []
     if command == "reconcile-mutation":
         result = store.reconcile_mutation(args.workflow_id, args.mutation_id, args.digest)
@@ -2811,6 +3468,88 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             store, args, command, {"message": args.message}, resume, allow_resume_required=True
         )
         return 0, "mutation_reconciled" if replay else "workflow_resumed", {**_public_state(state), "event": result}, []
+
+    if command == "plan-apply":
+        plan = _read_command_object(args.plan_json, args.plan_file, "plan")
+        _keys(plan, {"requirements", "nodes"}, "plan")
+        requirements = _plan_requirement_records(plan["requirements"])
+        if not isinstance(plan["nodes"], list) or len(plan["nodes"]) > MAX_NODES:
+            raise StateError(
+                f"plan.nodes must be a list with at most {MAX_NODES} entries"
+            )
+        nodes = [
+            _plan_node_record(raw, index)
+            for index, raw in enumerate(plan["nodes"])
+        ]
+        node_ids = [node["id"] for node in nodes]
+        if len(set(node_ids)) != len(node_ids):
+            raise StateError("plan node identifiers must be unique")
+        if not requirements and not nodes:
+            raise StateError("plan must add at least one requirement or node")
+
+        def apply_plan(state: dict[str, Any]) -> dict[str, Any]:
+            requirement_collisions = set(requirements) & set(state["requirements"])
+            if requirement_collisions:
+                raise StateError(
+                    "plan requirement identifiers already exist: "
+                    + ", ".join(sorted(requirement_collisions))
+                )
+            node_collisions = set(node_ids) & set(state["nodes"])
+            if node_collisions:
+                raise StateError(
+                    "plan node identifiers already exist: "
+                    + ", ".join(sorted(node_collisions))
+                )
+            if len(state["requirements"]) + len(requirements) > 256:
+                raise StateError(
+                    "requirement capacity would be exceeded",
+                    code="capacity_exceeded",
+                    exit_code=20,
+                )
+            if len(state["nodes"]) + len(nodes) > MAX_NODES:
+                raise StateError(
+                    "node capacity would be exceeded",
+                    code="capacity_exceeded",
+                    exit_code=20,
+                )
+            for requirement_id, requirement in requirements.items():
+                state["requirements"][requirement_id] = copy.deepcopy(requirement)
+            for node in nodes:
+                state["nodes"][node["id"]] = copy.deepcopy(node)
+            known_ids = set(state["nodes"])
+            for node in nodes:
+                unknown = set(node["dependencies"]) - known_ids
+                if unknown:
+                    raise StateError(
+                        f"plan node {node['id']} has unresolved dependencies: "
+                        + ", ".join(sorted(unknown))
+                    )
+            for node in nodes:
+                _refresh_node_assessment(state, node["id"])
+            event = add_event(
+                state,
+                "plan_applied",
+                f"added {len(requirements)} requirements and {len(nodes)} nodes",
+            )
+            return {
+                "requirement_ids": sorted(requirements),
+                "node_ids": node_ids,
+                "event": event,
+            }
+
+        state, result, replay = _mutate_command(
+            store, args, command, plan, apply_plan
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "plan_applied",
+            {
+                **_public_state(state),
+                "plan": result,
+                "planning": planning_diagnostics(state),
+            },
+            [],
+        )
 
     if command == "node-add":
         node = _new_node(args)
@@ -3046,41 +3785,176 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         }
 
         def route(state: dict[str, Any]) -> dict[str, Any]:
-            node = state["nodes"].get(args.node_id)
-            future = bool(
-                node
-                and node["status"] in ("pending", "ready")
-                and node["launch"]["state"] == "unclaimed"
+            return _route_node(
+                state,
+                args.node_id,
+                role=args.role,
+                model=args.model,
+                effort=args.effort,
+                rationale=args.rationale,
             )
-            failed_retry = bool(
-                node
-                and node["status"] == "failed"
-                and node["launch"]["state"] in ("unclaimed", "terminal")
-            )
-            if (
-                not node
-                or not (future or failed_retry)
-                or not _assessment_is_current_executable(state, args.node_id)
-            ):
-                raise StateError("node-route requires current executable future or failed leaf work")
-            if _workflow_dispatch_blocked(state) or args.node_id in _active_blocked_node_ids(state):
-                raise StateError("node-route requires an unblocked workflow and node")
-            if not _planning_at_fixed_point(state):
-                raise StateError(PLANNING_FIXED_POINT_ERROR)
-            prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
-            _reset_failed_leaf(node)
-            if _dependency_snapshot(args.node_id, node) != prior_dependency_snapshot:
-                _invalidate_direct_dependents(state, args.node_id)
-            node.update({"role": args.role, "model": args.model, "effort": args.effort})
-            node["route"] = {
-                "rationale": args.rationale,
-                "routed_at": now_iso(),
-                "attempt": len(node["attempts"]) + 1,
-            }
-            return add_event(state, "node_routed", args.rationale, args.node_id)
 
         state, result, replay = _mutate_command(store, args, command, operation, route)
         return 0, "mutation_reconciled" if replay else "node_routed", {**_public_state(state), "event": result}, []
+
+    if command == "node-route-auto":
+        profile = (
+            _read_command_object(None, args.profile_file, "profile")
+            if args.profile_file
+            else None
+        )
+        operation = {
+            "node_id": args.node_id,
+            "criticality": args.criticality,
+            "determinism": args.determinism,
+            "profile": profile,
+        }
+        def auto_route(state: dict[str, Any]) -> dict[str, Any]:
+            node = _require_routable_node(state, args.node_id)
+            task = _routing_task(
+                node,
+                criticality=args.criticality,
+                determinism=args.determinism,
+            )
+            try:
+                selection = choose(task, profile)
+            except RoutingError as exc:
+                raise StateError(
+                    str(exc), code="invalid_routing_input", exit_code=2
+                ) from exc
+            compact_selection = _compact_routing_selection(selection)
+            route = selection["route"]
+            event = _route_node(
+                state,
+                args.node_id,
+                role=route["role"],
+                model=route["model"],
+                effort=route["effort"],
+                rationale=selection["rationale"],
+            )
+            return {"event": event, "selection": compact_selection}
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, auto_route
+        )
+        node = state["nodes"][args.node_id]
+        raw_selection = (
+            result.get("selection")
+            if isinstance(result, dict) and isinstance(result.get("selection"), dict)
+            else {
+                "route": {
+                    "role": node["role"],
+                    "model": node["model"],
+                    "effort": node["effort"],
+                },
+                "rationale": node["route"]["rationale"],
+                "profile": {"budget": None, "candidate_count": 0},
+            }
+        )
+        routing = _compact_routing_selection(raw_selection)
+        return (
+            0,
+            "mutation_reconciled" if replay else "node_routed",
+            {**_public_state(state), "routing": routing},
+            [],
+        )
+
+    if command == "node-claim":
+        request_id, suggested_child_id = _launch_identifiers(
+            args.workflow_id, args.node_id, args.mutation_id
+        )
+        operation = {
+            "node_id": args.node_id,
+            "request_id": request_id,
+            "suggested_child_id": suggested_child_id,
+        }
+
+        def claim(state: dict[str, Any]) -> dict[str, Any]:
+            return _claim_node(state, args.node_id, request_id)
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, claim
+        )
+        node = state["nodes"][args.node_id]
+        attempt = next(
+            (
+                item["number"]
+                for item in node["attempts"]
+                if item["request_id"] == request_id
+            ),
+            None,
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "node_claimed",
+            {
+                **_public_state(state),
+                "node_id": args.node_id,
+                "request_id": request_id,
+                "suggested_child_id": suggested_child_id,
+                "attempt": attempt,
+                "event": result,
+            },
+            [],
+        )
+
+    if command == "node-start":
+        operation = {"node_id": args.node_id, "child_id": args.child_id}
+
+        def start(state: dict[str, Any]) -> dict[str, Any]:
+            return _start_node(state, args.node_id, args.child_id)
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, start
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "node_started",
+            {**_public_state(state), "event": result},
+            [],
+        )
+
+    if command == "node-complete":
+        if args.result_file == "-" and args.evidence_file == "-":
+            raise StateError(
+                "result and evidence cannot both read from standard input; "
+                "use a regular file or inline value for one of them",
+                code="invalid_invocation",
+                exit_code=2,
+            )
+        result_text = _read_command_text(
+            args.result, args.result_file, "result"
+        )
+        evidence_text = _read_command_text(
+            args.evidence, args.evidence_file, "evidence"
+        )
+        operation = {
+            "node_id": args.node_id,
+            "outcome": args.outcome,
+            "result": result_text,
+            "evidence": evidence_text,
+            "actual_cost": args.actual_cost,
+        }
+
+        def complete(state: dict[str, Any]) -> dict[str, Any]:
+            return _complete_node(
+                state,
+                args.node_id,
+                outcome=args.outcome,
+                result=result_text,
+                evidence=evidence_text,
+                actual_cost=args.actual_cost,
+            )
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, complete
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "node_completed",
+            {**_public_state(state), "event": result},
+            [],
+        )
 
     if command == "node-update":
         operation = {
@@ -3529,31 +4403,84 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         state, result, replay = _mutate_command(store, args, command, operation, event)
         return 0, "mutation_reconciled" if replay else "event_recorded", {**_public_state(state), "event": result}, []
 
+    if command == "workflow-complete":
+        completion = _read_command_object(
+            args.completion_json, args.completion_file, "completion"
+        )
+        completion = _keys(
+            completion,
+            {"summary", "validation", "requirements"},
+            "completion",
+        )
+        summary = _text(completion["summary"], "completion.summary", maximum=4096)
+        validation = _text(
+            completion["validation"],
+            "completion.validation",
+            maximum=MAX_TEXT - len(summary) - len(FINISH_EVENT_SEPARATOR),
+        )
+        raw_evidence = completion["requirements"]
+        if not isinstance(raw_evidence, dict) or len(raw_evidence) > 256:
+            raise StateError("completion.requirements must be a bounded object")
+        requirement_evidence = {
+            _identifier(requirement_id, "completion requirement id"): _text(
+                evidence,
+                f"completion.requirements.{requirement_id}",
+            )
+            for requirement_id, evidence in raw_evidence.items()
+        }
+        operation = {
+            "summary": summary,
+            "validation": validation,
+            "requirements": requirement_evidence,
+        }
+
+        def complete_workflow(state: dict[str, Any]) -> dict[str, Any]:
+            active = {
+                requirement_id
+                for requirement_id, requirement in state["requirements"].items()
+                if requirement["status"] == "active"
+            }
+            supplied = set(requirement_evidence)
+            if supplied != active:
+                missing = active - supplied
+                unknown = supplied - active
+                detail = []
+                if missing:
+                    detail.append("missing " + ", ".join(sorted(missing)))
+                if unknown:
+                    detail.append("unknown or already resolved " + ", ".join(sorted(unknown)))
+                raise StateError(
+                    "completion requirement evidence must exactly cover active requirements: "
+                    + "; ".join(detail)
+                )
+            for requirement_id, evidence in requirement_evidence.items():
+                state["requirements"][requirement_id]["status"] = "satisfied"
+                state["requirements"][requirement_id]["evidence"] = evidence
+            return _finish_workflow_state(
+                state,
+                summary=summary,
+                validation=validation,
+            )
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, complete_workflow
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "workflow_completed",
+            {**_public_state(state), "event": result},
+            [],
+        )
+
     if command == "finish":
         operation = {"summary": args.summary, "validation": args.validation}
 
         def finish(state: dict[str, Any]) -> dict[str, Any]:
-            summary = _text(args.summary, "finish summary", maximum=4096)
-            validation = _text(
-                args.validation,
-                "finish validation",
-                maximum=MAX_TEXT - len(summary) - len(FINISH_EVENT_SEPARATOR),
+            return _finish_workflow_state(
+                state,
+                summary=args.summary,
+                validation=args.validation,
             )
-            if not state["nodes"] or any(
-                not _node_resolves_completion(node)
-                for node in state["nodes"].values()
-            ):
-                raise StateError(
-                    "all visible nodes must resolve through done work, decomposition, or supersede"
-                )
-            if any(item["status"] == "active" for item in state["requirements"].values()):
-                raise StateError("all requirements must be resolved")
-            if any(item["status"] == "active" for item in state["blockers"]):
-                raise StateError("all blockers must be resolved")
-            _verify_finish_scopes(state)
-            state["status"] = "completed"
-            state["phase"] = "completed"
-            return add_event(state, "workflow_finished", summary + FINISH_EVENT_SEPARATOR + validation)
 
         state, result, replay = _mutate_command(store, args, command, operation, finish)
         return 0, "mutation_reconciled" if replay else "workflow_completed", {**_public_state(state), "event": result}, []
