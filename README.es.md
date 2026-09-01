@@ -210,25 +210,29 @@ En Windows, el estado se guarda en `%USERPROFILE%\.agent-coordinator\workflows`.
 <details>
 <summary>Demostración con Docker</summary>
 
-La demostración usa una imagen universal de OpenAI Codex fijada a una versión concreta y requiere `OPENAI_API_KEY` en el archivo `.env` ignorado, ubicado en la raíz. Los montajes de la skill y del código fuente son de solo lectura; la salida modificable permanece en el directorio ignorado `data/`.
+La demostración crea un contenedor desechable de Node.js, instala Codex en él y monta en modo de solo lectura la skill Coordinator de este repositorio. Configura `OPENAI_API_KEY` en el archivo ignorado `demo/.env`:
 
-Genera el backend con Coordinator:
-
-```sh
-docker compose run --rm coordinator
+```dotenv
+OPENAI_API_KEY=tu-clave-de-api
 ```
 
-`data/project/` debe estar limpio; un archivo regular `.nvmrc` ya existente es la única entrada permitida en el nivel superior. Conserva todo lo que necesites antes de vaciar `data/` para otra ejecución.
-
-La aplicación generada se encuentra en `data/project/`, con el backend en `data/project/backend/`. Las sesiones de Codex, el estado de Coordinator y los datos de SQLite usan directorios del mismo nivel, y la aplicación generada queda fuera de la verificación automatizada del repositorio.
-
-Inicia el backend generado de forma manual:
+Ejecuta la demostración desde la raíz del repositorio:
 
 ```sh
-docker compose up backend
+cd demo
+./run.sh
 ```
 
-La API estará disponible en `http://localhost:3000` y su base de datos SQLite persistirá en `data/sqlite/todos.db`.
+Cada ejecución elimina `demo/home/` antes de generar una aplicación nueva. Conserva cualquier resultado que necesites antes de volver a ejecutarla.
+
+La aplicación generada y su base de datos `todos.db` permanecen en `demo/home/app/`. El estado de Coordinator se guarda en `demo/home/state/` y el de Codex en `demo/home/codex/`. Los recursos de Compose se eliminan cuando finaliza la ejecución, mientras que estos archivos montados permanecen disponibles para su inspección.
+
+El proyecto generado incluye su propio comando `npm start`. Ejecútalo con una versión actual de Node.js:
+
+```sh
+cd demo/home/app
+npm start
+```
 
 </details>
 

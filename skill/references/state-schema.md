@@ -194,7 +194,11 @@ the snapshot. A node with no write scopes is explicitly evidence-only,
 must have `assessment.dimensions.change_surface` equal to 0, and uses empty scope maps. Conversely, a
 positive change-surface score requires a scope, and any scope requires a positive score. This relation
 is validated for added, refined, split, and stored nodes. The runtime never invokes or inspects a
-version-control system. The combined finish summary,
+version-control system. A successful evidence-only `review` node covers completed artifact nodes in
+its transitive dependency ancestry. Closeout rejects uncovered completed artifact work unless the
+controller supplies a non-blank `review_waiver`; the same atomic mutation records a `review_waived`
+event naming the uncovered nodes. A waiver is rejected when review coverage is already complete. The
+combined finish summary,
 separator, and validation text must fit the event-size bound. Skipped and cancelled nodes do not claim artifact evidence. Only a
 `skipped` decomposed parent or `skipped` superseded leaf resolves without runtime completion; a
 `cancelled` node never satisfies workflow completion.

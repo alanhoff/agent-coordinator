@@ -3169,6 +3169,7 @@ class DurableStateTests(unittest.TestCase):
         self.mutation(
             "finish", 8, "finish-with-materialized-scope", "--summary", "done",
             "--validation", "passed",
+            "--review-waiver", "Focused artifact work was accepted without a separate review pass",
         )
         completed = StateStore().load(self.workflow_id)
         scope_evidence = completed["nodes"]["work"]["attempts"][-1]["scope_evidence"]["preexisting.txt"]
@@ -3200,6 +3201,126 @@ class DurableStateTests(unittest.TestCase):
         self.assertNotIn("git", completed)
         self.assertEqual(completed["nodes"]["review"]["write_scopes"], [])
         self.assertEqual(completed["nodes"]["review"]["attempts"][-1]["scope_evidence"], {})
+
+    def test_artifact_closeout_requires_and_records_an_explicit_review_waiver(self) -> None:
+        self.start_scoped_work(node_id="work", scope="src/work.txt")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "work.txt").write_text("implemented\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-unreviewed-work", "--node-id", "work",
+            "--status", "done", "--result", "implemented",
+            "--evidence", "focused checks passed",
+        )
+
+        closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(closeout["action"], "finish")
+        self.assertIn("review_waiver", closeout["required"])
+        self.assertIn("work", closeout["reason"])
+
+        completion = {
+            "summary": "done",
+            "validation": "focused checks passed",
+            "requirements": {},
+        }
+        baseline = StateStore().load(self.workflow_id)
+        blank_waiver = {**completion, "review_waiver": "   "}
+        invalid = self.mutation(
+            "workflow-complete", 8, "reject-blank-review-waiver",
+            "--completion-json", json.dumps(blank_waiver), expected=2,
+        )
+        self.assertIn("completion.review_waiver", invalid["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        rejected = self.mutation(
+            "workflow-complete", 8, "reject-missing-review-waiver",
+            "--completion-json", json.dumps(completion), expected=2,
+        )
+        self.assertIn("explicit review waiver", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        completion["review_waiver"] = "User accepted focused validation without another review pass"
+        self.mutation(
+            "workflow-complete", 8, "complete-with-review-waiver",
+            "--completion-json", json.dumps(completion),
+        )
+        completed = StateStore().load(self.workflow_id)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["events"][-2]["kind"], "review_waived")
+        self.assertIn("unreviewed artifact nodes: work", completed["events"][-2]["message"])
+        self.assertEqual(completed["events"][-1]["kind"], "workflow_finished")
+        replay = self.mutation(
+            "workflow-complete", 8, "complete-with-review-waiver",
+            "--completion-json", json.dumps(completion),
+        )
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        self.assertEqual(StateStore().load(self.workflow_id), completed)
+
+    def test_integrated_review_covers_dependency_artifacts_without_a_waiver(self) -> None:
+        self.start_scoped_work(node_id="work", scope="src/work.txt")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "work.txt").write_text("implemented\n", encoding="utf-8")
+        self.mutation(
+            "node-update", 7, "finish-reviewed-work", "--node-id", "work",
+            "--status", "done", "--result", "implemented",
+            "--evidence", "focused checks passed",
+        )
+        self.mutation(
+            "node-add", 8, "add-integrated-review",
+            "--node-id", "review", "--title", "Integrated review", "--stage", "review",
+            "--dependency", "work", "--role", "reviewer",
+            "--acceptance", "review evidence is conclusive",
+            "--rationale", "review completed artifact work",
+            "--objective", "Review the completed implementation",
+            "--output", "Integrated review evidence",
+            "--breadth", "1", "--change-surface", "0", "--coupling", "1",
+            "--novelty", "1", "--verification", "1",
+            "--ambiguity-objective", "0", "--ambiguity-inputs", "0",
+            "--ambiguity-boundaries", "0", "--ambiguity-dependencies", "0",
+            "--ambiguity-acceptance", "0",
+            "--complexity-rationale", "bounded evidence-only review",
+        )
+        self.route("review", 9, "route-integrated-review", role="reviewer")
+        claim = self.mutation(
+            "node-claim", 10, "claim-integrated-review", "--node-id", "review",
+        )
+        self.mutation(
+            "node-start", 11, "start-integrated-review", "--node-id", "review",
+            "--child-id", claim["data"]["suggested_child_id"],
+        )
+        self.mutation(
+            "node-complete", 12, "complete-integrated-review", "--node-id", "review",
+            "--outcome", "succeeded", "--result", "review passed",
+            "--evidence", "artifact and focused checks reviewed",
+        )
+
+        closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertEqual(closeout["action"], "finish")
+        self.assertNotIn("review_waiver", closeout["required"])
+        baseline = StateStore().load(self.workflow_id)
+        unnecessary = {
+            "summary": "done",
+            "validation": "review passed",
+            "requirements": {},
+            "review_waiver": "not needed",
+        }
+        rejected = self.mutation(
+            "workflow-complete", 13, "reject-unnecessary-review-waiver",
+            "--completion-json", json.dumps(unnecessary), expected=2,
+        )
+        self.assertIn("only valid", rejected["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        completion = {
+            "summary": "done",
+            "validation": "review passed",
+            "requirements": {},
+        }
+        self.mutation(
+            "workflow-complete", 13, "complete-reviewed-workflow",
+            "--completion-json", json.dumps(completion),
+        )
+        completed = StateStore().load(self.workflow_id)
+        self.assertFalse(any(event["kind"] == "review_waived" for event in completed["events"]))
 
     def test_declared_directory_allows_an_unrelated_internal_symlink(self) -> None:
         if os.name == "nt":
@@ -3432,6 +3553,7 @@ class DurableStateTests(unittest.TestCase):
         self.mutation(
             "finish", 8, "finish-replacement-workflow", "--summary", "done",
             "--validation", "passed",
+            "--review-waiver", "Replacement artifact was accepted after focused validation",
         )
 
     def test_claim_atomically_promotes_routed_pending_work_to_ready(self) -> None:

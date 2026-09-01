@@ -48,7 +48,8 @@ specialists never mutate the graph.
    and remaining-work load both stop through terminal-success bridges because downstream is
    concurrently runnable. Recompute after each claim rather than assuming the original frontier remains
    safe.
-9. Read each selected role TOML. Include native specification, effective requirements/outputs/
+9. Read `agents/roles/<role>.toml`, replacing `<role>` with each selected node's persisted role.
+   Include native specification, effective requirements/outputs/
    acceptance, and lineage provenance in its task packet. Run `node-claim` before delegation, then
    `node-start` after a child is definitely created, and `node-complete` only after inspecting outputs
    and acceptance evidence. Inline execution uses the same lifecycle and consumes the parent sequentially.
@@ -60,7 +61,9 @@ specialists never mutate the graph.
    integrated result, confirm every declared artifact scope has attempt-scoped change evidence anchored
    to the original repository filesystem object and remains materialized, then use one
    `workflow-complete` payload to satisfy exactly the active requirements and finish atomically. Close
-   the private session. Evidence-only
+   the private session. Completed artifact work must be covered by a successful evidence-only review
+   in its transitive dependency ancestry or the completion payload must contain a non-blank
+   `review_waiver` reason. Evidence-only
    nodes use persisted result/evidence and empty scope maps.
 
 ## Mutation boundaries and recovery
@@ -124,6 +127,12 @@ a clean review does not justify a replacement judge. Use parallel judges only fo
 risk surfaces, merge their findings into one set, and decide from that merged evidence whether another
 wave is warranted. There is no arbitrary numeric ceiling that hides a real defect, but there is a hard
 convergence rule: no new concrete finding, no new wave.
+
+A successful evidence-only `review` node covers completed artifact nodes in its transitive dependency
+ancestry. If any completed artifact work remains uncovered at closeout, `next` requires
+`review_waiver`; `workflow-complete` accepts that optional field only in this case and records its
+non-blank reason in a durable `review_waived` event. Advanced `finish` provides the equivalent
+`--review-waiver` option. Do not waive a known unresolved finding.
 
 An explicit user instruction to stop, accept, or finish overrides speculative quality expansion. Stop
 spawning immediately, reconcile or interrupt active providers, preserve completed evidence, and close

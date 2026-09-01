@@ -178,7 +178,9 @@ or result. Terminal-success bridges stop live dependency ordering and remaining-
 downstream is concurrently runnable, while repairable failed work retains its complexity. Do not leave
 a real slot idle when a compliant leaf can run. For every selected node:
 
-1. Read `agents/roles/ROLE.toml` from `SKILL_DIR`. Build one task packet containing its `description`
+1. Read `agents/roles/<role>.toml` from `SKILL_DIR`, replacing `<role>` with the node's persisted role;
+   for example, an `implementer` node uses `agents/roles/implementer.toml`. Build one task packet
+   containing its `description`
    and `developer_instructions` verbatim, plus the repository, node objective, dependencies, write
    scopes, native specification, effective requirements/outputs/acceptance, lineage provenance,
    required evidence, and a ban on graph mutation. Carried obligations remain acceptance commitments;
@@ -233,7 +235,12 @@ Review must converge on evidence. Default to one integrated review wave after im
 focused validation. Add another fix/revalidation wave only for a concrete acceptance-relevant finding
 with file or test evidence; reviewing a clean review is not itself a reason to spawn more judges.
 Parallel judges are justified only by explicitly distinct risk surfaces, and their findings must be
-merged before deciding on another wave. On an explicit user stop or acceptance instruction, stop
+merged before deciding on another wave. A successful evidence-only `review` node covers completed
+artifact work in its transitive dependency ancestry. Closeout rejects any other completed artifact
+work unless `workflow-complete` includes a non-blank `review_waiver` reason (or advanced `finish` uses
+`--review-waiver`); the state owner records that decision as a `review_waived` event. Use a waiver only
+for a deliberate stop or acceptance decision, never to hide an unresolved review finding. On an
+explicit user stop or acceptance instruction, stop
 spawning immediately, reconcile or interrupt active providers, and close with already-completed
 evidence—never reinterpret “finish” as permission for another quality wave.
 

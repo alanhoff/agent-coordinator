@@ -210,10 +210,19 @@ def _release_advisory_lock(descriptor: int) -> None:
 
 
 def _keys(value: Any, expected: set[str], field: str) -> Mapping[str, Any]:
+    return _keys_with_optional(value, expected, set(), field)
+
+
+def _keys_with_optional(
+    value: Any,
+    required: set[str],
+    optional: set[str],
+    field: str,
+) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise StateError(f"{field} must be an object")
-    unknown = set(value) - expected
-    missing = expected - set(value)
+    unknown = set(value) - required - optional
+    missing = required - set(value)
     if unknown or missing:
         detail = []
         if missing:
@@ -869,6 +878,52 @@ def _node_resolves_completion(node: Mapping[str, Any]) -> bool:
         node["status"] == "skipped"
         and (bool(node["lineage"]["child_ids"]) or node["superseded_by"] is not None)
     )
+
+
+def _dependency_ancestors(
+    state: Mapping[str, Any], node_ids: set[str]
+) -> set[str]:
+    ancestors: set[str] = set()
+    pending = list(node_ids)
+    while pending:
+        node_id = pending.pop()
+        if node_id in ancestors:
+            continue
+        ancestors.add(node_id)
+        pending.extend(state["nodes"][node_id]["dependencies"])
+    return ancestors
+
+
+def _unreviewed_artifact_node_ids(state: Mapping[str, Any]) -> list[str]:
+    """Return completed artifact work not covered by a successful review pass."""
+    targets = {
+        node_id
+        for node_id, node in state["nodes"].items()
+        if node["status"] == "done"
+        and bool(node["write_scopes"])
+    }
+    reviewed: set[str] = set()
+    for node_id, node in state["nodes"].items():
+        if (
+            node["status"] != "done"
+            or node["stage"] != "review"
+            or node["write_scopes"]
+        ):
+            continue
+        metadata = _runtime_metadata(state, node_id)
+        if metadata is not None and metadata.get("kind") == "judge":
+            target_id = metadata.get("judge_for")
+            gate = state["runtime_graph"]["gates"].get(target_id)
+            if (
+                target_id is None
+                or gate is None
+                or gate["verdicts"].get(node_id) != "pass"
+            ):
+                continue
+            reviewed.update(_dependency_ancestors(state, {target_id}))
+            continue
+        reviewed.update(_dependency_ancestors(state, set(node["dependencies"])))
+    return sorted(targets - reviewed)
 
 
 def _raw_over_budget(state: Mapping[str, Any], node: Mapping[str, Any]) -> bool:
@@ -3632,6 +3687,7 @@ def _finish_workflow_state(
     *,
     summary: str,
     validation: str,
+    review_waiver: str | None = None,
 ) -> dict[str, Any]:
     summary = _text(summary, "finish summary", maximum=4096)
     validation = _text(
@@ -3650,6 +3706,25 @@ def _finish_workflow_state(
     if any(item["status"] == "active" for item in state["blockers"]):
         raise StateError("all blockers must be resolved")
     _verify_finish_scopes(state)
+    unreviewed = _unreviewed_artifact_node_ids(state)
+    if unreviewed and review_waiver is None:
+        raise StateError(
+            "integrated review is required for completed artifact work or closeout "
+            "must include an explicit review waiver; unreviewed: "
+            + ", ".join(unreviewed)
+        )
+    if not unreviewed and review_waiver is not None:
+        raise StateError(
+            "review waiver is only valid when completed artifact work lacks "
+            "integrated review coverage"
+        )
+    if review_waiver is not None:
+        waiver = _text(review_waiver, "review waiver", maximum=4096)
+        add_event(
+            state,
+            "review_waived",
+            waiver + "; unreviewed artifact nodes: " + ", ".join(unreviewed),
+        )
     state["status"] = "completed"
     state["phase"] = "completed"
     return add_event(
@@ -5307,20 +5382,32 @@ def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
     active_blockers = sorted(
         item["id"] for item in state["blockers"] if item["status"] == "active"
     )
+    unreviewed = (
+        _unreviewed_artifact_node_ids(state) if not unresolved_nodes else []
+    )
+    closeout_required = ["summary", "validation", "requirements"]
+    if unreviewed:
+        closeout_required.append("review_waiver")
+    review_note = (
+        "; integrated review is missing for " + ", ".join(unreviewed)
+        if unreviewed
+        else ""
+    )
     if not unresolved_nodes and active_requirements and not active_blockers:
         return action(
             "complete_requirements",
-            "all work resolves; active requirements need evidence at closeout",
+            "all work resolves; active requirements need evidence at closeout"
+            + review_note,
             command="workflow-complete",
             requirement_ids=active_requirements,
-            required=["summary", "validation", "requirements"],
+            required=closeout_required,
         )
     if not unresolved_nodes and not active_requirements and not active_blockers:
         return action(
             "finish",
-            "all completion gates are resolved",
+            "all completion gates are resolved" + review_note,
             command="workflow-complete",
-            required=["summary", "validation", "requirements"],
+            required=closeout_required,
         )
     node_blockers = [
         item
@@ -6361,9 +6448,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         completion = _read_command_object(
             args.completion_json, args.completion_file, "completion"
         )
-        completion = _keys(
+        completion = _keys_with_optional(
             completion,
             {"summary", "validation", "requirements"},
+            {"review_waiver"},
             "completion",
         )
         summary = _text(completion["summary"], "completion.summary", maximum=4096)
@@ -6382,11 +6470,22 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             )
             for requirement_id, evidence in raw_evidence.items()
         }
+        review_waiver = (
+            None
+            if "review_waiver" not in completion
+            else _text(
+                completion["review_waiver"],
+                "completion.review_waiver",
+                maximum=4096,
+            )
+        )
         operation = {
             "summary": summary,
             "validation": validation,
             "requirements": requirement_evidence,
         }
+        if review_waiver is not None:
+            operation["review_waiver"] = review_waiver
 
         def complete_workflow(state: dict[str, Any]) -> dict[str, Any]:
             active = {
@@ -6414,6 +6513,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 state,
                 summary=summary,
                 validation=validation,
+                review_waiver=review_waiver,
             )
 
         state, result, replay = _mutate_command(
@@ -6427,13 +6527,21 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         )
 
     if command == "finish":
+        review_waiver = (
+            None
+            if args.review_waiver is None
+            else _text(args.review_waiver, "review waiver", maximum=4096)
+        )
         operation = {"summary": args.summary, "validation": args.validation}
+        if review_waiver is not None:
+            operation["review_waiver"] = review_waiver
 
         def finish(state: dict[str, Any]) -> dict[str, Any]:
             return _finish_workflow_state(
                 state,
                 summary=args.summary,
                 validation=args.validation,
+                review_waiver=review_waiver,
             )
 
         state, result, replay = _mutate_command(store, args, command, operation, finish)

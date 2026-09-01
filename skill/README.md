@@ -16,7 +16,9 @@ from `scripts/lib/coordinator`, so installation needs no repository checkout, as
   `plan-apply` → `next` → `node-route-auto` → `node-claim` → `node-start` → `node-complete` →
   `workflow-complete`. Runtime adaptation adds `node-observe`, `graph-reconcile`,
   `graph-expand-auto`, `judge-gate-add`, and `judge-complete`; low-level mutation commands remain
-  available for reconciliation and recovery.
+  available for reconciliation and recovery. Role packets load from `agents/roles/<role>.toml`.
+  Closeout requires integrated review coverage for completed artifact work or an explicit
+  `review_waiver` reason, which is persisted as a `review_waived` event.
 - `scripts/model_router.py choose` for direct evidence-based role and runtime-candidate selection when
   testing or integrating the selector independently.
 

@@ -659,6 +659,52 @@ class DynamicRuntimeTests(unittest.TestCase):
             {judge_id: "pass"},
         )
 
+    def test_passing_review_judge_covers_gated_artifact_closeout(self) -> None:
+        self.apply(manifest("reviewed-gate", scopes=["src/reviewed-gate"]))
+        gate = {
+            "mode": "all",
+            "required": 1,
+            "judges": [
+                manifest(
+                    "reviewed-gate.review",
+                    stage="review",
+                    role="reviewer",
+                )
+            ],
+            "loop": None,
+        }
+        self.mutate(
+            "judge-gate-add",
+            "--node-id",
+            "reviewed-gate",
+            "--gate-json",
+            json.dumps(gate),
+        )
+        self.start("reviewed-gate")
+        artifact = self.repo / "src" / "reviewed-gate"
+        artifact.mkdir(parents=True)
+        (artifact / "result.txt").write_text("reviewed\n", encoding="utf-8")
+        self.complete("reviewed-gate")
+        self.judge("reviewed-gate.review", "pass")
+
+        closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
+        self.assertNotIn("review_waiver", closeout["required"])
+        completion = {
+            "summary": "gated artifact reviewed",
+            "validation": "review judge passed",
+            "requirements": {},
+        }
+        self.mutate(
+            "workflow-complete",
+            "--completion-json",
+            json.dumps(completion),
+        )
+        completed = StateStore().load(self.workflow_id)
+        self.assertEqual(completed["status"], "completed")
+        self.assertFalse(
+            any(event["kind"] == "review_waived" for event in completed["events"])
+        )
+
     def test_failed_gate_can_materialize_a_bounded_logical_cycle_as_acyclic_iterations(self) -> None:
         self.apply(manifest("loop-target"), manifest("after-loop", dependencies=["loop-target"]))
         plan = self.gate_plan(

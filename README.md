@@ -208,25 +208,29 @@ Windows state lives under `%USERPROFILE%\.agent-coordinator\workflows`.
 <details>
 <summary>Docker demo</summary>
 
-The demo uses a pinned OpenAI Codex universal image and requires `OPENAI_API_KEY` in the ignored root `.env` file. Skill and source mounts are read-only; mutable output stays under the ignored `data/` directory.
+The demo builds a disposable Node.js container, installs Codex in it, and mounts this repository's Coordinator skill read-only. Set `OPENAI_API_KEY` in the ignored `demo/.env` file:
 
-Generate the backend with Coordinator:
-
-```sh
-docker compose run --rm coordinator
+```dotenv
+OPENAI_API_KEY=your-api-key
 ```
 
-`data/project/` must be fresh; an existing regular `.nvmrc` is the only allowed top-level entry. Preserve anything you need before clearing `data/` for another run.
-
-The generated application is in `data/project/`, with its backend in `data/project/backend/`. Codex sessions, Coordinator state, and SQLite data use sibling directories, and the generated application remains outside automated repository verification.
-
-Start the generated backend manually:
+Run the demo from the repository root:
 
 ```sh
-docker compose up backend
+cd demo
+./run.sh
 ```
 
-The API is then available at `http://localhost:3000`, and its SQLite database persists at `data/sqlite/todos.db`.
+Each run deletes `demo/home/` before generating a fresh application, so preserve any output you need before running it again.
+
+The generated application and its `todos.db` database remain in `demo/home/app/`. Coordinator state is stored in `demo/home/state/`, and Codex state is stored in `demo/home/codex/`. Compose resources are removed when the run finishes, while these bind-mounted files remain available for inspection.
+
+The generated project provides its own `npm start` command. Run it with a current Node.js release:
+
+```sh
+cd demo/home/app
+npm start
+```
 
 </details>
 

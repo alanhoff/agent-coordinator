@@ -196,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish = _subcommand(sub, "finish", mutate=True)
     finish.add_argument("--summary", required=True)
     finish.add_argument("--validation", required=True)
+    finish.add_argument("--review-waiver")
     complete_workflow = _subcommand(sub, "workflow-complete", mutate=True)
     completion = complete_workflow.add_mutually_exclusive_group(required=True)
     completion.add_argument("--completion-json")

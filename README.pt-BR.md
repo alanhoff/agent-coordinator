@@ -212,25 +212,29 @@ No Windows, o estado fica em `%USERPROFILE%\.agent-coordinator\workflows`.
 <details>
 <summary>Demonstração com Docker</summary>
 
-A demonstração usa uma versão fixada da imagem universal do OpenAI Codex e requer `OPENAI_API_KEY` no arquivo `.env` ignorado na raiz. As montagens da skill e do código-fonte são somente leitura; a saída mutável permanece no diretório ignorado `data/`.
+A demonstração cria um contêiner descartável do Node.js, instala o Codex nele e monta como somente leitura a skill Coordinator deste repositório. Defina `OPENAI_API_KEY` no arquivo ignorado `demo/.env`:
 
-Gere o backend com o Coordinator:
-
-```sh
-docker compose run --rm coordinator
+```dotenv
+OPENAI_API_KEY=sua-chave-de-api
 ```
 
-`data/project/` deve estar limpo; um arquivo regular `.nvmrc` já existente é a única entrada permitida no nível superior. Preserve tudo o que for necessário antes de esvaziar `data/` para outra execução.
-
-O aplicativo gerado fica em `data/project/`, com o backend em `data/project/backend/`. As sessões do Codex, o estado do Coordinator e os dados do SQLite usam diretórios no mesmo nível, e o aplicativo gerado permanece fora da verificação automatizada do repositório.
-
-Inicie o backend gerado manualmente:
+Execute a demonstração a partir da raiz do repositório:
 
 ```sh
-docker compose up backend
+cd demo
+./run.sh
 ```
 
-A API estará disponível em `http://localhost:3000`, e o banco de dados SQLite persistirá em `data/sqlite/todos.db`.
+Cada execução exclui `demo/home/` antes de gerar uma nova aplicação. Preserve qualquer saída necessária antes de executar novamente.
+
+A aplicação gerada e seu banco de dados `todos.db` permanecem em `demo/home/app/`. O estado do Coordinator é armazenado em `demo/home/state/`, e o estado do Codex em `demo/home/codex/`. Os recursos do Compose são removidos quando a execução termina, enquanto esses arquivos montados permanecem disponíveis para inspeção.
+
+O projeto gerado fornece seu próprio comando `npm start`. Execute-o com uma versão atual do Node.js:
+
+```sh
+cd demo/home/app
+npm start
+```
 
 </details>
 
