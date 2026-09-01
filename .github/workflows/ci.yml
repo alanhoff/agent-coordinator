@@ -21,6 +21,17 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
+      - name: Validate release version
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+
+          value = pathlib.Path("VERSION").read_bytes()
+          pattern = rb"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\n"
+          if re.fullmatch(pattern, value) is None:
+              raise SystemExit("VERSION must contain one stable MAJOR.MINOR.PATCH value and a newline")
+          PY
       - name: Install pinned development linter
         run: python -m pip install --disable-pip-version-check --no-cache-dir ruff==0.16.2
       - name: Lint
@@ -53,3 +64,175 @@ jobs:
         run: python -m compileall -q skill/scripts tests
       - name: Confirm the checkout stayed clean
         run: python -c "import subprocess; result=subprocess.run(['git','status','--porcelain','--untracked-files=all'],check=True,text=True,stdout=subprocess.PIPE); assert not result.stdout,result.stdout"
+
+  release:
+    name: Release / GitHub
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect a version change
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            changed=true
+          else
+            set +e
+            git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- VERSION
+            diff_status=$?
+            set -e
+            case "$diff_status" in
+              0) changed=false ;;
+              1) changed=true ;;
+              *) exit "$diff_status" ;;
+            esac
+          fi
+
+          printf 'changed=%s\n' "$changed" >> "$GITHUB_OUTPUT"
+      - name: Build and validate the skill archive
+        if: steps.version.outputs.changed == 'true'
+        id: archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          archive="$RUNNER_TEMP/coordinator-$VERSION.zip"
+          git archive --format=zip --prefix=coordinator/ \
+            --output "$archive" "$GITHUB_SHA:skill"
+
+          ARCHIVE="$archive" python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          archive_path = pathlib.Path(os.environ["ARCHIVE"])
+          source_commit = os.environ["GITHUB_SHA"]
+          tracked = subprocess.run(
+              ["git", "ls-tree", "-r", "--name-only", source_commit, "skill"],
+              check=True,
+              stdout=subprocess.PIPE,
+              text=True,
+          ).stdout.splitlines()
+          expected = {
+              "coordinator/" + path.removeprefix("skill/"): path
+              for path in tracked
+          }
+
+          with zipfile.ZipFile(archive_path) as package:
+              if package.testzip() is not None:
+                  raise SystemExit("skill archive failed its CRC check")
+              files = [entry.filename for entry in package.infolist() if not entry.is_dir()]
+              if len(files) != len(set(files)) or set(files) != set(expected):
+                  raise SystemExit("skill archive inventory differs from the tracked skill tree")
+              for archived, source in expected.items():
+                  content = subprocess.run(
+                      ["git", "show", f"{source_commit}:{source}"],
+                      check=True,
+                      stdout=subprocess.PIPE,
+                  ).stdout
+                  if package.read(archived) != content:
+                      raise SystemExit(f"skill archive content differs for {archived}")
+          PY
+
+          printf 'path=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+          printf 'name=%s\n' "$(basename "$archive")" >> "$GITHUB_OUTPUT"
+      - name: Publish and verify the GitHub Release
+        if: steps.version.outputs.changed == 'true'
+        env:
+          ASSET_NAME: ${{ steps.archive.outputs.name }}
+          ASSET_PATH: ${{ steps.archive.outputs.path }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+
+          resolve_tag_commit() {
+            git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" |
+              awk -v direct="refs/tags/$tag" -v peeled="refs/tags/$tag^{}" '
+                $2 == direct { unpeeled = $1 }
+                $2 == peeled { print $1; found = 1 }
+                END { if (!found && unpeeled) print unpeeled }
+              '
+          }
+
+          verify_release() {
+            tag_commit="$(resolve_tag_commit)"
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              printf 'tag %s targets %s instead of %s\n' "$tag" "$tag_commit" "$GITHUB_SHA" >&2
+              return 1
+            fi
+
+            release_json="$RUNNER_TEMP/release.json"
+            gh release view "$tag" \
+              --json tagName,name,isDraft,isPrerelease,body,assets > "$release_json"
+            RELEASE_JSON="$release_json" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          release = json.loads(pathlib.Path(os.environ["RELEASE_JSON"]).read_text())
+          version = os.environ["VERSION"]
+          expected_asset = os.environ["ASSET_NAME"]
+          if release["tagName"] != f"v{version}":
+              raise SystemExit("release tag does not match VERSION")
+          if release["name"] != f"Agent Coordinator v{version}":
+              raise SystemExit("release title does not match VERSION")
+          if release["isDraft"] or release["isPrerelease"]:
+              raise SystemExit("release must be stable and published")
+          if not release["body"].strip():
+              raise SystemExit("generated release notes are empty")
+          if [asset["name"] for asset in release["assets"]] != [expected_asset]:
+              raise SystemExit("release asset inventory is not exact")
+          PY
+
+            latest_tag="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)"
+            if [ "$latest_tag" != "$tag" ]; then
+              printf 'latest release is %s instead of %s\n' "$latest_tag" "$tag" >&2
+              return 1
+            fi
+
+            download_dir="$RUNNER_TEMP/release-readback"
+            mkdir "$download_dir"
+            gh release download "$tag" --pattern "$ASSET_NAME" --dir "$download_dir"
+            cmp "$ASSET_PATH" "$download_dir/$ASSET_NAME"
+          }
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            verify_release
+            exit 0
+          fi
+
+          tag_commit="$(resolve_tag_commit)"
+          release_args=(
+            "$tag"
+            "$ASSET_PATH#Coordinator skill v$VERSION"
+            --title "Agent Coordinator v$VERSION"
+            --generate-notes
+            --latest
+          )
+          if [ -z "$tag_commit" ]; then
+            release_args+=(--target "$GITHUB_SHA")
+          elif [ "$tag_commit" = "$GITHUB_SHA" ]; then
+            release_args+=(--verify-tag)
+          else
+            printf 'tag %s already targets %s instead of %s\n' "$tag" "$tag_commit" "$GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          if ! gh release create "${release_args[@]}"; then
+            gh release view "$tag" >/dev/null
+          fi
+          verify_release
