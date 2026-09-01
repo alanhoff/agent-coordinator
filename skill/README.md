@@ -18,7 +18,9 @@ from `scripts/lib/coordinator`, so installation needs no repository checkout, as
   `graph-expand-auto`, `judge-gate-add`, and `judge-complete`; low-level mutation commands remain
   available for reconciliation and recovery. Role packets load from `agents/roles/<role>.toml`.
   Closeout requires integrated review coverage for completed artifact work or an explicit
-  `review_waiver` reason, which is persisted as a `review_waived` event.
+  `review_waiver` reason, which is persisted as a `review_waived` event. Schema-v8 nodes also require
+  descriptive evidence plus positive and negative proof commands; closeout reruns every non-exempt
+  node's pair and succeeds only when positive exits zero and negative exits nonzero.
 - `scripts/model_router.py choose` for direct evidence-based role and runtime-candidate selection when
   testing or integrating the selector independently.
 

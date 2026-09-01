@@ -48,12 +48,16 @@ python3 "$SKILL_DIR/scripts/coordinator_state.py" plan-apply \
 ```
 
 Each node has an execution specification, acceptance criteria, zero or more repository-relative write
-scopes, one role, and a rubric-v2 assessment. Valid stages are `architecture`, `design`,
+scopes, one role, a rubric-v2 assessment, descriptive `evidence`, and positive and negative proof
+commands. The positive command must demonstrate the accepted behavior and print non-blank output; the
+negative command must independently detect its absence, not merely exit nonzero unconditionally. Make
+both commands repeatable and idempotent because they run
+at node completion and again at workflow closeout. Valid stages are `architecture`, `design`,
 `documentation`, `fix`, `implementation`, `integration`, `research`, `review`, and `validation`.
 Omit write scopes only for evidence-only work that will not change repository artifacts, and score its
 `change_surface` as 0. Any positive `change_surface` requires at least one scope, and any declared
 scope requires a positive `change_surface`; the state owner rejects mismatches. The workflow's
-schema-v7 conventions default `node_complexity_split_threshold` to 6,
+schema-v8 conventions default `node_complexity_split_threshold` to 6,
 `dimension_complexity_split_threshold` to 3, `node_ambiguity_refine_threshold` to 4,
 `factor_ambiguity_refine_threshold` to 2, and `max_refinement_depth` to 8. Thresholds are inclusive:
 reaching one requires another planning mutation. Independent nodes may not overlap scopes.
@@ -66,6 +70,9 @@ python3 "$SKILL_DIR/scripts/coordinator_state.py" node-add \
   --write-scope src/api --role implementer \
   --objective "Implement the accepted API behavior" --output "Working API implementation" \
   --acceptance "Focused API tests pass" --breadth 2 --change-surface 2 --coupling 1 \
+  --evidence "Focused API tests demonstrate the accepted behavior" \
+  --evidence-positive-proof-command "npm test -- --runInBand api" \
+  --evidence-negative-proof-command "test ! -f src/api/index.ts" \
   --novelty 1 --verification 2 \
   --ambiguity-objective 0 --ambiguity-inputs 0 --ambiguity-boundaries 0 \
   --ambiguity-dependencies 0 --ambiguity-acceptance 0 \
@@ -82,7 +89,8 @@ assessable leaf whose assessment is `stale`, `refinement_required`, or `split_re
 1. Reassess stale work against the current specification and effective obligations; requirements;
    dependency effective outputs, normalized terminal disposition, result, and evidence; scopes; and
    planning conventions. Use `node-refine --node-id ...
-   (--refinement-json|--refinement-file)` to atomically persist clarified or reassessed inputs.
+   (--refinement-json|--refinement-file)` to atomically persist clarified or reassessed inputs. A
+   refinement of a schema-v8 node replaces all three planned proof fields as part of that exact payload.
 2. Resolve ambiguity through concrete inputs and refine the leaf. Resolve or remove every open question
    before launch; keep bounded non-decision uncertainty in the ambiguity score. A factor of 2–4 must
    identify at least one open question, and every open question requires a factor of at least 2.
@@ -153,9 +161,10 @@ assessment.
 Record `node-observe` only when execution reveals material new evidence: current progress, remaining
 five-dimension complexity, remaining ambiguity, cost, confidence, signals, and a note. The state owner
 derives `stable`, `refine`, or `split`; never author or edit that recommendation. Progress is monotonic.
-When `next` returns `reconcile_runtime`, run `graph-reconcile` to adapt exactly one highest-live-load
-actionable leaf and then inspect the new graph. It may checkpoint running work and replace it with a
-bounded discovery → execution pipeline. For a known topology, use `graph-expand-auto`; auto mode may
+When `next` returns `reconcile_runtime`, run `graph-reconcile` with an exact discovery/execution proof
+bundle to adapt exactly one highest-live-load actionable leaf and then inspect the new graph. It may
+checkpoint running work and replace it with a bounded discovery → execution pipeline. For a known
+topology, use `graph-expand-auto`; auto mode may
 choose pipeline, parallel, fan-out/fan-in, map/reduce, diamond, or arbitrary acyclic DAG. Keep explicit
 fragments bounded and deterministic. Nested expansions preserve graph paths. Persisted dependencies
 must remain acyclic; recurrence uses versioned iterations, never back-edges.
@@ -183,7 +192,8 @@ a real slot idle when a compliant leaf can run. For every selected node:
    containing its `description`
    and `developer_instructions` verbatim, plus the repository, node objective, dependencies, write
    scopes, native specification, effective requirements/outputs/acceptance, lineage provenance,
-   required evidence, and a ban on graph mutation. Carried obligations remain acceptance commitments;
+   planned evidence and both proof commands, and a ban on graph mutation. Carried obligations remain
+   acceptance commitments;
    do not hide them behind the child's narrower native fields. This packet is the specialist profile;
    do not depend on a globally registered agent.
 2. Confirm the current tool surface. Treat delegation as enabled only when a subagent creation or
@@ -202,9 +212,11 @@ a real slot idle when a compliant leaf can run. For every selected node:
    `node-update` to persist `reconcile_required` and inspect the provider edge. Bind the existing child
    if found; bind the inline executor only after proving no child exists. Never duplicate uncertain work.
 6. Inspect actual outputs and run the node acceptance checks. Then use `node-complete` with `succeeded`
-   or `failed`, file-backed result/evidence when multiline, and optional actual cost. It validates scope
-   evidence and records the terminal attempt in one mutation. Reassess affected work to the fixed point
-   before its next route.
+   or `failed` and optional actual cost. While holding the mutation fence, the state owner validates
+   artifact changes, runs the node's positive proof followed by its negative proof, and accepts only the
+   exit-code pair matching the declared outcome. It stores only the positive command's combined output
+   as `result`, records proof metadata, and re-fingerprints successful artifact scopes after proof side
+   effects. Reassess affected work to the fixed point before its next route.
 
 Monitor delegated work according to expected duration. Inline nodes run sequentially in the parent;
 do not count them as parallel. Serialize overlapping write ownership in both modes. A reported frontier
@@ -219,7 +231,10 @@ and completes the workflow atomically without resupplying immutable requirement 
 `requirement-set` plus `finish` for incremental or advanced recovery. Completion succeeds only when
 every runtime node is `done`, every decomposed parent is `skipped`, every superseded leaf is `skipped`,
 and no ordinary `cancelled` node remains; all requirements and blockers are resolved, validation is
-recorded, and all artifact evidence remains valid.
+recorded, and all artifact evidence remains valid. Closeout reruns both commands for every non-exempt
+graph record in deterministic node-ID order, including decomposed and superseded history, and requires
+positive exit `0` plus negative nonzero for each. There is no proof waiver. A failed closeout leaves
+durable workflow state unchanged, although proof-command filesystem side effects cannot be rolled back.
 A node can become blocked only before its launch is claimed; pending and blocked nodes never retain an
 active launch.
 When a launch is claimed, the state owner fingerprints every declared artifact scope. A `done`
@@ -227,7 +242,7 @@ transition requires each declared scope to be a materialized regular file or dir
 changed during that attempt; the before/after evidence remains in the attempt record. Each snapshot
 is rooted in the persisted repository filesystem identity, using anchored descriptor traversal where
 supported. Both `workflow-complete` and `finish` recheck that every done artifact scope remains materialized. Evidence-only nodes declare no write scopes and
-must have `change_surface=0`; they finish using their persisted result and evidence. Coordinator does not invoke or inspect a
+must have `change_surface=0`; they use the same proof execution contract. Coordinator does not invoke or inspect a
 version-control system. An explicitly deleted path cannot itself be a completed scope; deletion work
 must declare a containing directory that remains materialized or be modeled as evidence-only work.
 

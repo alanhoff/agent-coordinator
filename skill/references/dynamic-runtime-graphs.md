@@ -1,6 +1,7 @@
 # Dynamic runtime graph contract
 
-Coordinator schema version 7 adds a parent-owned runtime control plane. Workers may report evidence,
+Coordinator's runtime control plane, introduced in schema version 7 and proof-enforced in version 8,
+is parent-owned. Workers may report evidence,
 but only the state owner derives projections, selects a rewrite, materializes topology, moves a gate,
 creates another iteration, or persists a verdict. Every command below uses the ordinary private session,
 unique mutation ID, exact expected revision, state lock, receipt, and complete-state validation.
@@ -56,10 +57,28 @@ descending live remaining critical-path load and stable node ID, then rewrites e
 default rewrite is a discovery → execution pipeline. A consistent running attempt is first closed as
 `adapted at runtime`; claimed, bound, and reconciliation-required launches cannot be adapted.
 
+`graph-reconcile` requires an exact proof plan for both generated nodes:
+
+```json
+{
+  "discovery": {
+    "evidence": "Discovery output bounds the remaining work",
+    "evidence_positive_proof_command": "python -m unittest tests.test_discovery",
+    "evidence_negative_proof_command": "test ! -f docs/discovery.md"
+  },
+  "execution": {
+    "evidence": "Focused checks demonstrate the bounded implementation",
+    "evidence_positive_proof_command": "python -m unittest tests.test_runtime_work",
+    "evidence_negative_proof_command": "test ! -f src/runtime_work.py"
+  }
+}
+```
+
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" graph-reconcile \
   --workflow-id WORKFLOW --session-file /private/path/session.json \
-  --mutation-id reconcile-runtime-001 --expected-revision REVISION --json
+  --mutation-id reconcile-runtime-001 --expected-revision REVISION \
+  --proof-plan-file /private/path/reconcile-proofs.json --json
 ```
 
 ## Explicit runtime expansion and shape selection
@@ -86,6 +105,9 @@ contains two through sixteen ordinary strict plan-node manifests. `join` is anot
       "model": null,
       "effort": null,
       "acceptance": ["Adapter A focused checks pass"],
+      "evidence": "Focused checks demonstrate adapter A",
+      "evidence_positive_proof_command": "python -m unittest tests.test_adapter_a",
+      "evidence_negative_proof_command": "test ! -f src/adapter_a.py",
       "route_rationale": "Route after materialization",
       "estimated_cost": null,
       "spec": {
@@ -126,6 +148,9 @@ contains two through sixteen ordinary strict plan-node manifests. `join` is anot
       "model": null,
       "effort": null,
       "acceptance": ["Adapter B focused checks pass"],
+      "evidence": "Focused checks demonstrate adapter B",
+      "evidence_positive_proof_command": "python -m unittest tests.test_adapter_b",
+      "evidence_negative_proof_command": "test ! -f src/adapter_b.py",
       "route_rationale": "Route after materialization",
       "estimated_cost": null,
       "spec": {
@@ -167,6 +192,9 @@ contains two through sixteen ordinary strict plan-node manifests. `join` is anot
     "model": null,
     "effort": null,
     "acceptance": ["Both adapters pass integrated checks"],
+    "evidence": "Integrated checks demonstrate both adapters together",
+    "evidence_positive_proof_command": "python -m unittest tests.test_adapter_integration",
+    "evidence_negative_proof_command": "python tests/prove_adapter_integration_absent.py",
     "route_rationale": "Route after materialization",
     "estimated_cost": null,
     "spec": {
@@ -246,6 +274,9 @@ extended with the target automatically.
       "model": null,
       "effort": null,
       "acceptance": ["Verdict cites contract evidence"],
+      "evidence": "Contract validation independently demonstrates conformance",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_contract",
+      "evidence_negative_proof_command": "python tests/prove_api_contract_violation.py",
       "route_rationale": "Independent validation gate",
       "estimated_cost": null,
       "spec": {
@@ -286,6 +317,9 @@ extended with the target automatically.
       "model": null,
       "effort": null,
       "acceptance": ["Verdict cites regression evidence"],
+      "evidence": "Regression checks independently demonstrate compatibility",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_regression",
+      "evidence_negative_proof_command": "python tests/prove_api_regression.py",
       "route_rationale": "Independent review gate",
       "estimated_cost": null,
       "spec": {
@@ -324,21 +358,22 @@ For `all`, `required` equals the judge count. For `any`, it equals 1. For `quoru
 panel size. Coordinator intentionally records the complete panel before resolving any mode, preserving
 a full audit and preventing an unreported judge from disappearing after an early mathematical result.
 
-When the gated target succeeds, its launch becomes terminal and status becomes `judging`. Candidate
-result and evidence are retained on the target but are excluded from downstream dependency digests
-until resolution. Route and execute judges through the ordinary claim/start lifecycle, then replace
+When the gated target's completion proof agrees with `succeeded`, its launch becomes terminal and
+status becomes `judging`. Its positive proof output is retained as the candidate `result` but excluded
+from downstream dependency digests until resolution; planned evidence and proof commands remain part
+of the contract. Route and execute judges through the ordinary claim/start lifecycle, then replace
 `node-complete` with `judge-complete` for the terminal verdict:
 
 ```sh
 python3 "$SKILL_DIR/scripts/coordinator_state.py" judge-complete \
   --workflow-id WORKFLOW --session-file /private/path/session.json \
   --mutation-id judge-contract-001 --expected-revision REVISION \
-  --node-id api-contract-judge --verdict pass \
-  --result-file /private/path/judge-result.txt \
-  --evidence-file /private/path/judge-evidence.txt --json
+  --node-id api-contract-judge --verdict pass --json
 ```
 
-A passing policy makes the target `done`. A failed gate without a loop makes it `failed`.
+The verdict must agree with the judge's proof pair: `pass` requires positive `0` and negative nonzero;
+`fail` requires positive nonzero and negative `0`. A passing policy makes the target `done`. A failed
+gate without a loop makes it `failed`.
 
 ## Bounded feedback without persisted cycles
 
@@ -355,6 +390,34 @@ panel rejects an iteration and capacity remains, the state owner:
 This is a logical cycle implemented as finite, versioned acyclic iterations. It never introduces
 a dependency back-edge. If the hard limit is reached, the target is `failed` and the loop is
 `exhausted`.
+
+For proof-enforced loops, each clone inherits the target and judge proof contracts. A loop migrated
+from v6 or v7 is proof-exempt history; before it can create another iteration, `judge-complete` requires
+`--next-iteration-proof-json` or `--next-iteration-proof-file`. That exact object contains `target` and
+`judges`; `target` is one proof contract, while `judges` maps every prior judge ID to one proof contract.
+The newly created iteration is proof-enforced.
+
+```json
+{
+  "target": {
+    "evidence": "The repaired iteration satisfies the API contract",
+    "evidence_positive_proof_command": "python -m unittest tests.test_api_contract",
+    "evidence_negative_proof_command": "python tests/prove_api_contract_violation.py"
+  },
+  "judges": {
+    "api-contract-judge": {
+      "evidence": "Independent validation confirms the repaired contract",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_contract",
+      "evidence_negative_proof_command": "python tests/prove_api_contract_violation.py"
+    },
+    "api-regression-judge": {
+      "evidence": "Independent regression checks confirm compatibility",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_regression",
+      "evidence_negative_proof_command": "python tests/prove_api_regression.py"
+    }
+  }
+}
+```
 
 ## Structural fences and capacity
 

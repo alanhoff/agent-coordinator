@@ -1,15 +1,17 @@
 # Workflow state and recovery
 
-Coordinator stores one bounded `schema-v7` JSON document with `schema_version` equal to 7 per
-workflow under `~/.agent-coordinator/workflows`. Exact schema-version-6 documents are upgraded in
-memory with an empty runtime graph and are persisted as version 7 only by the next successful mutation. The state owner validates the complete document on
+Coordinator stores one bounded `schema-v8` JSON document with `schema_version` equal to 8 per
+workflow under `~/.agent-coordinator/workflows`. Exact schema-version-6 documents first gain the v7
+runtime graph, and exact v6 or v7 documents then upgrade in memory to v8. Every pre-existing node is
+permanently marked `proof_exempt=true`; the upgrade is persisted only by the next successful mutation.
+Every node created after migration is proof-enforced. The state owner validates the complete document on
 every read and before every persisted mutation. It rejects unknown fields, unsafe identifiers and write paths,
 missing or cyclic dependencies, concurrent scope collisions, invalid transitions, inconsistent
 execution state, and capacity violations.
 
 ## Runtime graph control plane
 
-Schema version 7 adds one exact-key `runtime_graph` object:
+The runtime control plane introduced in schema version 7 remains one exact-key `runtime_graph` object:
 
 - `generation`: the latest monotonically increasing adaptation generation;
 - `observations`: up to 64 timestamped live observations per node;
@@ -54,9 +56,21 @@ Workflow `conventions` contains the execution capacity settings plus these integ
 
 All four split/refinement thresholds are inclusive. A value at a threshold is not executable.
 
-Every node contains `spec`, `assessment`, and `lineage` alongside its execution fields. Exact-key
-validation applies at every level. `write_scopes` contains zero through 32 repository-relative paths;
+Every node contains `spec`, `assessment`, `lineage`, `evidence`,
+`evidence_positive_proof_command`, `evidence_negative_proof_command`, `proof_exempt`, and `proof`
+alongside its execution fields. Exact-key validation applies at every level. `write_scopes` contains
+zero through 32 repository-relative paths;
 an empty list declares evidence-only work with no repository artifact change.
+
+For every new node, the three planned proof fields are required non-blank strings and
+`proof_exempt=false`; callers cannot request an exemption. `evidence` is the planned human-readable
+description of what the commands establish; lifecycle transitions never replace it, while an eligible
+refinement replaces the complete planned proof contract. `result` remains a string but, for proof-enforced nodes,
+is state-owner-derived exclusively from the positive command's combined standard output and error.
+`proof` is either `null` or an exact object with `phase`, integer `positive_exit_code`, integer
+`negative_exit_code`, and `verified_at`. Phase is `node_completion` or `workflow_completion`.
+Legacy-exempt nodes have null proof commands and `proof`, retain their prior result/evidence behavior,
+and are the only nodes for which terminal APIs accept caller-provided result or evidence.
 
 `spec` contains `objective`, `inputs`, `outputs`, `constraints`, `non_goals`, `requirement_ids`, and
 `open_questions`. `assessment` contains `rubric_version`, `dimensions`, `total`,
@@ -93,7 +107,8 @@ and each carried obligation's combined decomposition-coverage and supersede grap
 path to a live leaf, active launch, repairable failed leaf, or `done` resolver. A dead end or cycle-only
 resolution is invalid.
 
-`input_digest` is derived from native specification and acceptance, carried obligations and linked
+`input_digest` is derived from native specification and acceptance, the planned evidence and proof
+commands for proof-enforced nodes, carried obligations and linked
 effective requirement text/source, write scopes, dimension and ambiguity inputs, planning conventions, and each
 dependency's identity, effective outputs, normalized terminal disposition, result, and evidence. A
 dependency disposition is its exact `done`, `failed`, `skipped`, or `cancelled` status, or
@@ -163,7 +178,8 @@ retry reconciliation idempotent; reuse of an ID for different content and stale 
 Atomic replacement and durability flushing ensure readers observe a complete old or new snapshot.
 Receipts stay in that snapshot up to its explicit bound; `reconcile-mutation` distinguishes a recorded
 mutation from one absent from persisted state. Capacity exhaustion is explicit rather than hidden behind
-a second persistence format.
+a second persistence format. Proof commands execute while the same workflow mutation fence is held;
+receipt replay returns the recorded response without rerunning them.
 
 One controller session owns an epoch, while immutable `origin_session_id` scopes initialization replay.
 Bearer values exist only in the caller-selected private file and private session registry, never in
@@ -184,7 +200,9 @@ attempt records `scope_evidence` with distinct before/after fingerprints for eve
 The after value exists only for a materialized regular file or directory; directory fingerprints cover
 its deterministic structure, file contents, modes, and link targets without following links. Fields
 are length-framed, file contents enter as fixed-size digests, and filesystem names use their native byte
-encoding, so valid trees have an unambiguous representation. Workflow completion rechecks that every
+encoding, so valid trees have an unambiguous representation. Successful node completion first confirms
+that every scope changed, then runs proofs, and finally re-fingerprints the scopes so permitted test or
+build side effects become the recorded final state. Workflow completion rechecks that every
 done artifact scope remains materialized. Repository identity combines the canonical path with the
 filesystem object's stable device and file identity. Every snapshot checks that identity; POSIX
 fingerprinting opens the root without following links and traverses relative to that anchored
@@ -202,6 +220,23 @@ combined finish summary,
 separator, and validation text must fit the event-size bound. Skipped and cancelled nodes do not claim artifact evidence. Only a
 `skipped` decomposed parent or `skipped` superseded leaf resolves without runtime completion; a
 `cancelled` node never satisfies workflow completion.
+
+Proof commands run sequentially through the platform shell at the repository root with the inherited
+environment, positive first. Each command has a five-minute timeout and a 32 KiB combined-output
+limit. Timeout, launch failure, invalid UTF-8, output overflow, or blank positive output rejects the
+mutation. A successful node or passing judge requires positive exit `0` and negative nonzero; a failed
+node or failing judge requires positive nonzero and negative `0`. Equal-polarity pairs are inconclusive
+and rejected atomically. The state owner compares only exit codes, so the negative command must express
+a real failure condition rather than return a constant nonzero status. Negative output is bounded and
+validated but never persisted.
+
+Both `finish` and `workflow-complete` rerun every non-exempt graph record in sorted node-ID order,
+including decomposed and superseded nodes. Every pair must prove success. Closeout replaces each such
+node's `result` and `proof` with the latest positive output and `workflow_completion` metadata,
+preserves historical statuses and verdicts, refreshes derived assessment digests, and rechecks artifact
+scopes before marking the workflow complete. No proof waiver exists. A failure leaves durable state
+unchanged, although shell-command side effects cannot be rolled back; proof commands therefore must be
+repeatable and idempotent.
 
 Read-only `list`, `status`, `context`, and `next` operations never create, lock, repair, normalize, cache, or
 clean state.

@@ -73,7 +73,8 @@ states produced by add, refine, or split are rejected when they strand such a le
 two-child capacity. Children may require another split only when both depth and the global reserve
 remain sufficient.
 
-The digest covers native specification and acceptance; carried lineage obligations and their effective
+The digest covers native specification and acceptance; planned evidence and proof commands for
+proof-enforced nodes; carried lineage obligations and their effective
 requirement text/source; write scopes; score inputs; ambiguity factors; planning policy; and each dependency's identity,
 effective outputs, normalized terminal disposition, result, and evidence. Disposition is `done`,
 `failed`, `skipped`, or `cancelled` for terminal work and `nonterminal` otherwise. Nonterminal status
@@ -99,6 +100,9 @@ snapshot instead of copying the former score.
     "open_questions": []
   },
   "acceptance": ["Observable proof of the bounded outcome"],
+  "evidence": "Focused checks demonstrate the bounded outcome",
+  "evidence_positive_proof_command": "python -m unittest tests.test_api",
+  "evidence_negative_proof_command": "test ! -f repository/relative/path",
   "write_scopes": ["repository/relative/path"],
   "assessment": {
     "dimensions": {
@@ -120,8 +124,9 @@ snapshot instead of copying the former score.
 }
 ```
 
-The mutation atomically replaces the eligible leaf's native specification, current write scopes, and
-assessment inputs. Before replacement, its full effective objective, requirements, inputs, outputs,
+The mutation atomically replaces the eligible leaf's native specification, current write scopes,
+planned evidence and proof commands, and assessment inputs. Before replacement, its full effective
+objective, requirements, inputs, outputs,
 constraints, non-goals, acceptance checks, and scope provenance are copied into carried lineage
 obligations, so a narrower clarification cannot silently erase work.
 The new write scopes replace the old execution ownership; obsolete broad scopes do not keep causing
@@ -157,6 +162,9 @@ must be decomposed with `node-split`.
       "model": null,
       "effort": null,
       "acceptance": ["Contract tests describe every required response"],
+      "evidence": "Contract checks demonstrate every required response",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_contract",
+      "evidence_negative_proof_command": "test ! -f src/api/schema.py",
       "spec": {
         "objective": "Define the accepted API contract",
         "inputs": ["req-1"],
@@ -197,6 +205,9 @@ must be decomposed with `node-split`.
       "model": null,
       "effort": null,
       "acceptance": ["Focused API tests pass"],
+      "evidence": "Focused API checks demonstrate the implementation",
+      "evidence_positive_proof_command": "python -m unittest tests.test_api_handlers",
+      "evidence_negative_proof_command": "test ! -f src/api/handlers.py",
       "spec": {
         "objective": "Implement the accepted API contract",
         "inputs": ["API contract"],
@@ -239,8 +250,9 @@ must be decomposed with `node-split`.
 ```
 
 Each child object uses exactly `id`, `title`, `stage`, `priority`, `dependencies`, `write_scopes`,
-`role`, `model`, `effort`, `acceptance`, `spec`, `assessment`, `route_rationale`, and
-`estimated_cost`. `model`, `effort`, and `estimated_cost` are nullable; child assessment contains only
+`role`, `model`, `effort`, `acceptance`, `evidence`, `evidence_positive_proof_command`,
+`evidence_negative_proof_command`, `spec`, `assessment`, `route_rationale`, and `estimated_cost`.
+`model`, `effort`, and `estimated_cost` are nullable; child assessment contains only
 the input fields shown above. Dependencies may refer to retained nodes or other children, but must
 produce an acyclic graph. Collectively the children must preserve every parent prerequisite: for each
 original parent prerequisite, at least one child must depend on it directly or through a path containing

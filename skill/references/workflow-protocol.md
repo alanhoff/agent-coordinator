@@ -16,7 +16,9 @@ specialists never mutate the graph.
    and acceptance ambiguity factors. Declare artifact write scopes, or an empty scope list for
    evidence-only work. Score `change_surface` as 0 exactly when the scope list is empty; the state
    owner rejects either mismatch. Scope names use NFC-normalized platform-safe segments so filesystem
-   aliases cannot claim independent ownership of one artifact.
+   aliases cannot claim independent ownership of one artifact. Every new node also declares exact,
+   non-blank `evidence`, `evidence_positive_proof_command`, and
+   `evidence_negative_proof_command` fields. Make the commands repeatable and idempotent.
 3. Read planning diagnostics. For every non-blocked assessable leaf, reassess `stale` work, use
    `node-refine` for unresolved or changed specification, and use `node-split` for over-budget work.
    Re-read after each revisioned mutation until all such leaves are current and `executable`. Blocked
@@ -26,12 +28,14 @@ specialists never mutate the graph.
    depth, and two unused node records remain reserved for it.
 5. Record `node-observe` when material execution evidence changes remaining complexity, ambiguity,
    cost, confidence, or progress. Accept only the policy-derived projection. When `next` selects
-   `reconcile_runtime`, run `graph-reconcile` for one highest-live-critical-path actionable node, or use
+   `reconcile_runtime`, run `graph-reconcile` with the required discovery/execution proof bundle for one
+   highest-live-critical-path actionable node, or use
    `graph-expand-auto` when a bounded explicit topology is already known. Generated topology may be
    nested or an arbitrary acyclic DAG; it must remain within node, depth, history, and scope bounds.
 6. Configure `judge-gate-add` before target completion when independent evidence is part of acceptance.
-   A successful target waits in `judging` while every configured evidence-only judge runs. Complete each
-   with `judge-complete`; an optional loop creates versioned acyclic iterations until a gate passes or
+   A successful target waits in `judging` while every configured evidence-only judge runs. Every judge
+   manifest carries the same three proof fields. Complete each with `judge-complete`; an optional loop
+   creates versioned acyclic iterations until a gate passes or
    the hard iteration limit is exhausted. Never bypass a gate or loop with generic graph mutations.
 7. Treat routes created by add, refine, split, runtime expansion, or a loop iteration as provisional.
    After the latest assessment and global fixed point, use `node-route-auto` to derive the existing
@@ -50,11 +54,16 @@ specialists never mutate the graph.
    safe.
 9. Read `agents/roles/<role>.toml`, replacing `<role>` with each selected node's persisted role.
    Include native specification, effective requirements/outputs/
-   acceptance, and lineage provenance in its task packet. Run `node-claim` before delegation, then
+   acceptance, lineage provenance, planned evidence, and both proof commands in its task packet. Run
+   `node-claim` before delegation, then
    `node-start` after a child is definitely created, and `node-complete` only after inspecting outputs
-   and acceptance evidence. Inline execution uses the same lifecycle and consumes the parent sequentially.
+   and acceptance evidence. The state owner runs positive then negative proof while holding the mutation
+   fence; `succeeded` requires exit `0`/nonzero and `failed` requires nonzero/`0`. Inline execution uses
+   the same lifecycle and consumes the parent sequentially.
 10. Reconcile an ambiguous delegation before inline fallback or retry. Never duplicate uncertain work.
-11. Persist terminal results and evidence, then reassess affected work. Dependency effective-output
+11. Let the state owner persist the positive proof command's combined output as terminal `result` and
+   its exit metadata as `proof`, then reassess affected work. Planned `evidence` remains descriptive.
+   Dependency effective-output
    changes, normalized terminal disposition, result/evidence, or retry can stale direct assessable
    dependents; nonterminal status transitions cannot.
 12. Repeat refinement and execution until no runnable work remains. Resolve blockers, validate the
@@ -63,8 +72,9 @@ specialists never mutate the graph.
    `workflow-complete` payload to satisfy exactly the active requirements and finish atomically. Close
    the private session. Completed artifact work must be covered by a successful evidence-only review
    in its transitive dependency ancestry or the completion payload must contain a non-blank
-   `review_waiver` reason. Evidence-only
-   nodes use persisted result/evidence and empty scope maps.
+   `review_waiver` reason. Closeout reruns every non-exempt graph record's proof commands in sorted
+   node-ID order, including decomposed and superseded history, and requires every pair to prove success.
+   Evidence-only nodes use the same proof contract and empty scope maps.
 
 ## Mutation boundaries and recovery
 
@@ -117,6 +127,11 @@ takeover converts every claimed, bound, or running launch to `reconcile_required
 provider reconciliation. Aborting the workflow also does not make an uncertain or discovered child
 terminal: `next` continues to select reconciliation until the provider outcome is terminal or absence is
 proved. Only an unclaimed future node may be blocked.
+
+Proof commands execute at the repository root with the inherited environment, a five-minute timeout,
+and a 32 KiB combined-output limit per command. They may have ordinary shell side effects. A failed
+node-completion or workflow-completion mutation leaves durable state unchanged, but those side effects
+cannot be rolled back. Persisted receipt replay never reruns commands.
 
 
 ## Review convergence and user control

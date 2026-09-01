@@ -34,7 +34,7 @@ an advanced override. Omit unset model/effort arguments from delegated invocatio
 
 Route only a non-blocked assessable leaf whose persisted assessment is current and `executable`, and
 only when every other non-blocked assessable leaf is also current and executable. Keep the router API
-unchanged and adapt persisted schema-v7 assessment values to its existing 1–5 request fields as follows:
+unchanged and adapt persisted schema-v8 assessment values to its existing 1–5 request fields as follows:
 
 - `complexity = clamp(1, 5, ceil(assessment.total / 4))`
 - `ambiguity = clamp(1, 5, assessment.ambiguity_total + 1)`

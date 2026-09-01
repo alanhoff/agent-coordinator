@@ -173,17 +173,18 @@ Every non-blocked assessable leaf must be current and executable before routing 
 
 - Each executable part has acceptance criteria, one role, and zero or more normalized repository-relative `write_scopes`.
 - Empty scopes mean evidence-only work and require `change_surface=0`. Artifact work requires a positive change-surface score and at least one scope.
+- Every new part declares descriptive evidence plus repeatable positive and negative proof commands. Success requires positive exit `0` and negative nonzero; failure requires the inverse pair.
 - Independent live work cannot overlap scopes. Case comparison follows behavior detected from the target filesystem.
 - Routing ranks only candidates advertised by the active runtime. If no current catalog is available or selection fails, execution inherits the parent model and effort.
 - A claim records a SHA-256 baseline for every artifact scope. Completion requires each declared scope to remain materialized and to have changed during that attempt.
-- Workflow completion requires resolved requirements and blockers, valid evidence, and only allowed terminal states. Coordinator does not invoke or inspect a version-control system.
+- Workflow completion reruns proofs for every non-exempt graph record, including decomposed and superseded history, and requires every pair to prove success. Requirements and blockers must also be resolved, with only allowed terminal states. Coordinator does not invoke or inspect a version-control system.
 
 </details>
 
 <details>
 <summary>State inspection, including Windows</summary>
 
-Persisted schema-v6 workflow documents live under `~/.agent-coordinator/workflows`. These commands are read-only and never create, lock, repair, normalize, cache, or clean state.
+Persisted schema-v8 workflow documents live under `~/.agent-coordinator/workflows`; v6 and v7 documents upgrade automatically, with their existing nodes permanently proof-exempt. These commands are read-only and never create, lock, repair, normalize, cache, or clean state.
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py list --json
