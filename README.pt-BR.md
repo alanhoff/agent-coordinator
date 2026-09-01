@@ -177,17 +177,18 @@ Toda folha avaliável e não bloqueada precisa estar atualizada e ser executáve
 
 - Cada parte executável tem critérios de aceitação, uma função e zero ou mais `write_scopes` normalizados e relativos ao repositório.
 - Escopos vazios representam trabalhos baseados apenas em evidências e exigem `change_surface=0`. Trabalhos que produzem artefatos exigem uma pontuação positiva de superfície de alteração e pelo menos um escopo.
+- Cada parte nova declara evidência descritiva e comandos de prova positivo e negativo repetíveis. O sucesso exige saída `0` no positivo e diferente de zero no negativo; a falha exige o par inverso.
 - Trabalhos independentes em execução não podem ter escopos sobrepostos. A comparação entre maiúsculas e minúsculas segue o comportamento detectado no sistema de arquivos de destino.
 - O roteamento classifica somente os candidatos disponibilizados pelo runtime ativo. Se não houver um catálogo atual disponível ou se a seleção falhar, a execução herdará o modelo e o nível de esforço do pai.
 - A ação de assumir um trabalho registra uma linha de base SHA-256 para cada escopo de artefato. A conclusão exige que cada escopo declarado continue existindo e tenha sido alterado durante aquela tentativa.
-- A conclusão do fluxo de trabalho exige requisitos e impedimentos resolvidos, evidências válidas e apenas estados terminais permitidos. O Coordinator não invoca nem inspeciona nenhum sistema de controle de versão.
+- A conclusão do fluxo de trabalho executa novamente as provas de todos os registros não isentos, inclusive o histórico decomposto e substituído, e exige que cada par demonstre sucesso. Requisitos e impedimentos também precisam estar resolvidos, com apenas estados terminais permitidos. O Coordinator não invoca nem inspeciona nenhum sistema de controle de versão.
 
 </details>
 
 <details>
 <summary>Inspeção do estado, inclusive no Windows</summary>
 
-Os documentos persistidos dos fluxos de trabalho, no esquema v6, ficam em `~/.agent-coordinator/workflows`. Estes comandos são somente leitura e nunca criam, bloqueiam, reparam, normalizam, armazenam em cache nem fazem limpeza no estado.
+Os documentos persistidos dos fluxos de trabalho, no esquema v8, ficam em `~/.agent-coordinator/workflows`; documentos v6 e v7 são atualizados automaticamente e seus nós existentes permanecem isentos de provas. Estes comandos são somente leitura e nunca criam, bloqueiam, reparam, normalizam, armazenam em cache nem fazem limpeza no estado.
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py list --json

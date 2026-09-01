@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,26 @@ OBLIGATION_FIELDS = (
     "objectives", "requirements", "inputs", "outputs", "constraints", "non_goals",
     "acceptance", "write_scopes",
 )
+
+
+def proof_contract(node_id: str, *, succeeds: bool = True) -> dict[str, str]:
+    output = f"{node_id} positive proof"
+    positive_body = f"print({output!r})" + ("" if succeeds else "; raise SystemExit(1)")
+    negative_body = "raise SystemExit(1)" if succeeds else "print('negative proof reproduced')"
+    return {
+        "evidence": f"Terminal proof commands validate {node_id}",
+        "evidence_positive_proof_command": python_command(positive_body),
+        "evidence_negative_proof_command": python_command(negative_body),
+    }
+
+
+def python_command(body: str) -> str:
+    arguments = [sys.executable, "-c", body]
+    return (
+        subprocess.list2cmdline(arguments)
+        if os.name == "nt"
+        else shlex.join(arguments)
+    )
 
 
 def empty_obligations() -> dict[str, list[str]]:
@@ -114,6 +135,7 @@ def split_child(
         "estimated_cost": None,
         "spec": specification(node_id, outputs=outputs, requirement_ids=requirement_ids),
         "assessment": assessment_inputs(dimensions=dimensions),
+        **proof_contract(node_id),
     }
 
 
@@ -145,6 +167,7 @@ def plan_node(
         "estimated_cost": None,
         "spec": specification(node_id, requirement_ids=requirement_ids),
         "assessment": assessment_inputs(dimensions=dimensions),
+        **proof_contract(node_id),
     }
 
 
@@ -239,9 +262,23 @@ class DurableStateTests(unittest.TestCase):
         *extra: str,
         scope: str | None = None,
         evidence_only: bool = False,
+        proof_succeeds: bool = True,
+        include_proof: bool = True,
         expected: int = 0,
     ) -> dict:
         scope_arguments = [] if evidence_only else ["--write-scope", scope or f"src/{node_id}"]
+        contract = proof_contract(node_id, succeeds=proof_succeeds)
+        proof_arguments = (
+            [
+                "--evidence", contract["evidence"],
+                "--evidence-positive-proof-command",
+                contract["evidence_positive_proof_command"],
+                "--evidence-negative-proof-command",
+                contract["evidence_negative_proof_command"],
+            ]
+            if include_proof
+            else []
+        )
         return self.mutation(
             "node-add", revision, mutation,
             "--node-id", node_id, "--title", node_id, "--stage", "implementation",
@@ -254,8 +291,34 @@ class DurableStateTests(unittest.TestCase):
             "--ambiguity-boundaries", "0", "--ambiguity-dependencies", "0",
             "--ambiguity-acceptance", "0",
             "--complexity-rationale", "small bounded leaf",
+            *proof_arguments,
             *extra,
             expected=expected,
+        )
+
+    def mutate_current(
+        self,
+        command: str,
+        mutation: str,
+        *arguments: str,
+        expected: int = 0,
+    ) -> dict:
+        revision = StateStore().load(self.workflow_id)["revision"]
+        return self.mutation(
+            command, revision, mutation, *arguments, expected=expected
+        )
+
+    def start_current(self, node_id: str) -> None:
+        self.mutate_current(
+            "node-route-auto", f"route-{node_id}", "--node-id", node_id,
+            "--criticality", "3", "--determinism", "3",
+        )
+        claim = self.mutate_current(
+            "node-claim", f"claim-{node_id}", "--node-id", node_id
+        )
+        self.mutate_current(
+            "node-start", f"start-{node_id}", "--node-id", node_id,
+            "--child-id", claim["data"]["suggested_child_id"],
         )
 
     def start_scoped_work(self, *, node_id: str = "work", scope: str = "src/work") -> dict:
@@ -318,7 +381,7 @@ class DurableStateTests(unittest.TestCase):
         )
 
         state = StateStore().load(self.workflow_id)
-        self.assertEqual(state["schema_version"], 7)
+        self.assertEqual(state["schema_version"], 8)
         self.assertNotIn("git", state)
         self.assertEqual(
             {
@@ -419,6 +482,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": ["focused test passes"],
             "write_scopes": ["src/oversized-total"],
             "assessment": assessment_inputs(rationale="Attempt to rescore instead of split"),
+            **proof_contract("oversized-total"),
         }
         rejected_escape = self.mutation(
             "node-refine", 10, "reject-split-escape", "--node-id", "oversized-total",
@@ -583,6 +647,7 @@ class DurableStateTests(unittest.TestCase):
             "assessment": assessment_inputs(
                 rationale="The changed requirement removes the former extra breadth"
             ),
+            **proof_contract("adaptive"),
         }
         self.mutation(
             "node-refine", 4, "recalculate-adaptive", "--node-id", "adaptive",
@@ -687,6 +752,7 @@ class DurableStateTests(unittest.TestCase):
             "assessment": assessment_inputs(
                 dimensions={**DIMENSIONS, "change_surface": 0}
             ),
+            **proof_contract("artifact-source"),
         }
         rejected_refinement = self.mutation(
             "node-refine", 3, "reject-evidence-refinement", "--node-id", "artifact-source",
@@ -717,6 +783,7 @@ class DurableStateTests(unittest.TestCase):
                 dimensions={**DIMENSIONS, "breadth": 0},
                 rationale="Decision removes breadth and ambiguity",
             ),
+            **proof_contract("draft", succeeds=False),
         }
         malformed_payloads = []
         extra_top_level = {**refinement, "total": 4}
@@ -779,7 +846,6 @@ class DurableStateTests(unittest.TestCase):
         self.mutation("node-update", 7, "run-draft", "--node-id", "draft", "--status", "running")
         self.mutation(
             "node-update", 8, "fail-draft", "--node-id", "draft", "--status", "failed",
-            "--result", "partial draft result", "--evidence", "focused failure log",
             "--attempt-outcome", "focused test failed",
         )
         failed_attempts = copy.deepcopy(StateStore().load(self.workflow_id)["nodes"]["draft"]["attempts"])
@@ -789,6 +855,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": ["focused test passes"],
             "write_scopes": ["src/draft-dependent"],
             "assessment": assessment_inputs(rationale="Assessed against the recorded failure evidence"),
+            **proof_contract("draft-dependent"),
         }
         self.mutation(
             "node-refine", 10, "reassess-draft-dependent", "--node-id", "draft-dependent",
@@ -802,6 +869,7 @@ class DurableStateTests(unittest.TestCase):
             dimensions={**DIMENSIONS, "breadth": 0, "novelty": 0},
             rationale="Failure evidence narrows the retry",
         )
+        retry_refinement.update(proof_contract("draft"))
         self.mutation(
             "node-refine", 11, "refine-failed-draft", "--node-id", "draft",
             "--refinement-json", json.dumps(retry_refinement),
@@ -856,6 +924,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": ["upstream revised acceptance"],
             "write_scopes": ["src/upstream"],
             "assessment": assessment_inputs(rationale="Declared output is now precise"),
+            **proof_contract("upstream"),
         }
         self.mutation(
             "node-refine", 9, "refine-upstream-output", "--node-id", "upstream",
@@ -869,6 +938,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": ["focused test passes"],
             "write_scopes": ["src/output-dependent"],
             "assessment": assessment_inputs(rationale="Reassessed against the renamed upstream output"),
+            **proof_contract("output-dependent"),
         }
         self.mutation(
             "node-refine", 10, "reassess-output-dependent", "--node-id", "output-dependent",
@@ -937,7 +1007,6 @@ class DurableStateTests(unittest.TestCase):
         dependency_scope.write_text("dependency implementation\n", encoding="utf-8")
         self.mutation(
             "node-update", 19, "finish-dependency", "--node-id", "dependency", "--status", "done",
-            "--result", "dependency implemented", "--evidence", "dependency tests passed",
         )
 
         state = StateStore().load(self.workflow_id)
@@ -948,7 +1017,10 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(state["nodes"]["unrelated"]["assessment"]["state"], "executable")
         self.assertEqual(
             (state["nodes"]["dependency"]["result"], state["nodes"]["dependency"]["evidence"]),
-            ("dependency implemented", "dependency tests passed"),
+            (
+                f"dependency positive proof{os.linesep}",
+                proof_contract("dependency")["evidence"],
+            ),
         )
         self.assertEqual(state["nodes"]["requirement-work"]["assessment"]["input_digest"], requirement_digest)
         self.assertEqual(state["nodes"]["direct-dependent"]["assessment"]["input_digest"], dependency_digest)
@@ -1185,6 +1257,7 @@ class DurableStateTests(unittest.TestCase):
             "--output", "public API artifact", "--acceptance", "integration passes",
             "--breadth", "2", "--change-surface", "2", "--coupling", "1",
             "--novelty", "1", "--verification", "1",
+            proof_succeeds=False,
         )
         self.add("dependent", 4, "add-dependent", "--dependency", "parent")
         self.mutation("node-update", 5, "ready-parent", "--node-id", "parent", "--status", "ready")
@@ -1383,6 +1456,7 @@ class DurableStateTests(unittest.TestCase):
                 dimensions=recursive_lower,
                 rationale="Replace only native descendant fields",
             ),
+            **proof_contract("grandchild-a"),
         }
         self.mutation(
             "node-refine", 13, "refine-obligated-descendant", "--node-id", "grandchild-a",
@@ -1543,7 +1617,10 @@ class DurableStateTests(unittest.TestCase):
             "requirement-set", 23, "add-stale-split-requirement", "--requirement-id", "req-stale-split",
             "--text", "Keep split accounting current", "--source", "task", "--status", "active",
         )
-        self.add("stale-failed-parent", 24, "add-stale-failed-parent", "--requirement-id", "req-stale-split")
+        self.add(
+            "stale-failed-parent", 24, "add-stale-failed-parent",
+            "--requirement-id", "req-stale-split", proof_succeeds=False,
+        )
         self.route("stale-failed-parent", 25, "route-stale-failed-parent")
         self.mutation(
             "node-update", 26, "ready-stale-failed-parent", "--node-id", "stale-failed-parent",
@@ -1563,8 +1640,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-update", 30, "fail-stale-failed-parent", "--node-id", "stale-failed-parent",
-            "--status", "failed", "--result", "partial split candidate",
-            "--evidence", "failed candidate evidence", "--attempt-outcome", "candidate failed",
+            "--status", "failed", "--attempt-outcome", "candidate failed",
         )
         self.mutation(
             "requirement-set", 31, "change-stale-split-requirement", "--requirement-id", "req-stale-split",
@@ -1968,6 +2044,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": list(replacement["acceptance"]),
             "write_scopes": list(replacement["write_scopes"]),
             "assessment": assessment_inputs(rationale="Reassess B after accepting A's carried work"),
+            **proof_contract("cycle-b"),
         }
         self.mutation(
             "node-refine", 4, "reassess-cycle-b", "--node-id", "cycle-b",
@@ -2421,6 +2498,7 @@ class DurableStateTests(unittest.TestCase):
                     },
                     rationale="This refinement would require another split",
                 ),
+                **proof_contract("depth-one-a"),
             }
             rejected_refinement = self.mutation(
                 "node-refine", 3, "reject-over-budget-refinement-at-limit", "--node-id", "depth-one-a",
@@ -2560,7 +2638,7 @@ class DurableStateTests(unittest.TestCase):
         self.mutation("node-update", 6, "run-inline", "--node-id", "work", "--status", "running")
         rejected = self.mutation(
             "node-update", 7, "finish-inline-missing-scope", "--node-id", "work", "--status", "done",
-            "--result", "implemented inline", "--evidence", "focused test passed", expected=2,
+            expected=2,
         )
         self.assertIn("no materialized file or directory", rejected["data"]["message"])
         work_scope = self.repo / "src" / "work"
@@ -2568,7 +2646,6 @@ class DurableStateTests(unittest.TestCase):
         work_scope.write_text("inline implementation\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-inline", "--node-id", "work", "--status", "done",
-            "--result", "implemented inline", "--evidence", "focused test passed",
         )
         node = StateStore().load(self.workflow_id)["nodes"]["work"]
         self.assertEqual((node["status"], node["launch"]["state"]), ("done", "terminal"))
@@ -2631,6 +2708,7 @@ class DurableStateTests(unittest.TestCase):
             "acceptance": ["focused test passes"],
             "write_scopes": ["src/work"],
             "assessment": assessment_inputs(rationale="Reassessed against the current recovery input"),
+            **proof_contract("work"),
         }
         self.mutation(
             "node-refine", 11, "reassess-recovered-work", "--node-id", "work",
@@ -2749,7 +2827,7 @@ class DurableStateTests(unittest.TestCase):
 
 
     def test_failed_attempt_can_be_routed_and_relaunched_without_losing_history(self) -> None:
-        self.add("work", 1, "add-work")
+        self.add("work", 1, "add-work", proof_succeeds=False)
         self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
         self.route("work", 3, "route-work")
         self.mutation(
@@ -2991,7 +3069,7 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_state_boundary_rejects_mismatched_attempt_completion_fields(self) -> None:
-        self.add("work", 1, "add-work")
+        self.add("work", 1, "add-work", proof_succeeds=False)
         self.mutation("node-update", 2, "ready-work", "--node-id", "work", "--status", "ready")
         self.route("work", 3, "route-work")
         self.mutation(
@@ -3122,6 +3200,7 @@ class DurableStateTests(unittest.TestCase):
             "assessment": assessment_inputs(
                 dimensions={**DIMENSIONS, "change_surface": 0}
             ),
+            **proof_contract("review"),
         }
         rejected_refinement = self.mutation(
             "node-refine", 2, "reject-scoped-read-only-refinement",
@@ -3149,7 +3228,6 @@ class DurableStateTests(unittest.TestCase):
         self.mutation("node-update", 6, "run-work", "--node-id", "work", "--status", "running")
         unchanged = self.mutation(
             "node-update", 7, "finish-work", "--node-id", "work", "--status", "done",
-            "--result", "implemented work", "--evidence", "focused test passed",
             expected=2,
         )
         self.assertIn("no attempt-scoped change", unchanged["data"]["message"])
@@ -3157,7 +3235,6 @@ class DurableStateTests(unittest.TestCase):
         (self.repo / "preexisting.txt").write_text("implemented work\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-work-changed", "--node-id", "work", "--status", "done",
-            "--result", "implemented work", "--evidence", "focused test passed",
         )
         (self.repo / "preexisting.txt").unlink()
         missing_at_finish = self.mutation(
@@ -3191,7 +3268,6 @@ class DurableStateTests(unittest.TestCase):
         self.mutation("node-update", 6, "run-review", "--node-id", "review", "--status", "running")
         self.mutation(
             "node-update", 7, "finish-review", "--node-id", "review", "--status", "done",
-            "--result", "recommendation recorded", "--evidence", "review evidence persisted",
         )
         self.mutation(
             "finish", 8, "finish-read-only", "--summary", "review complete",
@@ -3208,8 +3284,7 @@ class DurableStateTests(unittest.TestCase):
         (self.repo / "src" / "work.txt").write_text("implemented\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-unreviewed-work", "--node-id", "work",
-            "--status", "done", "--result", "implemented",
-            "--evidence", "focused checks passed",
+            "--status", "done",
         )
 
         closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
@@ -3261,8 +3336,7 @@ class DurableStateTests(unittest.TestCase):
         (self.repo / "src" / "work.txt").write_text("implemented\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-reviewed-work", "--node-id", "work",
-            "--status", "done", "--result", "implemented",
-            "--evidence", "focused checks passed",
+            "--status", "done",
         )
         self.mutation(
             "node-add", 8, "add-integrated-review",
@@ -3278,6 +3352,11 @@ class DurableStateTests(unittest.TestCase):
             "--ambiguity-boundaries", "0", "--ambiguity-dependencies", "0",
             "--ambiguity-acceptance", "0",
             "--complexity-rationale", "bounded evidence-only review",
+            "--evidence", proof_contract("review")["evidence"],
+            "--evidence-positive-proof-command",
+            proof_contract("review")["evidence_positive_proof_command"],
+            "--evidence-negative-proof-command",
+            proof_contract("review")["evidence_negative_proof_command"],
         )
         self.route("review", 9, "route-integrated-review", role="reviewer")
         claim = self.mutation(
@@ -3289,8 +3368,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-complete", 12, "complete-integrated-review", "--node-id", "review",
-            "--outcome", "succeeded", "--result", "review passed",
-            "--evidence", "artifact and focused checks reviewed",
+            "--outcome", "succeeded",
         )
 
         closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
@@ -3345,7 +3423,6 @@ class DurableStateTests(unittest.TestCase):
         (directory / "target.txt").write_text("updated target\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-package", "--node-id", "package", "--status", "done",
-            "--result", "package updated", "--evidence", "focused check passed",
         )
 
     def test_scope_fingerprint_frames_tree_records_unambiguously(self) -> None:
@@ -3395,8 +3472,7 @@ class DurableStateTests(unittest.TestCase):
         try:
             rejected = self.mutation(
                 "node-update", 7, "reject-replaced-root", "--node-id", "work",
-                "--status", "done", "--result", "forged result",
-                "--evidence", "forged evidence", expected=20,
+                "--status", "done", expected=20,
             )
             self.assertEqual(rejected["code"], "invalid_repository")
             self.assertIn("repository object changed", rejected["data"]["message"])
@@ -3421,8 +3497,7 @@ class DurableStateTests(unittest.TestCase):
         try:
             rejected = self.mutation(
                 "node-update", 7, "reject-symlinked-root", "--node-id", "work",
-                "--status", "done", "--result", "forged result",
-                "--evidence", "forged evidence", expected=20,
+                "--status", "done", expected=20,
             )
             self.assertEqual(rejected["code"], "invalid_repository")
             self.assertEqual(StateStore().load(self.workflow_id), running)
@@ -3541,14 +3616,12 @@ class DurableStateTests(unittest.TestCase):
         (self.repo / "preexisting.txt").unlink()
         rejected = self.mutation(
             "node-update", 7, "finish-deletion", "--node-id", "work", "--status", "done",
-            "--result", "obsolete artifact deleted", "--evidence", "focused deletion test passed",
             expected=2,
         )
         self.assertIn("no materialized file or directory", rejected["data"]["message"])
         (self.repo / "preexisting.txt").write_text("replacement artifact\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-replacement", "--node-id", "work", "--status", "done",
-            "--result", "obsolete artifact replaced", "--evidence", "focused replacement check passed",
         )
         self.mutation(
             "finish", 8, "finish-replacement-workflow", "--summary", "done",
@@ -3598,7 +3671,6 @@ class DurableStateTests(unittest.TestCase):
         scope.write_text("completed original contract\n", encoding="utf-8")
         self.mutation(
             "node-update", 7, "finish-immutable-work", "--node-id", "work", "--status", "done",
-            "--result", "original contract built", "--evidence", "focused test passed",
         )
         done = StateStore().load(self.workflow_id)
         rejected_done = self.mutation(
@@ -3932,8 +4004,7 @@ class DurableStateTests(unittest.TestCase):
         scope.write_text("implemented\n", encoding="utf-8")
         completed = self.mutation(
             "node-complete", 5, "complete-facade", "--node-id", "facade",
-            "--outcome", "succeeded", "--result", "feature implemented",
-            "--evidence", "focused test passed", "--actual-cost", "1.25",
+            "--outcome", "succeeded", "--actual-cost", "1.25",
         )
         self.assertEqual(completed["code"], "node_completed")
         state = StateStore().load(self.workflow_id)
@@ -4008,7 +4079,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-complete", 6, "complete-first", "--node-id", "first",
-            "--outcome", "succeeded", "--result", "done", "--evidence", "checked",
+            "--outcome", "succeeded",
         )
         self.mutation(
             "node-route-auto", 7, "route-second", "--node-id", "second",
@@ -4030,7 +4101,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-complete", 10, "complete-second", "--node-id", "second",
-            "--outcome", "succeeded", "--result", "done", "--evidence", "checked",
+            "--outcome", "succeeded",
         )
         self.add("unchanged", 11, "add-unchanged", scope="preexisting.txt")
         self.mutation(
@@ -4045,8 +4116,7 @@ class DurableStateTests(unittest.TestCase):
         before_complete = StateStore().load(self.workflow_id)
         rejected = self.mutation(
             "node-complete", 15, "complete-unchanged", "--node-id", "unchanged",
-            "--outcome", "succeeded", "--result", "claimed done",
-            "--evidence", "no actual change", expected=2,
+            "--outcome", "succeeded", expected=2,
         )
         self.assertIn("no attempt-scoped change", rejected["data"]["message"])
         self.assertEqual(StateStore().load(self.workflow_id), before_complete)
@@ -4212,7 +4282,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-complete", 5, "complete-next", "--node-id", "next-work",
-            "--outcome", "succeeded", "--result", "finished", "--evidence", "checked",
+            "--outcome", "succeeded",
         )
         closeout = self.cli("next", "--workflow-id", self.workflow_id)["data"]
         self.assertEqual(closeout["action"], "complete_requirements")
@@ -4251,7 +4321,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.mutation(
             "node-complete", 5, "complete-closeout", "--node-id", "closeout",
-            "--outcome", "succeeded", "--result", "done", "--evidence", "validated",
+            "--outcome", "succeeded",
         )
         before = StateStore().load(self.workflow_id)
         incomplete = {
@@ -4280,6 +4350,430 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(state["requirements"]["req-a"]["text"], "A")
         self.assertEqual(state["requirements"]["req-b"]["source"], "test")
         self.assertEqual(state["requirements"]["req-a"]["status"], "satisfied")
+
+    def test_node_completion_persists_positive_output_and_replay_does_not_rerun(self) -> None:
+        counter = "proof-run-count.txt"
+        positive = python_command(
+            "from pathlib import Path; "
+            f"p=Path({counter!r}); "
+            "n=int(p.read_text()) + 1 if p.exists() else 1; "
+            "p.write_text(str(n)); print(f'proof-run-{n}')"
+        )
+        self.add(
+            "proofed", 1, "add-proofed",
+            "--evidence-positive-proof-command", positive, evidence_only=True,
+        )
+        self.start_current("proofed")
+        completed = self.mutate_current(
+            "node-complete", "complete-proofed", "--node-id", "proofed",
+            "--outcome", "succeeded",
+        )
+        self.assertEqual(completed["code"], "node_completed")
+        node = StateStore().load(self.workflow_id)["nodes"]["proofed"]
+        self.assertEqual(node["result"], f"proof-run-1{os.linesep}")
+        self.assertEqual(node["evidence"], proof_contract("proofed")["evidence"])
+        self.assertEqual(
+            (
+                node["proof"]["phase"],
+                node["proof"]["positive_exit_code"],
+                node["proof"]["negative_exit_code"],
+            ),
+            ("node_completion", 0, 1),
+        )
+
+        replay = self.mutate_current(
+            "node-complete", "complete-proofed", "--node-id", "proofed",
+            "--outcome", "succeeded",
+        )
+        self.assertEqual(replay["code"], "mutation_reconciled")
+        self.assertEqual((self.repo / counter).read_text(encoding="utf-8"), "1")
+
+    def test_failed_outcome_requires_the_inverse_proof_pair(self) -> None:
+        self.add(
+            "expected-failure", 1, "add-expected-failure",
+            evidence_only=True, proof_succeeds=False,
+        )
+        self.start_current("expected-failure")
+        self.mutate_current(
+            "node-complete", "complete-expected-failure",
+            "--node-id", "expected-failure", "--outcome", "failed",
+        )
+        node = StateStore().load(self.workflow_id)["nodes"]["expected-failure"]
+        self.assertEqual(node["status"], "failed")
+        self.assertEqual(
+            node["result"], f"expected-failure positive proof{os.linesep}"
+        )
+        self.assertNotEqual(node["proof"]["positive_exit_code"], 0)
+        self.assertEqual(node["proof"]["negative_exit_code"], 0)
+
+    def test_contradictory_and_silent_proofs_are_rejected_atomically(self) -> None:
+        silent_marker = "silent-negative-ran.txt"
+        contracts = {
+            "both-zero": (
+                python_command("print('positive passed')"),
+                python_command("print('negative also passed')"),
+                "succeeded",
+            ),
+            "both-nonzero": (
+                python_command("print('positive failed'); raise SystemExit(1)"),
+                python_command("raise SystemExit(1)"),
+                "failed",
+            ),
+            "silent": (
+                python_command("pass"),
+                python_command(
+                    "from pathlib import Path; "
+                    f"Path({silent_marker!r}).write_text('ran'); raise SystemExit(1)"
+                ),
+                "succeeded",
+            ),
+        }
+        revision = 1
+        for node_id, (positive, negative, _outcome) in contracts.items():
+            self.add(
+                node_id, revision, f"add-{node_id}",
+                "--evidence-positive-proof-command", positive,
+                "--evidence-negative-proof-command", negative,
+                evidence_only=True,
+            )
+            revision += 1
+        for node_id in contracts:
+            self.start_current(node_id)
+
+        for node_id, (_positive, _negative, outcome) in contracts.items():
+            with self.subTest(node=node_id):
+                baseline = StateStore().load(self.workflow_id)
+                rejected = self.mutate_current(
+                    "node-complete", f"reject-{node_id}", "--node-id", node_id,
+                    "--outcome", outcome, expected=2,
+                )
+                expected_message = (
+                    "must emit non-blank" if node_id == "silent" else "inconclusive"
+                )
+                self.assertIn(expected_message, rejected["data"]["message"])
+                self.assertEqual(StateStore().load(self.workflow_id), baseline)
+        self.assertFalse((self.repo / silent_marker).exists())
+
+    def test_proof_execution_error_and_terminal_result_bypasses_are_atomic(self) -> None:
+        self.add("guarded", 1, "add-guarded", evidence_only=True)
+        self.start_current("guarded")
+        baseline = StateStore().load(self.workflow_id)
+
+        rejected_update = self.mutate_current(
+            "node-update", "reject-update-result", "--node-id", "guarded",
+            "--status", "done", "--result", "caller result",
+            "--evidence", "caller evidence", expected=2,
+        )
+        self.assertIn("derive result", rejected_update["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        rejected_complete = self.mutate_current(
+            "node-complete", "reject-complete-result", "--node-id", "guarded",
+            "--outcome", "succeeded", "--result", "caller result",
+            "--evidence", "caller evidence", expected=2,
+        )
+        self.assertIn("derives result", rejected_complete["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        ignored_result = self.mutate_current(
+            "node-update", "reject-ignored-result", "--node-id", "guarded",
+            "--result", "caller result", expected=2,
+        )
+        self.assertIn("terminal status", ignored_result["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        with mock.patch.object(
+            state_owner,
+            "run_proof_command",
+            side_effect=state_owner.ProofExecutionError("proof command timed out"),
+        ):
+            execution_error = self.mutate_current(
+                "node-complete", "proof-launch-error", "--node-id", "guarded",
+                "--outcome", "succeeded", expected=20,
+            )
+        self.assertEqual(execution_error["code"], "proof_execution_error")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+    def test_creation_and_refinement_surfaces_require_exact_proof_contracts(self) -> None:
+        baseline = StateStore().load(self.workflow_id)
+        missing_add = self.add(
+            "missing-add", 1, "missing-add", evidence_only=True,
+            include_proof=False, expected=2,
+        )
+        self.assertEqual(missing_add["code"], "invalid_invocation")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        missing_plan_node = plan_node("missing-plan")
+        missing_plan_node.pop("evidence_positive_proof_command")
+        missing_plan = self.mutate_current(
+            "plan-apply", "missing-plan-proof", "--plan-json",
+            json.dumps({"requirements": [], "nodes": [missing_plan_node]}),
+            expected=2,
+        )
+        self.assertIn("evidence_positive_proof_command", missing_plan["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        unknown_plan_node = plan_node("unknown-plan")
+        unknown_plan_node["proof_exempt"] = True
+        unknown_plan = self.mutate_current(
+            "plan-apply", "unknown-plan-proof", "--plan-json",
+            json.dumps({"requirements": [], "nodes": [unknown_plan_node]}),
+            expected=2,
+        )
+        self.assertIn("proof_exempt", unknown_plan["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        self.add("refinable", 1, "add-refinable", evidence_only=True)
+        node = StateStore().load(self.workflow_id)["nodes"]["refinable"]
+        refinement = {
+            "spec": copy.deepcopy(node["spec"]),
+            "acceptance": list(node["acceptance"]),
+            "write_scopes": list(node["write_scopes"]),
+            "assessment": assessment_inputs(
+                dimensions=node["assessment"]["dimensions"]
+            ),
+            **proof_contract("refinable"),
+        }
+        refinement.pop("evidence_negative_proof_command")
+        before_refine = StateStore().load(self.workflow_id)
+        missing_refine = self.mutate_current(
+            "node-refine", "missing-refine-proof", "--node-id", "refinable",
+            "--refinement-json", json.dumps(refinement), expected=2,
+        )
+        self.assertIn("evidence_negative_proof_command", missing_refine["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before_refine)
+
+        parent_revision = before_refine["revision"]
+        self.add(
+            "split-proof-parent", parent_revision, "add-split-proof-parent",
+            "--breadth", "3", evidence_only=True,
+        )
+        child_a = split_child(
+            "proof-child-a", acceptance=["child A proof"],
+            outputs=["split-proof-parent implementation"], requirement_ids=[],
+        )
+        child_b = split_child(
+            "proof-child-b", acceptance=["focused test passes"],
+            outputs=["child B output"], requirement_ids=[],
+        )
+        for child in (child_a, child_b):
+            child["write_scopes"] = []
+            child["assessment"]["dimensions"]["change_surface"] = 0
+        child_a.pop("evidence")
+        split = {
+            "parent_id": "split-proof-parent",
+            "reason": "exercise proof validation",
+            "children": [child_a, child_b],
+            "coverage": {
+                "requirements": {},
+                "outputs": {"split-proof-parent implementation": ["proof-child-a"]},
+                "acceptance": {"focused test passes": ["proof-child-b"]},
+            },
+            "dependent_replacements": {},
+        }
+        before_split = StateStore().load(self.workflow_id)
+        missing_split = self.mutate_current(
+            "node-split", "missing-split-proof", "--plan-json",
+            json.dumps(split), expected=2,
+        )
+        self.assertIn("evidence", missing_split["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), before_split)
+
+    def test_completion_refingerprints_scope_after_proof_side_effects(self) -> None:
+        positive = python_command(
+            "from pathlib import Path; p=Path('src/output.txt'); "
+            "p.write_text('built by proof\\n'); print('build verified')"
+        )
+        negative = python_command(
+            "from pathlib import Path; "
+            "raise SystemExit(1 if Path('src/output.txt').read_text() == "
+            "'built by proof\\n' else 0)"
+        )
+        self.add(
+            "side-effect", 1, "add-side-effect",
+            "--evidence-positive-proof-command", positive,
+            "--evidence-negative-proof-command", negative,
+            scope="src/output.txt",
+        )
+        self.start_current("side-effect")
+        output = self.repo / "src" / "output.txt"
+        output.parent.mkdir(parents=True)
+        output.write_text("implementation\n", encoding="utf-8")
+        before_proof = state_owner._scope_fingerprint(str(self.repo), "src/output.txt")
+        self.mutate_current(
+            "node-complete", "complete-side-effect", "--node-id", "side-effect",
+            "--outcome", "succeeded",
+        )
+        node = StateStore().load(self.workflow_id)["nodes"]["side-effect"]
+        recorded = node["attempts"][-1]["scope_evidence"]["src/output.txt"]["after"]
+        current = state_owner._scope_fingerprint(str(self.repo), "src/output.txt")
+        self.assertNotEqual(before_proof, current)
+        self.assertEqual(recorded, current)
+        self.assertEqual(node["result"], f"build verified{os.linesep}")
+
+    def test_closeout_detects_regression_and_leaves_state_atomic(self) -> None:
+        positive = python_command(
+            "from pathlib import Path; ok=Path('feature.txt').read_text() == 'good\\n'; "
+            "print('feature is good' if ok else 'feature regressed'); "
+            "raise SystemExit(0 if ok else 1)"
+        )
+        negative = python_command(
+            "from pathlib import Path; ok=Path('feature.txt').read_text() == 'good\\n'; "
+            "raise SystemExit(1 if ok else 0)"
+        )
+        self.add(
+            "regression", 1, "add-regression",
+            "--evidence-positive-proof-command", positive,
+            "--evidence-negative-proof-command", negative,
+            evidence_only=True,
+        )
+        (self.repo / "feature.txt").write_text("good\n", encoding="utf-8")
+        self.start_current("regression")
+        self.mutate_current(
+            "node-complete", "complete-regression", "--node-id", "regression",
+            "--outcome", "succeeded",
+        )
+        (self.repo / "feature.txt").write_text("bad\n", encoding="utf-8")
+        baseline = StateStore().load(self.workflow_id)
+        rejected = self.mutate_current(
+            "workflow-complete", "reject-regression", "--completion-json",
+            json.dumps(
+                {
+                    "summary": "done",
+                    "validation": "proofs rerun",
+                    "requirements": {},
+                }
+            ),
+            expected=2,
+        )
+        self.assertEqual(rejected["code"], "proof_mismatch")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        (self.repo / "feature.txt").write_text("good\n", encoding="utf-8")
+        self.mutate_current(
+            "finish", "complete-after-repair", "--summary", "done",
+            "--validation", "proofs rerun",
+        )
+        completed = StateStore().load(self.workflow_id)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(
+            completed["nodes"]["regression"]["proof"]["phase"],
+            "workflow_completion",
+        )
+
+    def test_closeout_proves_decomposed_and_superseded_records_in_id_order(self) -> None:
+        self.add(
+            "split-parent", 1, "add-split-parent", "--breadth", "3",
+            evidence_only=True,
+        )
+        self.add("superseded", 2, "add-superseded", evidence_only=True)
+        self.add("replacement", 3, "add-replacement", evidence_only=True)
+        children = [
+            split_child(
+                "leaf-a", acceptance=["leaf A proof"],
+                outputs=["split-parent implementation"], requirement_ids=[],
+            ),
+            split_child(
+                "leaf-b", acceptance=["focused test passes"],
+                outputs=["leaf B output"], requirement_ids=[],
+            ),
+        ]
+        for child in children:
+            child["write_scopes"] = []
+            child["assessment"]["dimensions"]["change_surface"] = 0
+        self.mutate_current(
+            "node-split", "split-for-closeout", "--plan-json",
+            json.dumps(
+                {
+                    "parent_id": "split-parent",
+                    "reason": "bounded closeout leaves",
+                    "children": children,
+                    "coverage": {
+                        "requirements": {},
+                        "outputs": {"split-parent implementation": ["leaf-a"]},
+                        "acceptance": {"focused test passes": ["leaf-b"]},
+                    },
+                    "dependent_replacements": {},
+                }
+            ),
+        )
+        self.mutate_current(
+            "graph-replan", "supersede-for-closeout", "--plan-json",
+            json.dumps(
+                {
+                    "reason": "replacement owns the remaining obligation",
+                    "operations": [
+                        {
+                            "op": "supersede",
+                            "node_id": "superseded",
+                            "replacement": "replacement",
+                        }
+                    ],
+                }
+            ),
+        )
+        replacement = StateStore().load(self.workflow_id)["nodes"]["replacement"]
+        self.mutate_current(
+            "node-refine", "reassess-replacement", "--node-id", "replacement",
+            "--refinement-json",
+            json.dumps(
+                {
+                    "spec": replacement["spec"],
+                    "acceptance": replacement["acceptance"],
+                    "write_scopes": replacement["write_scopes"],
+                    "assessment": {
+                        "dimensions": replacement["assessment"]["dimensions"],
+                        "ambiguity_factors": replacement["assessment"]["ambiguity_factors"],
+                        "rationale": replacement["assessment"]["rationale"],
+                    },
+                    **proof_contract("replacement"),
+                }
+            ),
+        )
+        for node_id in ("leaf-a", "leaf-b", "replacement"):
+            self.start_current(node_id)
+            self.mutate_current(
+                "node-complete", f"complete-{node_id}", "--node-id", node_id,
+                "--outcome", "succeeded",
+            )
+
+        before = StateStore().load(self.workflow_id)
+        expected_commands = [
+            command
+            for node_id in sorted(before["nodes"])
+            for command in (
+                before["nodes"][node_id]["evidence_positive_proof_command"],
+                before["nodes"][node_id]["evidence_negative_proof_command"],
+            )
+        ]
+        observed_commands: list[str] = []
+        real_runner = state_owner.run_proof_command
+
+        def recording_runner(command: str, *, repository: str):
+            observed_commands.append(command)
+            return real_runner(command, repository=repository)
+
+        with mock.patch.object(
+            state_owner, "run_proof_command", side_effect=recording_runner
+        ):
+            self.mutate_current(
+                "finish", "finish-all-records", "--summary", "done",
+                "--validation", "all graph proofs passed",
+            )
+        self.assertEqual(observed_commands, expected_commands)
+        completed = StateStore().load(self.workflow_id)
+        self.assertEqual(completed["status"], "completed")
+        for node_id, node in completed["nodes"].items():
+            self.assertEqual(node["proof"]["phase"], "workflow_completion")
+            self.assertEqual(
+                node["result"], f"{node_id} positive proof{os.linesep}"
+            )
+            self.assertEqual(
+                node["assessment"]["input_digest"],
+                state_owner._assessment_input_digest(completed, node),
+            )
+        self.assertEqual(completed["nodes"]["split-parent"]["status"], "skipped")
+        self.assertEqual(completed["nodes"]["superseded"]["status"], "skipped")
 
 
     def test_state_lock_is_advisory_persistent_exclusive_and_released_on_exit(self) -> None:

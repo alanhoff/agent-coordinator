@@ -18,9 +18,10 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
 from coordinator.routing.selector import STAGES, RoutingError, choose
+from coordinator.state.proofs import ProofExecutionError, run_proof_command
 
-SCHEMA_VERSION = 7
-LEGACY_SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
+LEGACY_SCHEMA_VERSIONS = (6, 7)
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_COMMAND_BYTES = MAX_STATE_BYTES
 MAX_NODES = 128
@@ -81,6 +82,23 @@ PLANNING_FIXED_POINT_ERROR = (
     "to have a current executable assessment"
 )
 FINISH_EVENT_SEPARATOR = "; validation: "
+PROOF_PHASES = ("node_completion", "workflow_completion")
+PROOF_CONTRACT_KEYS = {
+    "evidence",
+    "evidence_positive_proof_command",
+    "evidence_negative_proof_command",
+}
+LEGACY_NODE_RECORD_KEYS = {
+    "id", "title", "stage", "priority", "dependencies", "write_scopes", "role", "model",
+    "effort", "acceptance", "route", "launch", "attempts", "status", "result", "evidence",
+    "estimated_cost", "actual_cost", "superseded_by", "spec", "assessment", "lineage",
+}
+NODE_RECORD_KEYS = LEGACY_NODE_RECORD_KEYS | {
+    "evidence_positive_proof_command",
+    "evidence_negative_proof_command",
+    "proof_exempt",
+    "proof",
+}
 ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_RESERVED_SCOPE_NAMES = frozenset(
@@ -247,6 +265,119 @@ def _identifier(value: Any, field: str) -> str:
     if not ID_RE.fullmatch(text):
         raise StateError(f"{field} is not a safe identifier")
     return text
+
+
+def _validate_proof_contract(value: Any, field: str) -> dict[str, str]:
+    contract = _keys(value, PROOF_CONTRACT_KEYS, field)
+    return {
+        "evidence": _text(contract["evidence"], f"{field}.evidence"),
+        "evidence_positive_proof_command": _text(
+            contract["evidence_positive_proof_command"],
+            f"{field}.evidence_positive_proof_command",
+        ),
+        "evidence_negative_proof_command": _text(
+            contract["evidence_negative_proof_command"],
+            f"{field}.evidence_negative_proof_command",
+        ),
+    }
+
+
+def _validate_proof_record(value: Any, field: str) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    proof = _keys(
+        value,
+        {"phase", "positive_exit_code", "negative_exit_code", "verified_at"},
+        field,
+    )
+    if proof["phase"] not in PROOF_PHASES:
+        raise StateError(f"{field}.phase is invalid")
+    for name in ("positive_exit_code", "negative_exit_code"):
+        if not isinstance(proof[name], int) or isinstance(proof[name], bool):
+            raise StateError(f"{field}.{name} must be an integer")
+    _parse_time(proof["verified_at"], f"{field}.verified_at")
+    if not (_proof_is_success(proof) or _proof_is_failure(proof)):
+        raise StateError(f"{field} exit codes must be complementary")
+    return proof
+
+
+def _proof_is_success(proof: Mapping[str, Any]) -> bool:
+    return proof["positive_exit_code"] == 0 and proof["negative_exit_code"] != 0
+
+
+def _proof_is_failure(proof: Mapping[str, Any]) -> bool:
+    return proof["positive_exit_code"] != 0 and proof["negative_exit_code"] == 0
+
+
+def _execute_node_proof(
+    state: Mapping[str, Any],
+    node: Mapping[str, Any],
+    *,
+    phase: str,
+) -> tuple[str, dict[str, Any]]:
+    if phase not in PROOF_PHASES:
+        raise StateError("proof phase is invalid")
+    if node["proof_exempt"]:
+        raise StateError("legacy proof-exempt nodes do not execute proof commands")
+    repository = state["repository"]["path"]
+    expected_identity = state["repository"]["identity"]
+
+    def verify_repository_identity() -> None:
+        if canonical_repository(pathlib.Path(repository))["identity"] != expected_identity:
+            raise StateError(
+                "workflow repository object changed",
+                code="invalid_repository",
+                exit_code=20,
+            )
+
+    verify_repository_identity()
+    try:
+        positive = run_proof_command(
+            node["evidence_positive_proof_command"], repository=repository
+        )
+        if not positive.output.strip():
+            raise StateError(
+                "positive proof command must emit non-blank UTF-8 output",
+                code="proof_invalid",
+            )
+        verify_repository_identity()
+        negative = run_proof_command(
+            node["evidence_negative_proof_command"], repository=repository
+        )
+        verify_repository_identity()
+    except ProofExecutionError as exc:
+        raise StateError(
+            str(exc), code="proof_execution_error", exit_code=20
+        ) from exc
+    proof = {
+        "phase": phase,
+        "positive_exit_code": positive.exit_code,
+        "negative_exit_code": negative.exit_code,
+        "verified_at": now_iso(),
+    }
+    if not (_proof_is_success(proof) or _proof_is_failure(proof)):
+        raise StateError(
+            "proof commands are inconclusive: positive and negative commands must "
+            "have complementary zero/nonzero exit codes",
+            code="proof_inconclusive",
+        )
+    return _text(positive.output, "positive proof output"), proof
+
+
+def _require_proof_outcome(
+    proof: Mapping[str, Any], *, expected_success: bool, field: str
+) -> None:
+    matches = _proof_is_success(proof) if expected_success else _proof_is_failure(proof)
+    if not matches:
+        expected = (
+            "positive=0 and negative!=0"
+            if expected_success
+            else "positive!=0 and negative=0"
+        )
+        raise StateError(
+            f"{field} disagrees with proof commands; expected {expected}",
+            code="proof_mismatch",
+        )
 
 
 def _repository_identity(path: pathlib.Path, info: os.stat_result) -> str:
@@ -816,7 +947,17 @@ def _dependency_snapshot(node_id: str, node: Mapping[str, Any]) -> dict[str, Any
         "outputs": _effective_obligations(node)["outputs"],
         "disposition": node["status"] if node["status"] in TERMINAL_NODE_STATUSES else "nonterminal",
         "result": None if provisional else node["result"],
-        "evidence": None if provisional else node["evidence"],
+        "evidence": (
+            None
+            if provisional and node["proof_exempt"]
+            else node["evidence"]
+        ),
+        "evidence_positive_proof_command": node[
+            "evidence_positive_proof_command"
+        ],
+        "evidence_negative_proof_command": node[
+            "evidence_negative_proof_command"
+        ],
     }
 
 
@@ -837,6 +978,17 @@ def _assessment_input_digest(state: Mapping[str, Any], node: Mapping[str, Any]) 
     payload = {
         "spec": node["spec"],
         "acceptance": node["acceptance"],
+        "evidence": None if node["proof_exempt"] else node["evidence"],
+        "evidence_positive_proof_command": (
+            None
+            if node["proof_exempt"]
+            else node["evidence_positive_proof_command"]
+        ),
+        "evidence_negative_proof_command": (
+            None
+            if node["proof_exempt"]
+            else node["evidence_negative_proof_command"]
+        ),
         "obligations": node["lineage"]["obligations"],
         "requirements": requirements,
         "dependencies": dependencies,
@@ -1341,19 +1493,46 @@ def _empty_runtime_graph() -> dict[str, Any]:
 
 
 def _upgrade_state_document(value: Any) -> Any:
-    """Upgrade an exact schema-v6 document in memory; never repair unknown data."""
-    if not isinstance(value, dict) or value.get("schema_version") != LEGACY_SCHEMA_VERSION:
+    """Upgrade exact schema-v6/v7 documents in memory; never repair unknown data."""
+    if not isinstance(value, dict) or value.get("schema_version") not in LEGACY_SCHEMA_VERSIONS:
         return value
-    legacy_keys = {
+    schema_v6_keys = {
         "schema_version", "workflow_id", "repository", "task", "status", "phase",
         "revision", "created_at", "updated_at", "conventions", "nodes", "requirements",
         "decisions", "blockers", "events", "controller", "receipts",
     }
-    if set(value) != legacy_keys:
-        return value
     upgraded = copy.deepcopy(value)
+    if upgraded["schema_version"] == 6:
+        if set(upgraded) != schema_v6_keys:
+            return value
+        upgraded["schema_version"] = 7
+        upgraded["runtime_graph"] = _empty_runtime_graph()
+    schema_v7_keys = schema_v6_keys | {"runtime_graph"}
+    if upgraded["schema_version"] != 7 or set(upgraded) != schema_v7_keys:
+        return value
+    raw_nodes = upgraded.get("nodes")
+    if not isinstance(raw_nodes, dict):
+        return value
+    for raw_node in raw_nodes.values():
+        if (
+            not isinstance(raw_node, dict)
+            or set(raw_node) != LEGACY_NODE_RECORD_KEYS
+        ):
+            return value
+        raw_node.update(
+            {
+                "evidence_positive_proof_command": None,
+                "evidence_negative_proof_command": None,
+                "proof_exempt": True,
+                "proof": None,
+            }
+        )
     upgraded["schema_version"] = SCHEMA_VERSION
-    upgraded["runtime_graph"] = _empty_runtime_graph()
+    try:
+        for node_id in sorted(raw_nodes):
+            _refresh_node_assessment(upgraded, node_id)
+    except (StateError, KeyError, TypeError, AttributeError, IndexError):
+        return upgraded
     return upgraded
 
 
@@ -1813,11 +1992,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         node_id = _identifier(node_key, "node key")
         node = _keys(
             raw_node,
-            {
-                "id", "title", "stage", "priority", "dependencies", "write_scopes", "role", "model",
-                "effort", "acceptance", "route", "launch", "attempts", "status", "result", "evidence",
-                "estimated_cost", "actual_cost", "superseded_by", "spec", "assessment", "lineage",
-            },
+            NODE_RECORD_KEYS,
             f"nodes.{node_id}",
         )
         if node["id"] != node_id:
@@ -1857,6 +2032,28 @@ def validate_state(state: Any) -> dict[str, Any]:
             _text(item, f"nodes.{node_id}.acceptance", maximum=2048)
         if len(set(node["acceptance"])) != len(node["acceptance"]):
             raise StateError(f"nodes.{node_id}.acceptance must not contain duplicates")
+        if not isinstance(node["proof_exempt"], bool):
+            raise StateError(f"nodes.{node_id}.proof_exempt must be boolean")
+        if node["proof_exempt"]:
+            if (
+                node["evidence_positive_proof_command"] is not None
+                or node["evidence_negative_proof_command"] is not None
+                or node["proof"] is not None
+            ):
+                raise StateError(
+                    f"nodes.{node_id} legacy proof exemption requires null proof fields"
+                )
+        else:
+            _text(node["evidence"], f"nodes.{node_id}.evidence")
+            _text(
+                node["evidence_positive_proof_command"],
+                f"nodes.{node_id}.evidence_positive_proof_command",
+            )
+            _text(
+                node["evidence_negative_proof_command"],
+                f"nodes.{node_id}.evidence_negative_proof_command",
+            )
+            _validate_proof_record(node["proof"], f"nodes.{node_id}.proof")
         spec = _validate_spec(node["spec"], f"nodes.{node_id}.spec")
         assessment = _keys(
             node["assessment"],
@@ -2093,14 +2290,45 @@ def validate_state(state: Any) -> dict[str, Any]:
                 or node[key] < 0
             ):
                 raise StateError(f"nodes.{node_id}.{key} must be non-negative or null")
-        if node["status"] in ("done", "judging") and (not node["result"] or not node["evidence"]):
-            raise StateError(f"nodes.{node_id} completed execution requires result and evidence")
+        if node["status"] in ("done", "judging"):
+            if node["proof_exempt"]:
+                if not node["result"] or not node["evidence"]:
+                    raise StateError(
+                        f"nodes.{node_id} completed legacy execution requires result and evidence"
+                    )
+            elif not node["result"] or node["proof"] is None:
+                raise StateError(
+                    f"nodes.{node_id} completed execution requires positive proof output and metadata"
+                )
         if node["status"] in ("done", "judging") and (
             not node["attempts"]
             or set(node["attempts"][-1]["scope_baseline"]) != set(node["write_scopes"])
             or set(node["attempts"][-1]["scope_evidence"]) != set(node["write_scopes"])
         ):
             raise StateError(f"nodes.{node_id} completed execution requires attempt evidence for every write scope")
+        if not node["proof_exempt"] and node["proof"] is not None:
+            proof = node["proof"]
+            if (
+                proof["phase"] == "workflow_completion"
+                and top["status"] != "completed"
+            ):
+                raise StateError(
+                    f"nodes.{node_id} workflow-completion proof requires a completed workflow"
+                )
+            if node["status"] == "judging" and not _proof_is_success(proof):
+                raise StateError(f"nodes.{node_id} judging work requires successful proof")
+            if node["status"] == "done" and top["status"] != "completed":
+                metadata = _runtime_metadata(top, node_id)
+                if metadata is not None and metadata.get("kind") == "judge":
+                    target_id = metadata.get("judge_for")
+                    gate = top["runtime_graph"]["gates"].get(target_id)
+                    verdict = None if gate is None else gate["verdicts"].get(node_id)
+                    if verdict == "pass" and not _proof_is_success(proof):
+                        raise StateError(f"nodes.{node_id} pass verdict disagrees with proof")
+                    if verdict == "fail" and not _proof_is_failure(proof):
+                        raise StateError(f"nodes.{node_id} fail verdict disagrees with proof")
+                elif not _proof_is_success(proof):
+                    raise StateError(f"nodes.{node_id} done work requires successful proof")
         active_launch = launch["state"] in ("claimed", "reconcile_required", "bound", "running")
         aborted_recovery = (
             top["status"] == "aborted"
@@ -2154,12 +2382,16 @@ def validate_state(state: Any) -> dict[str, Any]:
         node = top["nodes"][node_id]
         if (
             node["status"] != "skipped"
-            or node["result"] != "superseded"
-            or not node["evidence"]
             or node["launch"]["state"] != "unclaimed"
             or node["lineage"]["child_ids"]
         ):
             raise StateError(f"nodes.{node_id} superseded_by source must be a skipped superseded leaf")
+        if node["proof_exempt"] and (
+            node["result"] != "superseded" or not node["evidence"]
+        ):
+            raise StateError(
+                f"nodes.{node_id} legacy superseded source requires result and evidence"
+            )
         if any(node_id in other["dependencies"] for other in top["nodes"].values()):
             raise StateError(f"nodes.{node_id} is superseded but still has dependents")
         replacement = top["nodes"][node["superseded_by"]]
@@ -2464,6 +2696,22 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError("completed workflow requires every node to resolve through done work")
         if any(item["status"] == "active" for item in top["requirements"].values()) or any(item["status"] == "active" for item in top["blockers"]):
             raise StateError("completed workflow cannot retain active requirements or blockers")
+        unproved = [
+            node_id
+            for node_id, node in top["nodes"].items()
+            if not node["proof_exempt"]
+            and (
+                node["proof"] is None
+                or node["proof"]["phase"] != "workflow_completion"
+                or not _proof_is_success(node["proof"])
+                or not node["result"]
+            )
+        ]
+        if unproved:
+            raise StateError(
+                "completed workflow requires successful closeout proof for every "
+                "non-exempt node: " + ", ".join(sorted(unproved))
+            )
     if top["status"] == "aborted" and top["phase"] != "aborted":
         raise StateError("aborted workflow phase is inconsistent")
     if top["phase"] == "completed" and top["status"] != "completed":
@@ -3087,6 +3335,18 @@ def _read_command_text(
     return result
 
 
+def _read_optional_command_text(
+    value: str | None,
+    path: str | None,
+    name: str,
+    *,
+    maximum: int = MAX_COMMAND_BYTES,
+) -> str | None:
+    if value is None and path is None:
+        return None
+    return _read_command_text(value, path, name, maximum=maximum)
+
+
 def _read_command_object(value: str | None, path: str | None, name: str) -> dict[str, Any]:
     text = _read_command_text(value, path, name)
     try:
@@ -3148,6 +3408,9 @@ def _node_record(
     model: str | None,
     effort: str | None,
     acceptance: list[str],
+    evidence: str,
+    evidence_positive_proof_command: str,
+    evidence_negative_proof_command: str,
     route_rationale: str,
     estimated_cost: float | None,
     spec: Mapping[str, Any],
@@ -3170,6 +3433,17 @@ def _node_record(
         "model": model,
         "effort": effort,
         "acceptance": list(acceptance),
+        "evidence": _text(evidence, "node evidence"),
+        "evidence_positive_proof_command": _text(
+            evidence_positive_proof_command,
+            "node evidence_positive_proof_command",
+        ),
+        "evidence_negative_proof_command": _text(
+            evidence_negative_proof_command,
+            "node evidence_negative_proof_command",
+        ),
+        "proof_exempt": False,
+        "proof": None,
         "spec": copy.deepcopy(dict(checked_spec)),
         "assessment": _assessment_shell(assessment),
         "lineage": {
@@ -3190,7 +3464,6 @@ def _node_record(
         "attempts": [],
         "status": "pending",
         "result": None,
-        "evidence": None,
         "estimated_cost": estimated_cost,
         "actual_cost": None,
         "superseded_by": None,
@@ -3209,6 +3482,9 @@ def _new_node(args: Any) -> dict[str, Any]:
         model=args.model,
         effort=args.effort,
         acceptance=args.acceptance,
+        evidence=args.evidence,
+        evidence_positive_proof_command=args.evidence_positive_proof_command,
+        evidence_negative_proof_command=args.evidence_negative_proof_command,
         route_rationale=args.rationale,
         estimated_cost=args.estimated_cost,
         spec={
@@ -3253,7 +3529,9 @@ def _reset_failed_leaf(node: dict[str, Any]) -> None:
         return
     node["status"] = "pending"
     node["result"] = None
-    node["evidence"] = None
+    node["proof"] = None
+    if node["proof_exempt"]:
+        node["evidence"] = None
     node["launch"] = {
         "state": "unclaimed",
         "request_id": None,
@@ -3265,7 +3543,8 @@ def _reset_failed_leaf(node: dict[str, Any]) -> None:
 
 SPLIT_CHILD_KEYS = {
     "id", "title", "stage", "priority", "dependencies", "write_scopes", "role", "model", "effort",
-    "acceptance", "route_rationale", "estimated_cost", "spec", "assessment",
+    "acceptance", "evidence", "evidence_positive_proof_command",
+    "evidence_negative_proof_command", "route_rationale", "estimated_cost", "spec", "assessment",
 }
 
 
@@ -3288,6 +3567,13 @@ def _split_child_record(raw: Any, *, parent_id: str, depth: int, index: int) -> 
         model=child["model"],
         effort=child["effort"],
         acceptance=acceptance,
+        evidence=child["evidence"],
+        evidence_positive_proof_command=child[
+            "evidence_positive_proof_command"
+        ],
+        evidence_negative_proof_command=child[
+            "evidence_negative_proof_command"
+        ],
         route_rationale=_text(child["route_rationale"], f"{field}.route_rationale", maximum=4096),
         estimated_cost=child["estimated_cost"],
         spec=child["spec"],
@@ -3401,6 +3687,13 @@ def _plan_node_record(raw: Any, index: int) -> dict[str, Any]:
         acceptance=_text_list(
             node["acceptance"], f"{field}.acceptance", required=True
         ),
+        evidence=node["evidence"],
+        evidence_positive_proof_command=node[
+            "evidence_positive_proof_command"
+        ],
+        evidence_negative_proof_command=node[
+            "evidence_negative_proof_command"
+        ],
         route_rationale=_text(
             node["route_rationale"], f"{field}.route_rationale", maximum=4096
         ),
@@ -3610,10 +3903,11 @@ def _complete_node(
     node_id: str,
     *,
     outcome: str,
-    result: str,
-    evidence: str,
+    result: str | None,
+    evidence: str | None,
     actual_cost: float | None,
     judge_completion: bool = False,
+    proof_expected_success: bool | None = None,
 ) -> dict[str, Any]:
     node = state["nodes"].get(node_id)
     if node is None:
@@ -3624,14 +3918,11 @@ def _complete_node(
         raise StateError("node-complete outcome is invalid")
     metadata = _runtime_metadata(state, node_id)
     if (
-        outcome == "succeeded"
-        and not judge_completion
+        not judge_completion
         and metadata is not None
         and metadata.get("kind") == "judge"
     ):
         raise StateError("runtime judge nodes must use judge-complete")
-    result = _text(result, "node result")
-    evidence = _text(evidence, "node evidence")
     if actual_cost is not None and (
         not isinstance(actual_cost, (int, float))
         or isinstance(actual_cost, bool)
@@ -3639,15 +3930,51 @@ def _complete_node(
         or actual_cost < 0
     ):
         raise StateError("actual_cost must be non-negative or null")
-    prior_dependency_snapshot = _dependency_snapshot(node_id, node)
     gate = state["runtime_graph"]["gates"].get(node_id)
-    if outcome == "succeeded":
-        node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
-            state, node
+    if outcome == "succeeded" and gate is not None and gate["status"] != "configured":
+        raise StateError("judge gate is not ready for a new completion attempt")
+    if node["proof_exempt"]:
+        if result is None or evidence is None:
+            raise StateError(
+                "legacy proof-exempt completion requires result and evidence"
+            )
+        result = _text(result, "node result")
+        evidence = _text(evidence, "node evidence")
+        proof = None
+    else:
+        if result is not None or evidence is not None:
+            raise StateError(
+                "proof-enforced completion derives result and uses planned evidence; "
+                "do not supply result or evidence"
+            )
+        if outcome == "succeeded":
+            node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
+                state, node
+            )
+        result, proof = _execute_node_proof(
+            state, node, phase="node_completion"
         )
+        expected_success = (
+            outcome == "succeeded"
+            if proof_expected_success is None
+            else proof_expected_success
+        )
+        _require_proof_outcome(
+            proof,
+            expected_success=expected_success,
+            field=("judge verdict" if judge_completion else "node outcome"),
+        )
+        if outcome == "succeeded":
+            node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
+                state, node
+            )
+    prior_dependency_snapshot = _dependency_snapshot(node_id, node)
+    if outcome == "succeeded":
+        if node["proof_exempt"]:
+            node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
+                state, node
+            )
         if gate is not None:
-            if gate["status"] != "configured":
-                raise StateError("judge gate is not ready for a new completion attempt")
             node["status"] = "judging"
             gate["status"] = "pending"
         else:
@@ -3655,7 +3982,10 @@ def _complete_node(
     else:
         node["status"] = "failed"
     node["result"] = result
-    node["evidence"] = evidence
+    if node["proof_exempt"]:
+        node["evidence"] = evidence
+    else:
+        node["proof"] = proof
     node["actual_cost"] = actual_cost
     node["launch"]["state"] = "terminal"
     node["attempts"][-1].update(
@@ -3680,6 +4010,25 @@ def _complete_node(
         f"node outcome={outcome}",
         node_id,
     )
+
+
+def _verify_workflow_proofs(state: dict[str, Any]) -> None:
+    for node_id in sorted(state["nodes"]):
+        node = state["nodes"][node_id]
+        if node["proof_exempt"]:
+            continue
+        result, proof = _execute_node_proof(
+            state, node, phase="workflow_completion"
+        )
+        _require_proof_outcome(
+            proof,
+            expected_success=True,
+            field=f"workflow completion for node {node_id}",
+        )
+        node["result"] = result
+        node["proof"] = proof
+    for node_id in sorted(state["nodes"]):
+        _refresh_node_assessment(state, node_id)
 
 
 def _finish_workflow_state(
@@ -3725,6 +4074,8 @@ def _finish_workflow_state(
             "review_waived",
             waiver + "; unreviewed artifact nodes: " + ", ".join(unreviewed),
         )
+    _verify_workflow_proofs(state)
+    _verify_finish_scopes(state)
     state["status"] = "completed"
     state["phase"] = "completed"
     return add_event(
@@ -3993,6 +4344,7 @@ def _node_manifest_from_parent(
     dependencies: list[str],
     write_scopes: list[str],
     acceptance: list[str],
+    proof_contract: Mapping[str, str],
     artifact: bool,
     fraction: float,
     source_dimensions: Mapping[str, int] | None = None,
@@ -4009,6 +4361,7 @@ def _node_manifest_from_parent(
         "model": None,
         "effort": None,
         "acceptance": acceptance,
+        **dict(proof_contract),
         "route_rationale": "runtime-generated node requires fresh route",
         "estimated_cost": None,
         "spec": {
@@ -4044,6 +4397,13 @@ def _plan_manifest_from_record(node: Mapping[str, Any]) -> dict[str, Any]:
         "model": node["model"],
         "effort": node["effort"],
         "acceptance": list(node["acceptance"]),
+        "evidence": node["evidence"],
+        "evidence_positive_proof_command": node[
+            "evidence_positive_proof_command"
+        ],
+        "evidence_negative_proof_command": node[
+            "evidence_negative_proof_command"
+        ],
         "route_rationale": node["route"]["rationale"],
         "estimated_cost": node["estimated_cost"],
         "spec": copy.deepcopy(node["spec"]),
@@ -4198,13 +4558,18 @@ def _checkpoint_running_for_adaptation(
         {"finished_at": now_iso(), "outcome": "adapted at runtime"}
     )
     node["status"] = "failed"
-    node["result"] = "runtime adaptation requested"
-    node["evidence"] = reason
+    node["result"] = None
+    node["proof"] = None
+    if node["proof_exempt"]:
+        node["result"] = "runtime adaptation requested"
+        node["evidence"] = reason
     node["launch"]["state"] = "terminal"
     _refresh_recovery_status(state)
 
 
-def _runtime_generated_split(state: dict[str, Any], node_id: str) -> dict[str, Any]:
+def _runtime_generated_split(
+    state: dict[str, Any], node_id: str, proof_plan: Mapping[str, Any]
+) -> dict[str, Any]:
     node = state["nodes"].get(node_id)
     if node is None:
         raise StateError("unknown node")
@@ -4222,6 +4587,15 @@ def _runtime_generated_split(state: dict[str, Any], node_id: str) -> dict[str, A
     if source_gate is not None and source_gate["status"] != "configured":
         raise StateError("runtime reconcile cannot move an active or resolved judge gate")
     reason = projection["reason"]
+    checked_proofs = _keys(
+        proof_plan, {"discovery", "execution"}, "proof_plan"
+    )
+    discovery_proof = _validate_proof_contract(
+        checked_proofs["discovery"], "proof_plan.discovery"
+    )
+    execution_proof = _validate_proof_contract(
+        checked_proofs["execution"], "proof_plan.execution"
+    )
     _checkpoint_running_for_adaptation(state, node_id, reason)
     discovery_id = _derived_runtime_id(state["nodes"], node_id, "discover")
     execution_id = _derived_runtime_id(
@@ -4240,6 +4614,7 @@ def _runtime_generated_split(state: dict[str, Any], node_id: str) -> dict[str, A
         dependencies=list(node["dependencies"]),
         write_scopes=[],
         acceptance=["Runtime findings identify bounded work and explicit acceptance evidence"],
+        proof_contract=discovery_proof,
         artifact=False,
         fraction=0.40,
         source_dimensions=projection["dimensions"],
@@ -4256,6 +4631,7 @@ def _runtime_generated_split(state: dict[str, Any], node_id: str) -> dict[str, A
         dependencies=[discovery_id],
         write_scopes=list(node["write_scopes"]),
         acceptance=list(node["acceptance"]),
+        proof_contract=execution_proof,
         artifact=bool(node["write_scopes"]),
         fraction=0.55,
         source_dimensions=projection["dimensions"],
@@ -4575,15 +4951,41 @@ def _reset_cloned_node(node: dict[str, Any], new_id: str, title: str) -> None:
     node["attempts"] = []
     node["status"] = "pending"
     node["result"] = None
-    node["evidence"] = None
+    node["proof"] = None
+    if node["proof_exempt"]:
+        node["evidence"] = None
     node["actual_cost"] = None
     node["superseded_by"] = None
     node["lineage"]["child_ids"] = []
     node["lineage"]["split_reason"] = None
 
 
+def _validate_iteration_proof_plan(
+    value: Any, judge_ids: list[str]
+) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    plan = _keys(value, {"target", "judges"}, "next_iteration_proof")
+    target = _validate_proof_contract(
+        plan["target"], "next_iteration_proof.target"
+    )
+    if not isinstance(plan["judges"], dict) or set(plan["judges"]) != set(judge_ids):
+        raise StateError(
+            "next_iteration_proof.judges must exactly cover prior judge identifiers"
+        )
+    judges = {
+        judge_id: _validate_proof_contract(
+            plan["judges"][judge_id],
+            f"next_iteration_proof.judges.{judge_id}",
+        )
+        for judge_id in judge_ids
+    }
+    return target, judges
+
+
 def _materialize_loop_iteration(
-    state: dict[str, Any], loop_id: str, failed_target_id: str
+    state: dict[str, Any],
+    loop_id: str,
+    failed_target_id: str,
+    next_iteration_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime = state["runtime_graph"]
     loop = runtime["loops"][loop_id]
@@ -4594,6 +4996,21 @@ def _materialize_loop_iteration(
         raise StateError("loop iteration budget is exhausted")
     failed_target = state["nodes"][failed_target_id]
     old_gate = runtime["gates"][failed_target_id]
+    if failed_target["proof_exempt"]:
+        if next_iteration_proof is None:
+            raise StateError(
+                "legacy proof-exempt loop requires a next-iteration proof plan"
+            )
+        target_proof, judge_proofs = _validate_iteration_proof_plan(
+            next_iteration_proof, old_gate["judge_ids"]
+        )
+    else:
+        if next_iteration_proof is not None:
+            raise StateError(
+                "next-iteration proof plan is only valid for a legacy proof-exempt loop"
+            )
+        target_proof = None
+        judge_proofs = {}
     required_nodes = 1 + len(old_gate["judge_ids"])
     if len(state["nodes"]) + required_nodes > MAX_NODES:
         raise StateError("loop cannot materialize within node capacity", code="capacity_exceeded", exit_code=20)
@@ -4604,6 +5021,9 @@ def _materialize_loop_iteration(
         new_target_id,
         f"{failed_target['title']} [iteration {next_iteration}]",
     )
+    if target_proof is not None:
+        new_target.update(target_proof)
+        new_target["proof_exempt"] = False
     if failed_target["lineage"]["parent_id"] is not None:
         parent_id = failed_target["lineage"]["parent_id"]
         state["nodes"][parent_id]["lineage"]["child_ids"].append(new_target_id)
@@ -4619,6 +5039,9 @@ def _materialize_loop_iteration(
             new_judge_id,
             f"{old_judge['title']} [iteration {next_iteration}]",
         )
+        if target_proof is not None:
+            new_judge.update(judge_proofs[old_judge_id])
+            new_judge["proof_exempt"] = False
         new_judge["dependencies"] = _ordered_union(
             [
                 new_target_id if dependency == failed_target_id else dependency
@@ -4646,8 +5069,11 @@ def _materialize_loop_iteration(
             downstream.append(node_id)
 
     failed_target["status"] = "skipped"
-    failed_target["result"] = "superseded"
-    failed_target["evidence"] = "judge gate failed; next bounded iteration materialized"
+    if failed_target["proof_exempt"]:
+        failed_target["result"] = "superseded"
+        failed_target["evidence"] = (
+            "judge gate failed; next bounded iteration materialized"
+        )
     failed_target["superseded_by"] = new_target_id
     failed_target["launch"] = {
         "state": "unclaimed",
@@ -4736,9 +5162,10 @@ def _complete_judge(
     judge_id: str,
     *,
     verdict: str,
-    result: str,
-    evidence: str,
+    result: str | None,
+    evidence: str | None,
     actual_cost: float | None,
+    next_iteration_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     judge_id = _identifier(judge_id, "judge_id")
     metadata = _runtime_metadata(state, judge_id)
@@ -4758,6 +5185,7 @@ def _complete_judge(
         evidence=evidence,
         actual_cost=actual_cost,
         judge_completion=True,
+        proof_expected_success=verdict == "pass",
     )
     gate["verdicts"][judge_id] = verdict
     outcome: dict[str, Any] = {
@@ -4767,6 +5195,10 @@ def _complete_judge(
         "gate_status": gate["status"],
     }
     if len(gate["verdicts"]) != len(gate["judge_ids"]):
+        if next_iteration_proof is not None:
+            raise StateError(
+                "next-iteration proof plan is valid only on the resolving judge verdict"
+            )
         return outcome
 
     target = state["nodes"][target_id]
@@ -4784,6 +5216,10 @@ def _complete_judge(
         _refresh_node_assessment(state, completed_judge_id)
     loop_id = state["runtime_graph"]["node_metadata"][target_id]["loop_id"]
     if passed:
+        if next_iteration_proof is not None:
+            raise StateError(
+                "next-iteration proof plan is invalid when the gate passes"
+            )
         target["status"] = "done"
         if loop_id is not None:
             loop = state["runtime_graph"]["loops"][loop_id]
@@ -4803,8 +5239,17 @@ def _complete_judge(
     elif loop_id is not None:
         loop = state["runtime_graph"]["loops"][loop_id]
         if loop["iteration"] < loop["max_iterations"]:
-            outcome["next_iteration"] = _materialize_loop_iteration(state, loop_id, target_id)
+            outcome["next_iteration"] = _materialize_loop_iteration(
+                state,
+                loop_id,
+                target_id,
+                next_iteration_proof=next_iteration_proof,
+            )
         else:
+            if next_iteration_proof is not None:
+                raise StateError(
+                    "next-iteration proof plan is invalid when the loop is exhausted"
+                )
             target["status"] = "failed"
             loop["status"] = "exhausted"
             loop["history"].append(
@@ -4820,6 +5265,10 @@ def _complete_judge(
             )
             add_event(state, "runtime_loop_exhausted", f"loop={loop_id}", target_id)
     else:
+        if next_iteration_proof is not None:
+            raise StateError(
+                "next-iteration proof plan is invalid when no iteration is created"
+            )
         target["status"] = "failed"
         _record_runtime_adaptation(
             state,
@@ -4954,7 +5403,9 @@ def _expand_runtime_graph(state: dict[str, Any], plan: Mapping[str, Any]) -> dic
     }
 
 
-def _reconcile_runtime_graph(state: dict[str, Any]) -> dict[str, Any]:
+def _reconcile_runtime_graph(
+    state: dict[str, Any], proof_plan: Mapping[str, Any]
+) -> dict[str, Any]:
     candidates = []
     for node_id, projection in state["runtime_graph"]["projections"].items():
         node = state["nodes"][node_id]
@@ -4969,7 +5420,7 @@ def _reconcile_runtime_graph(state: dict[str, Any]) -> dict[str, Any]:
         raise StateError("no actionable runtime projection is available")
     loads = _critical_path_loads(state)
     selected = sorted(candidates, key=lambda item: (-loads[item], item))[0]
-    result = _runtime_generated_split(state, selected)
+    result = _runtime_generated_split(state, selected, proof_plan)
     return {"changed": True, **result}
 
 def _apply_split_plan(
@@ -5132,9 +5583,9 @@ def _apply_split_plan(
     parent["lineage"]["split_reason"] = reason
     parent["assessment"]["state"] = "decomposed"
     parent["status"] = "skipped"
-    if parent["result"] is None:
+    if parent["proof_exempt"] and parent["result"] is None:
         parent["result"] = "decomposed"
-    if parent["evidence"] is None:
+    if parent["proof_exempt"] and parent["evidence"] is None:
         parent["evidence"] = reason
     return add_event(state, "node_split", reason, parent_id)
 
@@ -5254,7 +5705,7 @@ def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
             "live execution evidence requires bounded graph adaptation",
             command="graph-reconcile",
             node_ids=actionable_runtime,
-            required=[],
+            required=["proof_plan"],
         )
     blocked_nodes = _active_blocked_node_ids(state)
     assessable = [
@@ -5593,12 +6044,25 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
 
     if command == "node-refine":
         refinement = _read_command_object(args.refinement_json, args.refinement_file, "refinement")
-        _keys(refinement, {"spec", "acceptance", "write_scopes", "assessment"}, "refinement")
 
         def refine(state: dict[str, Any]) -> dict[str, Any]:
             node = state["nodes"].get(args.node_id)
             if node is None:
                 raise StateError("unknown node")
+            refinement_keys = {"spec", "acceptance", "write_scopes", "assessment"}
+            if node["proof_exempt"]:
+                _keys(refinement, refinement_keys, "refinement")
+                proof_contract = None
+            else:
+                _keys(
+                    refinement,
+                    refinement_keys | PROOF_CONTRACT_KEYS,
+                    "refinement",
+                )
+                proof_contract = _validate_proof_contract(
+                    {key: refinement[key] for key in PROOF_CONTRACT_KEYS},
+                    "refinement",
+                )
             _require_rewritable_leaf(node, "node-refine")
             if _derived_assessment_state(state, node) == "split_required":
                 raise StateError("node-refine cannot replace required decomposition; use node-split")
@@ -5616,6 +6080,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             node["spec"] = copy.deepcopy(dict(spec))
             node["acceptance"] = acceptance
             node["write_scopes"] = write_scopes
+            if proof_contract is not None:
+                node.update(proof_contract)
+                node["result"] = None
+                node["proof"] = None
             for field in OBLIGATION_FIELDS:
                 node["lineage"]["obligations"][field] = _ordered_union(
                     node["lineage"]["obligations"][field],
@@ -5678,10 +6146,16 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         )
 
     if command == "graph-reconcile":
-        operation = {"policy": "highest-critical-path-actionable-v1"}
+        proof_plan = _read_command_object(
+            args.proof_plan_json, args.proof_plan_file, "proof_plan"
+        )
+        operation = {
+            "policy": "highest-critical-path-actionable-v1",
+            "proof_plan": proof_plan,
+        }
 
         def reconcile_graph(state: dict[str, Any]) -> dict[str, Any]:
-            return _reconcile_runtime_graph(state)
+            return _reconcile_runtime_graph(state, proof_plan)
 
         state, result, replay = _mutate_command(
             store, args, command, operation, reconcile_graph
@@ -5747,9 +6221,21 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 code="invalid_invocation",
                 exit_code=2,
             )
-        result_text = _read_command_text(args.result, args.result_file, "result")
-        evidence_text = _read_command_text(
+        result_text = _read_optional_command_text(
+            args.result, args.result_file, "result"
+        )
+        evidence_text = _read_optional_command_text(
             args.evidence, args.evidence_file, "evidence"
+        )
+        next_iteration_proof = (
+            None
+            if args.next_iteration_proof_json is None
+            and args.next_iteration_proof_file is None
+            else _read_command_object(
+                args.next_iteration_proof_json,
+                args.next_iteration_proof_file,
+                "next_iteration_proof",
+            )
         )
         operation = {
             "node_id": args.node_id,
@@ -5757,6 +6243,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             "result": result_text,
             "evidence": evidence_text,
             "actual_cost": args.actual_cost,
+            "next_iteration_proof": next_iteration_proof,
         }
 
         def complete_judge(state: dict[str, Any]) -> dict[str, Any]:
@@ -5767,6 +6254,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 result=result_text,
                 evidence=evidence_text,
                 actual_cost=args.actual_cost,
+                next_iteration_proof=next_iteration_proof,
             )
 
         state, result, replay = _mutate_command(
@@ -5935,10 +6423,10 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 code="invalid_invocation",
                 exit_code=2,
             )
-        result_text = _read_command_text(
+        result_text = _read_optional_command_text(
             args.result, args.result_file, "result"
         )
-        evidence_text = _read_command_text(
+        evidence_text = _read_optional_command_text(
             args.evidence, args.evidence_file, "evidence"
         )
         operation = {
@@ -5990,6 +6478,19 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             prior_dependency_snapshot = _dependency_snapshot(args.node_id, node)
             if not any(value is not None for key, value in operation.items() if key != "node_id"):
                 raise StateError("node-update requires a changed field")
+            if args.actual_cost is not None and (
+                not isinstance(args.actual_cost, (int, float))
+                or isinstance(args.actual_cost, bool)
+                or not math.isfinite(args.actual_cost)
+                or args.actual_cost < 0
+            ):
+                raise StateError("actual_cost must be non-negative or null")
+            if args.status is None and (
+                args.result is not None or args.evidence is not None
+            ):
+                raise StateError(
+                    "result and evidence require a terminal status update"
+                )
             if args.launch_state is not None:
                 allowed_launch = {
                     "unclaimed": {"claimed"},
@@ -6073,7 +6574,9 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     if node["status"] == "running":
                         node["status"] = "pending"
                         node["result"] = None
-                        node["evidence"] = None
+                        node["proof"] = None
+                        if node["proof_exempt"]:
+                            node["evidence"] = None
                     _invalidate_assessment(state, node)
                     _refresh_recovery_status(state)
                 elif args.launch_state == "terminal" and (
@@ -6089,6 +6592,9 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 else:
                     node["launch"]["state"] = args.launch_state
             if args.status is not None:
+                terminal_result = args.result
+                terminal_evidence = args.evidence
+                terminal_proof = None
                 allowed_status = {
                     "pending": {"ready", "blocked"},
                     "ready": {"running", "blocked"},
@@ -6133,19 +6639,51 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         for dependency in node["dependencies"]
                     ):
                         raise StateError("node dependencies are not satisfied")
-                if args.status == "done":
-                    if args.node_id in state["runtime_graph"]["gates"]:
-                        raise StateError("gated work must pass judge-complete verdicts before done")
+                if args.status in TERMINAL_NODE_STATUSES:
                     metadata = _runtime_metadata(state, args.node_id)
                     if metadata is not None and metadata.get("kind") == "judge":
                         raise StateError("runtime judge nodes must use judge-complete")
-                    if not args.result or not args.evidence:
-                        raise StateError("done node requires --result and --evidence")
-                    node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(state, node)
+                if args.status == "done" and args.node_id in state["runtime_graph"]["gates"]:
+                    raise StateError("gated work must pass judge-complete verdicts before done")
+                if args.status in ("done", "failed"):
+                    if node["proof_exempt"]:
+                        if args.status == "done" and (
+                            not terminal_result or not terminal_evidence
+                        ):
+                            raise StateError("done legacy node requires --result and --evidence")
+                    else:
+                        if terminal_result is not None or terminal_evidence is not None:
+                            raise StateError(
+                                "proof-enforced terminal updates derive result and use "
+                                "planned evidence; do not supply result or evidence"
+                            )
+                        if args.status == "done":
+                            node["attempts"][-1]["scope_evidence"] = (
+                                _complete_scope_evidence(state, node)
+                            )
+                        terminal_result, terminal_proof = _execute_node_proof(
+                            state, node, phase="node_completion"
+                        )
+                        _require_proof_outcome(
+                            terminal_proof,
+                            expected_success=args.status == "done",
+                            field="node status",
+                        )
+                        if args.status == "done":
+                            node["attempts"][-1]["scope_evidence"] = (
+                                _complete_scope_evidence(state, node)
+                            )
+                elif args.result is not None or args.evidence is not None:
+                    raise StateError(
+                        "result and evidence are valid only with a terminal status update"
+                    )
                 node["status"] = args.status
                 if args.status in TERMINAL_NODE_STATUSES:
-                    node["result"] = args.result
-                    node["evidence"] = args.evidence
+                    node["result"] = terminal_result
+                    if node["proof_exempt"]:
+                        node["evidence"] = terminal_evidence
+                    else:
+                        node["proof"] = terminal_proof
                     if node["launch"]["child_id"]:
                         node["launch"]["state"] = "terminal"
                     if node["attempts"] and node["attempts"][-1]["finished_at"] is None:
@@ -6307,8 +6845,9 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         ):
                             _invalidate_direct_dependents(state, replacement)
                     node["status"] = "skipped"
-                    node["result"] = "superseded"
-                    node["evidence"] = plan["reason"]
+                    if node["proof_exempt"]:
+                        node["result"] = "superseded"
+                        node["evidence"] = plan["reason"]
                     node["superseded_by"] = replacement
                     for other in state["nodes"].values():
                         if node_id in other["dependencies"]:
@@ -6574,8 +7113,12 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
             for node in state["nodes"].values():
                 if node["status"] not in TERMINAL_NODE_STATUSES:
                     node["status"] = "cancelled"
-                    node["result"] = args.reason
-                    node["evidence"] = "controller abort"
+                    if node["proof_exempt"]:
+                        node["result"] = args.reason
+                        node["evidence"] = "controller abort"
+                    else:
+                        node["result"] = None
+                        node["proof"] = None
                     if node["launch"]["state"] in ("claimed", "reconcile_required", "bound", "running"):
                         node["launch"]["state"] = "reconcile_required"
                         node["launch"]["reconciliation"] = "abort requires provider outcome reconciliation"

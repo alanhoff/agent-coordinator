@@ -6,6 +6,8 @@ import io
 import json
 import os
 import pathlib
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,6 +42,33 @@ AMBIGUITY = {
     "dependencies": 0,
     "acceptance": 0,
 }
+
+
+def proof_contract(node_id: str, *, succeeds: bool = True) -> dict[str, str]:
+    output = f"{node_id} positive proof"
+    positive_body = f"print({output!r})" + ("" if succeeds else "; raise SystemExit(1)")
+    negative_body = "raise SystemExit(1)" if succeeds else "print('negative proof reproduced')"
+    return {
+        "evidence": f"Terminal proof commands validate {node_id}",
+        "evidence_positive_proof_command": python_command(positive_body),
+        "evidence_negative_proof_command": python_command(negative_body),
+    }
+
+
+def python_command(body: str) -> str:
+    arguments = [sys.executable, "-c", body]
+    return (
+        subprocess.list2cmdline(arguments)
+        if os.name == "nt"
+        else shlex.join(arguments)
+    )
+
+
+def reconciliation_proof_plan(node_id: str) -> dict[str, dict[str, str]]:
+    return {
+        "discovery": proof_contract(f"{node_id} discovery"),
+        "execution": proof_contract(f"{node_id} execution"),
+    }
 
 
 def manifest(
@@ -81,6 +110,7 @@ def manifest(
             "ambiguity_factors": dict(AMBIGUITY),
             "rationale": "bounded runtime test work",
         },
+        **proof_contract(node_id),
     }
 
 
@@ -190,6 +220,21 @@ class DynamicRuntimeTests(unittest.TestCase):
             json.dumps({"requirements": [], "nodes": list(nodes)}),
         )
 
+    def downgrade_persisted_state_to_v7(self) -> None:
+        store = StateStore()
+        path = store._state_path(self.workflow_id)
+        legacy = copy.deepcopy(store.load(self.workflow_id))
+        legacy["schema_version"] = 7
+        for node in legacy["nodes"].values():
+            node.pop("evidence_positive_proof_command")
+            node.pop("evidence_negative_proof_command")
+            node.pop("proof_exempt")
+            node.pop("proof")
+        path.write_text(
+            json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def start(self, node_id: str) -> None:
         self.mutate(
             "node-route-auto",
@@ -216,24 +261,29 @@ class DynamicRuntimeTests(unittest.TestCase):
             node_id,
             "--outcome",
             "succeeded",
-            "--result",
-            f"{node_id} completed",
-            "--evidence",
-            f"{node_id} evidence",
         )
 
     def judge(self, judge_id: str, verdict: str) -> dict:
         self.start(judge_id)
+        if verdict == "fail":
+            results = [
+                mock.Mock(exit_code=1, output=f"{judge_id} failure reproduced\n"),
+                mock.Mock(exit_code=0, output="negative proof reproduced\n"),
+            ]
+            with mock.patch.object(state_owner, "run_proof_command", side_effect=results):
+                return self.mutate(
+                    "judge-complete",
+                    "--node-id",
+                    judge_id,
+                    "--verdict",
+                    verdict,
+                )
         return self.mutate(
             "judge-complete",
             "--node-id",
             judge_id,
             "--verdict",
             verdict,
-            "--result",
-            f"{judge_id} reviewed",
-            "--evidence",
-            f"{judge_id} independent evidence",
         )
 
     def gate_plan(
@@ -284,17 +334,24 @@ class DynamicRuntimeTests(unittest.TestCase):
             expected=expected,
         )
 
-    def test_schema_v6_loads_in_memory_and_persists_v7_on_next_mutation(self) -> None:
+    def test_schema_v6_loads_in_memory_and_persists_v8_on_next_mutation(self) -> None:
+        self.apply(manifest("legacy-node"))
         store = StateStore()
         path = store._state_path(self.workflow_id)
         legacy = copy.deepcopy(store.load(self.workflow_id))
         legacy["schema_version"] = 6
         legacy.pop("runtime_graph")
+        for node in legacy["nodes"].values():
+            node.pop("evidence_positive_proof_command")
+            node.pop("evidence_negative_proof_command")
+            node.pop("proof_exempt")
+            node.pop("proof")
         path.write_text(json.dumps(legacy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         loaded = store.load(self.workflow_id)
-        self.assertEqual(loaded["schema_version"], 7)
+        self.assertEqual(loaded["schema_version"], 8)
         self.assertEqual(loaded["runtime_graph"]["generation"], 0)
+        self.assertTrue(loaded["nodes"]["legacy-node"]["proof_exempt"])
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 6)
 
         self.mutate(
@@ -302,15 +359,16 @@ class DynamicRuntimeTests(unittest.TestCase):
             "--requirement-id",
             "migration-proof",
             "--text",
-            "Persist schema seven",
+            "Persist schema eight",
             "--source",
             "test",
             "--status",
             "active",
         )
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 7)
+        self.assertEqual(persisted["schema_version"], 8)
         self.assertIn("runtime_graph", persisted)
+        self.assertTrue(persisted["nodes"]["legacy-node"]["proof_exempt"])
 
     def test_observations_recalculate_complexity_and_are_monotonic_and_atomic(self) -> None:
         self.apply(manifest("adaptive"), manifest("ambiguous"))
@@ -389,7 +447,11 @@ class DynamicRuntimeTests(unittest.TestCase):
             "--observation-json",
             json.dumps(observation(progress=45, total=8, cost=100, confidence=35)),
         )
-        reconciled = self.mutate("graph-reconcile")
+        reconciled = self.mutate(
+            "graph-reconcile",
+            "--proof-plan-json",
+            json.dumps(reconciliation_proof_plan("running-parent")),
+        )
         child_ids = reconciled["data"]["reconciliation"]["child_ids"]
         self.assertEqual(len(child_ids), 2)
         discovery, execution = child_ids
@@ -546,7 +608,7 @@ class DynamicRuntimeTests(unittest.TestCase):
         self.assertEqual(judging["nodes"]["candidate"]["status"], "judging")
         snapshot = state_owner._dependency_snapshot("candidate", judging["nodes"]["candidate"])
         self.assertIsNone(snapshot["result"])
-        self.assertIsNone(snapshot["evidence"])
+        self.assertEqual(snapshot["evidence"], proof_contract("candidate")["evidence"])
         self.assertEqual(snapshot["disposition"], "nonterminal")
 
         judge_id = judging["runtime_graph"]["gates"]["candidate"]["judge_ids"][0]
@@ -609,10 +671,6 @@ class DynamicRuntimeTests(unittest.TestCase):
             judge_id,
             "--outcome",
             "succeeded",
-            "--result",
-            "generic completion",
-            "--evidence",
-            "generic completion evidence",
             expected=2,
         )
         self.assertIn(
@@ -627,10 +685,6 @@ class DynamicRuntimeTests(unittest.TestCase):
             judge_id,
             "--status",
             "done",
-            "--result",
-            "generic status update",
-            "--evidence",
-            "generic status update evidence",
             expected=2,
         )
         self.assertIn(
@@ -645,10 +699,6 @@ class DynamicRuntimeTests(unittest.TestCase):
             judge_id,
             "--verdict",
             "pass",
-            "--result",
-            "judge reviewed the candidate",
-            "--evidence",
-            "independent judge evidence",
         )
         self.assertEqual(completed["data"]["judgment"]["gate_status"], "passed")
         state = StateStore().load(self.workflow_id)
@@ -726,6 +776,21 @@ class DynamicRuntimeTests(unittest.TestCase):
         self.assertEqual(state["nodes"]["loop-target"]["superseded_by"], replacement)
         self.assertEqual(state["nodes"]["after-loop"]["dependencies"], [replacement])
         self.assertEqual(state["runtime_graph"]["loops"]["quality-loop"]["iteration"], 2)
+        for field in (
+            "evidence",
+            "evidence_positive_proof_command",
+            "evidence_negative_proof_command",
+        ):
+            self.assertEqual(
+                state["nodes"][replacement][field],
+                state["nodes"]["loop-target"][field],
+            )
+            self.assertEqual(
+                state["nodes"][replacement_judge][field],
+                state["nodes"]["loop-target.judge-1"][field],
+            )
+        self.assertFalse(state["nodes"][replacement]["proof_exempt"])
+        self.assertFalse(state["nodes"][replacement_judge]["proof_exempt"])
         self.assertEqual(graph_diagnostics(
             state["nodes"],
             case_sensitive=state["conventions"]["write_scope_case_sensitive"],
@@ -924,7 +989,11 @@ class DynamicRuntimeTests(unittest.TestCase):
             "--observation-json",
             json.dumps(observation(progress=15, total=8, confidence=25)),
         )
-        reconciled = self.mutate("graph-reconcile")
+        reconciled = self.mutate(
+            "graph-reconcile",
+            "--proof-plan-json",
+            json.dumps(reconciliation_proof_plan("gated-adaptive")),
+        )
         discovery, execution = reconciled["data"]["reconciliation"]["child_ids"]
         state = StateStore().load(self.workflow_id)
         self.assertNotIn("gated-adaptive", state["runtime_graph"]["gates"])
@@ -1185,7 +1254,11 @@ class DynamicRuntimeTests(unittest.TestCase):
             "--observation-json",
             json.dumps(observation(progress=20, total=8)),
         )
-        reconciled = self.mutate("graph-reconcile")
+        reconciled = self.mutate(
+            "graph-reconcile",
+            "--proof-plan-json",
+            json.dumps(reconciliation_proof_plan("loop-root")),
+        )
         discovery = reconciled["data"]["reconciliation"]["child_ids"][0]
         baseline = StateStore().load(self.workflow_id)
         rejected = self.mutate(
@@ -1237,7 +1310,11 @@ class DynamicRuntimeTests(unittest.TestCase):
             "--observation-json",
             json.dumps(observation(progress=15, total=8, confidence=20)),
         )
-        reconciled = self.mutate("graph-reconcile")
+        reconciled = self.mutate(
+            "graph-reconcile",
+            "--proof-plan-json",
+            json.dumps(reconciliation_proof_plan("blocked-adaptive")),
+        )
         child_ids = reconciled["data"]["reconciliation"]["child_ids"]
         state = StateStore().load(self.workflow_id)
         self.assertTrue(set(child_ids).issubset(state_owner._active_blocked_node_ids(state)))
@@ -1317,10 +1394,6 @@ class DynamicRuntimeTests(unittest.TestCase):
             judge_id,
             "--verdict",
             "pass",
-            "--result",
-            "judge recovered and reviewed",
-            "--evidence",
-            "provider identity and independent review evidence verified",
             session=second_session,
         )
         state = StateStore().load(self.workflow_id)
@@ -1350,6 +1423,212 @@ class DynamicRuntimeTests(unittest.TestCase):
             state_owner._refresh_node_assessment(malformed, judge_id)
         with self.assertRaisesRegex(StateError, "requires every configured verdict"):
             validate_state(malformed)
+
+    def test_runtime_manifest_surfaces_require_exact_proof_contracts(self) -> None:
+        self.apply(manifest("expand-parent"), manifest("gate-parent"))
+        baseline = StateStore().load(self.workflow_id)
+
+        missing_fragment = manifest("missing-fragment")
+        missing_fragment.pop("evidence_positive_proof_command")
+        rejected_fragment = self.expand(
+            "expand-parent",
+            fragments=[missing_fragment, manifest("valid-fragment-peer")],
+            join=None,
+            expected=2,
+        )
+        self.assertIn(
+            "evidence_positive_proof_command",
+            rejected_fragment["data"]["message"],
+        )
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        unknown_join = manifest("unknown-join", stage="integration", role="validator")
+        unknown_join["proof_exempt"] = False
+        rejected_join = self.expand(
+            "expand-parent",
+            fragments=[
+                manifest("valid-fragment-a"),
+                manifest("valid-fragment-b"),
+            ],
+            join=unknown_join,
+            expected=2,
+        )
+        self.assertIn("proof_exempt", rejected_join["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        missing_judge = self.gate_plan(
+            "gate-parent", judge_count=1, mode="all", required=1
+        )
+        missing_judge["judges"][0].pop("evidence_negative_proof_command")
+        rejected_judge = self.mutate(
+            "judge-gate-add", "--node-id", "gate-parent", "--gate-json",
+            json.dumps(missing_judge), expected=2,
+        )
+        self.assertIn(
+            "evidence_negative_proof_command",
+            rejected_judge["data"]["message"],
+        )
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+    def test_graph_reconcile_requires_an_exact_proof_bundle(self) -> None:
+        self.apply(manifest("adaptive-proof"))
+        self.mutate(
+            "node-observe", "--node-id", "adaptive-proof", "--observation-json",
+            json.dumps(observation(progress=20, total=8, confidence=20)),
+        )
+        baseline = StateStore().load(self.workflow_id)
+        missing_cli_bundle = self.mutate("graph-reconcile", expected=2)
+        self.assertEqual(missing_cli_bundle["code"], "invalid_invocation")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        missing = reconciliation_proof_plan("adaptive-proof")
+        missing["discovery"].pop("evidence")
+        rejected_missing = self.mutate(
+            "graph-reconcile", "--proof-plan-json", json.dumps(missing),
+            expected=2,
+        )
+        self.assertIn("evidence", rejected_missing["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        unknown = reconciliation_proof_plan("adaptive-proof")
+        unknown["execution"]["proof_exempt"] = False
+        rejected_unknown = self.mutate(
+            "graph-reconcile", "--proof-plan-json", json.dumps(unknown),
+            expected=2,
+        )
+        self.assertIn("proof_exempt", rejected_unknown["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        valid = reconciliation_proof_plan("adaptive-proof")
+        reconciled = self.mutate(
+            "graph-reconcile", "--proof-plan-json", json.dumps(valid)
+        )
+        discovery_id, execution_id = reconciled["data"]["reconciliation"]["child_ids"]
+        state = StateStore().load(self.workflow_id)
+        for node_id, contract_name in (
+            (discovery_id, "discovery"),
+            (execution_id, "execution"),
+        ):
+            self.assertFalse(state["nodes"][node_id]["proof_exempt"])
+            for field, value in valid[contract_name].items():
+                self.assertEqual(state["nodes"][node_id][field], value)
+
+    def test_judge_verdict_must_agree_with_its_proof_pair_atomically(self) -> None:
+        self.apply(manifest("judge-agreement"))
+        self.mutate(
+            "judge-gate-add", "--node-id", "judge-agreement", "--gate-json",
+            json.dumps(
+                self.gate_plan(
+                    "judge-agreement", judge_count=1, mode="all", required=1
+                )
+            ),
+        )
+        self.start("judge-agreement")
+        self.complete("judge-agreement")
+        judge_id = "judge-agreement.judge-1"
+        self.start(judge_id)
+        baseline = StateStore().load(self.workflow_id)
+        rejected = self.mutate(
+            "judge-complete", "--node-id", judge_id, "--verdict", "fail",
+            expected=2,
+        )
+        self.assertEqual(rejected["code"], "proof_mismatch")
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+        self.mutate(
+            "judge-complete", "--node-id", judge_id, "--verdict", "pass"
+        )
+
+    def test_schema_v7_nodes_remain_exempt_but_post_migration_nodes_are_strict(self) -> None:
+        self.apply(manifest("legacy-v7"))
+        self.downgrade_persisted_state_to_v7()
+        store = StateStore()
+        path = store._state_path(self.workflow_id)
+        loaded = store.load(self.workflow_id)
+        self.assertEqual(loaded["schema_version"], 8)
+        self.assertTrue(loaded["nodes"]["legacy-v7"]["proof_exempt"])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 7)
+
+        self.apply(manifest("strict-after-migration"))
+        migrated = StateStore().load(self.workflow_id)
+        self.assertEqual(migrated["schema_version"], 8)
+        self.assertTrue(migrated["nodes"]["legacy-v7"]["proof_exempt"])
+        self.assertFalse(
+            migrated["nodes"]["strict-after-migration"]["proof_exempt"]
+        )
+
+        self.start("legacy-v7")
+        self.mutate(
+            "node-complete", "--node-id", "legacy-v7", "--outcome", "succeeded",
+            "--result", "legacy result", "--evidence", "legacy evidence",
+        )
+        self.start("strict-after-migration")
+        self.complete("strict-after-migration")
+        self.mutate(
+            "workflow-complete", "--completion-json",
+            json.dumps(
+                {
+                    "summary": "migration complete",
+                    "validation": "strict proof reran",
+                    "requirements": {},
+                }
+            ),
+        )
+        completed = StateStore().load(self.workflow_id)
+        legacy = completed["nodes"]["legacy-v7"]
+        strict = completed["nodes"]["strict-after-migration"]
+        self.assertEqual((legacy["result"], legacy["evidence"]), ("legacy result", "legacy evidence"))
+        self.assertIsNone(legacy["proof"])
+        self.assertEqual(strict["proof"]["phase"], "workflow_completion")
+
+    def test_legacy_feedback_loop_requires_proofs_for_the_next_iteration(self) -> None:
+        self.apply(manifest("legacy-loop"))
+        self.mutate(
+            "judge-gate-add", "--node-id", "legacy-loop", "--gate-json",
+            json.dumps(
+                self.gate_plan(
+                    "legacy-loop", judge_count=1, mode="all", required=1,
+                    loop={"id": "legacy-loop-id", "max_iterations": 2},
+                )
+            ),
+        )
+        self.downgrade_persisted_state_to_v7()
+        self.start("legacy-loop")
+        self.mutate(
+            "node-complete", "--node-id", "legacy-loop", "--outcome", "succeeded",
+            "--result", "legacy candidate", "--evidence", "legacy candidate evidence",
+        )
+        judge_id = "legacy-loop.judge-1"
+        self.start(judge_id)
+        baseline = StateStore().load(self.workflow_id)
+        missing = self.mutate(
+            "judge-complete", "--node-id", judge_id, "--verdict", "fail",
+            "--result", "legacy judge rejected", "--evidence", "legacy judge evidence",
+            expected=2,
+        )
+        self.assertIn("next-iteration proof plan", missing["data"]["message"])
+        self.assertEqual(StateStore().load(self.workflow_id), baseline)
+
+        bundle = {
+            "target": proof_contract("legacy-loop iteration 2"),
+            "judges": {
+                judge_id: proof_contract("legacy-loop judge iteration 2")
+            },
+        }
+        resolved = self.mutate(
+            "judge-complete", "--node-id", judge_id, "--verdict", "fail",
+            "--result", "legacy judge rejected", "--evidence", "legacy judge evidence",
+            "--next-iteration-proof-json", json.dumps(bundle),
+        )
+        iteration = resolved["data"]["judgment"]["next_iteration"]
+        state = StateStore().load(self.workflow_id)
+        new_target = state["nodes"][iteration["target_id"]]
+        new_judge = state["nodes"][iteration["judge_ids"][0]]
+        self.assertFalse(new_target["proof_exempt"])
+        self.assertFalse(new_judge["proof_exempt"])
+        for field, value in bundle["target"].items():
+            self.assertEqual(new_target[field], value)
+        for field, value in bundle["judges"][judge_id].items():
+            self.assertEqual(new_judge[field], value)
 
     def test_runtime_control_plane_fences_judges_and_active_gates_from_generic_rewrites(self) -> None:
         self.apply(manifest("controlled"))

@@ -175,17 +175,18 @@ Antes de iniciar el enrutamiento, toda hoja evaluable que no esté bloqueada deb
 
 - Cada parte ejecutable tiene criterios de aceptación, un rol y cero o más `write_scopes` normalizados relativos al repositorio.
 - La ausencia de ámbitos —es decir, una lista `write_scopes` vacía— indica trabajo basado únicamente en evidencia y requiere `change_surface=0`. El trabajo sobre artefactos requiere una puntuación positiva de superficie de cambio y al menos un ámbito.
+- Cada parte nueva declara evidencia descriptiva y comandos de prueba positivo y negativo repetibles. El éxito exige que el positivo termine con `0` y el negativo con un valor distinto de cero; el fracaso exige el par inverso.
 - No puede haber solapamiento de ámbitos entre trabajos activos independientes. La comparación entre mayúsculas y minúsculas sigue el comportamiento detectado en el sistema de archivos de destino.
 - El enrutamiento solo clasifica los candidatos anunciados por el entorno de ejecución activo. Si no hay un catálogo vigente disponible o la selección falla, la ejecución hereda el modelo y el nivel de esfuerzo del elemento padre.
 - Al reclamar el trabajo, se registra una línea base SHA-256 para cada ámbito de artefactos. Para completar una parte, cada ámbito declarado debe seguir materializado y haber cambiado durante ese intento.
-- Para completar el flujo de trabajo, deben cumplirse los requisitos y resolverse los bloqueos, la evidencia debe ser válida y solo puede haber estados terminales permitidos. Coordinator no invoca ni inspecciona ningún sistema de control de versiones.
+- Al completar el flujo de trabajo se vuelven a ejecutar las pruebas de todos los registros no exentos, incluido el historial descompuesto y sustituido, y cada par debe demostrar éxito. También deben cumplirse los requisitos, resolverse los bloqueos y existir solo estados terminales permitidos. Coordinator no invoca ni inspecciona ningún sistema de control de versiones.
 
 </details>
 
 <details>
 <summary>Inspección del estado, incluido Windows</summary>
 
-Los documentos persistentes de flujos de trabajo con esquema v6 se guardan en `~/.agent-coordinator/workflows`. Estos comandos son de solo lectura y nunca crean, bloquean, reparan, normalizan, almacenan en caché ni limpian el estado.
+Los documentos persistentes de flujos de trabajo con esquema v8 se guardan en `~/.agent-coordinator/workflows`; los documentos v6 y v7 se actualizan automáticamente y sus nodos existentes quedan exentos de pruebas de forma permanente. Estos comandos son de solo lectura y nunca crean, bloquean, reparan, normalizan, almacenan en caché ni limpian el estado.
 
 ```sh
 python3 ~/.agents/skills/coordinator/scripts/coordinator_state.py list --json
