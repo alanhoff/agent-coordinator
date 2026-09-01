@@ -1018,7 +1018,7 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(
             (state["nodes"]["dependency"]["result"], state["nodes"]["dependency"]["evidence"]),
             (
-                "dependency positive proof\n",
+                f"dependency positive proof{os.linesep}",
                 proof_contract("dependency")["evidence"],
             ),
         )
@@ -4370,7 +4370,7 @@ class DurableStateTests(unittest.TestCase):
         )
         self.assertEqual(completed["code"], "node_completed")
         node = StateStore().load(self.workflow_id)["nodes"]["proofed"]
-        self.assertEqual(node["result"], "proof-run-1\n")
+        self.assertEqual(node["result"], f"proof-run-1{os.linesep}")
         self.assertEqual(node["evidence"], proof_contract("proofed")["evidence"])
         self.assertEqual(
             (
@@ -4400,7 +4400,9 @@ class DurableStateTests(unittest.TestCase):
         )
         node = StateStore().load(self.workflow_id)["nodes"]["expected-failure"]
         self.assertEqual(node["status"], "failed")
-        self.assertEqual(node["result"], "expected-failure positive proof\n")
+        self.assertEqual(
+            node["result"], f"expected-failure positive proof{os.linesep}"
+        )
         self.assertNotEqual(node["proof"]["positive_exit_code"], 0)
         self.assertEqual(node["proof"]["negative_exit_code"], 0)
 
@@ -4607,7 +4609,7 @@ class DurableStateTests(unittest.TestCase):
         current = state_owner._scope_fingerprint(str(self.repo), "src/output.txt")
         self.assertNotEqual(before_proof, current)
         self.assertEqual(recorded, current)
-        self.assertEqual(node["result"], "build verified\n")
+        self.assertEqual(node["result"], f"build verified{os.linesep}")
 
     def test_closeout_detects_regression_and_leaves_state_atomic(self) -> None:
         positive = python_command(
@@ -4763,7 +4765,9 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         for node_id, node in completed["nodes"].items():
             self.assertEqual(node["proof"]["phase"], "workflow_completion")
-            self.assertEqual(node["result"], f"{node_id} positive proof\n")
+            self.assertEqual(
+                node["result"], f"{node_id} positive proof{os.linesep}"
+            )
             self.assertEqual(
                 node["assessment"]["input_digest"],
                 state_owner._assessment_input_digest(completed, node),

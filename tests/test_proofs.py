@@ -56,7 +56,9 @@ class ProofRunnerTests(unittest.TestCase):
             python_command("print('failure-output'); raise SystemExit(7)"),
             repository=str(self.repository),
         )
-        self.assertEqual((failed.exit_code, failed.output), (7, "failure-output\n"))
+        self.assertEqual(
+            (failed.exit_code, failed.output), (7, f"failure-output{os.linesep}")
+        )
 
     def test_output_limit_invalid_utf8_timeout_and_launch_error_are_rejected(self) -> None:
         cases = (
