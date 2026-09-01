@@ -53,7 +53,7 @@ scopes, one role, and a rubric-v2 assessment. Valid stages are `architecture`, `
 Omit write scopes only for evidence-only work that will not change repository artifacts, and score its
 `change_surface` as 0. Any positive `change_surface` requires at least one scope, and any declared
 scope requires a positive `change_surface`; the state owner rejects mismatches. The workflow's
-schema-v6 conventions default `node_complexity_split_threshold` to 6,
+schema-v7 conventions default `node_complexity_split_threshold` to 6,
 `dimension_complexity_split_threshold` to 3, `node_ambiguity_refine_threshold` to 4,
 `factor_ambiguity_refine_threshold` to 2, and `max_refinement_depth` to 8. Thresholds are inclusive:
 reaching one requires another planning mutation. Independent nodes may not overlap scopes.
@@ -146,7 +146,28 @@ After every material mutation, call read-only `next --workflow-id WORKFLOW --jso
 action as an oracle for the next legal action class, then supply the required semantic inputs; it never
 contains secrets or shell-escaped commands. On a newly initialized workflow with no nodes, `plan`
 means apply one non-empty `plan-apply` manifest rather than attempting closeout. Planning diagnostics
-order ready work by descending critical-path load, then priority, then node ID.
+order ready work by descending critical-path load, then priority, then node ID. Runtime projections
+replace a node's static load only for remaining-work ordering; they never overwrite its authored
+assessment.
+
+Record `node-observe` only when execution reveals material new evidence: current progress, remaining
+five-dimension complexity, remaining ambiguity, cost, confidence, signals, and a note. The state owner
+derives `stable`, `refine`, or `split`; never author or edit that recommendation. Progress is monotonic.
+When `next` returns `reconcile_runtime`, run `graph-reconcile` to adapt exactly one highest-live-load
+actionable leaf and then inspect the new graph. It may checkpoint running work and replace it with a
+bounded discovery → execution pipeline. For a known topology, use `graph-expand-auto`; auto mode may
+choose pipeline, parallel, fan-out/fan-in, map/reduce, diamond, or arbitrary acyclic DAG. Keep explicit
+fragments bounded and deterministic. Nested expansions preserve graph paths. Persisted dependencies
+must remain acyclic; recurrence uses versioned iterations, never back-edges.
+
+Attach `judge-gate-add` to live leaf work before it completes when acceptance requires independent
+review or validation. Judge manifests are evidence-only and use `review` or `validation` stages. A
+successful target then enters `judging`; route, claim, start, and finish every configured judge, using
+`judge-complete` for its `pass` or `fail` verdict. The gate resolves only after the full panel reports.
+An optional loop may materialize another acyclic target-and-judge iteration up to its hard limit.
+A configured gate follows a runtime rewrite only when the rewrite has one completion exit; add a join
+before expanding gated work into multiple branches. Do not use generic split or replan operations to
+bypass active gates, judge nodes, or feedback loops. See `references/dynamic-runtime-graphs.md`.
 
 Inspect the current tool surface before selecting a claim batch. If no delegation tool is callable,
 runtime capacity is one: select and claim exactly one inline node, then take it terminal before claiming
@@ -157,7 +178,9 @@ or result. Terminal-success bridges stop live dependency ordering and remaining-
 downstream is concurrently runnable, while repairable failed work retains its complexity. Do not leave
 a real slot idle when a compliant leaf can run. For every selected node:
 
-1. Read `agents/roles/ROLE.toml` from `SKILL_DIR`. Build one task packet containing its `description`
+1. Read `agents/roles/<role>.toml` from `SKILL_DIR`, replacing `<role>` with the node's persisted role;
+   for example, an `implementer` node uses `agents/roles/implementer.toml`. Build one task packet
+   containing its `description`
    and `developer_instructions` verbatim, plus the repository, node objective, dependencies, write
    scopes, native specification, effective requirements/outputs/acceptance, lineage provenance,
    required evidence, and a ban on graph mutation. Carried obligations remain acceptance commitments;
@@ -212,7 +235,12 @@ Review must converge on evidence. Default to one integrated review wave after im
 focused validation. Add another fix/revalidation wave only for a concrete acceptance-relevant finding
 with file or test evidence; reviewing a clean review is not itself a reason to spawn more judges.
 Parallel judges are justified only by explicitly distinct risk surfaces, and their findings must be
-merged before deciding on another wave. On an explicit user stop or acceptance instruction, stop
+merged before deciding on another wave. A successful evidence-only `review` node covers completed
+artifact work in its transitive dependency ancestry. Closeout rejects any other completed artifact
+work unless `workflow-complete` includes a non-blank `review_waiver` reason (or advanced `finish` uses
+`--review-waiver`); the state owner records that decision as a `review_waived` event. Use a waiver only
+for a deliberate stop or acceptance decision, never to hide an unresolved review finding. On an
+explicit user stop or acceptance instruction, stop
 spawning immediately, reconcile or interrupt active providers, and close with already-completed
 evidence—never reinterpret “finish” as permission for another quality wave.
 
@@ -226,4 +254,5 @@ reported instead of adding a second persistence system. Close the private sessio
 persisted state without mutation.
 
 See `references/workflow-protocol.md`, `references/complexity-accounting.md`,
-`references/state-schema.md`, and `references/model-routing.md` for the stable contracts.
+`references/state-schema.md`, `references/dynamic-runtime-graphs.md`, and
+`references/model-routing.md` for the stable contracts.

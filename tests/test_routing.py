@@ -9,7 +9,8 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+RUNTIME = ROOT / "skill" / "scripts" / "lib"
+sys.path.insert(0, str(RUNTIME))
 
 from coordinator.cli import routing as routing_cli  # noqa: E402
 from coordinator.routing.selector import RoutingError, choose  # noqa: E402

@@ -1,10 +1,46 @@
 # Workflow state and recovery
 
-Coordinator stores one bounded `schema-v6` JSON document with `schema_version` equal to 6 per
-workflow under `~/.agent-coordinator/workflows`. The state owner validates the complete document on
+Coordinator stores one bounded `schema-v7` JSON document with `schema_version` equal to 7 per
+workflow under `~/.agent-coordinator/workflows`. Exact schema-version-6 documents are upgraded in
+memory with an empty runtime graph and are persisted as version 7 only by the next successful mutation. The state owner validates the complete document on
 every read and before every persisted mutation. It rejects unknown fields, unsafe identifiers and write paths,
 missing or cyclic dependencies, concurrent scope collisions, invalid transitions, inconsistent
 execution state, and capacity violations.
+
+## Runtime graph control plane
+
+Schema version 7 adds one exact-key `runtime_graph` object:
+
+- `generation`: the latest monotonically increasing adaptation generation;
+- `observations`: up to 64 timestamped live observations per node;
+- `projections`: the policy-derived projection from exactly the latest observation;
+- `node_metadata`: task, join, or judge kind; a nested graph path of at most 32 identifiers; selected
+  shape; iteration; judge target; loop; and generator;
+- `gates`: completion panels keyed by target node;
+- `loops`: up to 32 bounded logical feedback loops;
+- `adaptations`: up to 256 ordered audit records.
+
+The state owner recomputes every stored projection and rejects tampering. Live observations contain
+0–100 progress and confidence, remaining rubric dimensions and ambiguity factors, nullable
+non-negative remaining cost, up to 16 bounded signals, and a note. Progress cannot decrease. A runtime
+projection may reorder remaining critical-path load or recommend `stable`, `refine`, or `split`, but it
+does not overwrite the authored assessment.
+
+Generated topology is bounded to the workflow's 128-node ceiling and remains physically acyclic.
+Explicit runtime expansions accept two through sixteen fragments and an optional join. Runtime node
+metadata preserves nested provenance. A configured gate can move to one replacement exit; active or
+resolved gates cannot be structurally moved. Generic split/replan paths are fenced from active gates,
+judge nodes, and active loops.
+
+A gated target that otherwise succeeds uses node status `judging`, with a terminal launch and
+provisional result/evidence held from downstream dependency digests. Its one through eight judges are
+evidence-only `review` or `validation` nodes. Gate modes are `all`, `any`, and `quorum`; the complete
+configured panel reports before resolution. A passing gate exposes the target as `done`. A failed gate
+either exposes `failed` or, for an active feedback loop, materializes a new versioned target and judge
+panel. Loops permit two through sixteen iterations and become `passed` or `exhausted`; no persisted
+back-edge is introduced.
+
+See `dynamic-runtime-graphs.md` for command payloads, selection rules, and adaptation invariants.
 
 ## Planning policy and node records
 
@@ -101,8 +137,9 @@ derived total, and peak instead of collapsing uncertainty to Boolean membership.
 retains `ready_nodes` as an alias. Dispatch order is descending critical-path load, then priority, then
 node ID. Critical-path load measures remaining work. Terminal-success and decomposed nodes contribute
 zero and sever the bridge to downstream dependents; a repairable failed leaf retains its assessment
-complexity. Other remaining leaves contribute their assessment total plus the greatest reachable
-downstream dependent load. `usable_parallelism` is
+complexity. Other remaining leaves contribute their live runtime load when a projection exists, otherwise their
+assessment total, plus the greatest reachable downstream dependent load. Live load combines remaining
+complexity, logarithmically bounded remaining cost, and a low-confidence penalty. `usable_parallelism` is
 `max_parallel - reserve`; `available_parallelism` is the smaller of frontier width and usable capacity
 remaining after active launches. These diagnostics do not relax dependencies, write-scope exclusion,
 reserve, or actual runtime capacity. They describe graph capacity, not guaranteed executors. The
@@ -157,7 +194,11 @@ the snapshot. A node with no write scopes is explicitly evidence-only,
 must have `assessment.dimensions.change_surface` equal to 0, and uses empty scope maps. Conversely, a
 positive change-surface score requires a scope, and any scope requires a positive score. This relation
 is validated for added, refined, split, and stored nodes. The runtime never invokes or inspects a
-version-control system. The combined finish summary,
+version-control system. A successful evidence-only `review` node covers completed artifact nodes in
+its transitive dependency ancestry. Closeout rejects uncovered completed artifact work unless the
+controller supplies a non-blank `review_waiver`; the same atomic mutation records a `review_waived`
+event naming the uncovered nodes. A waiver is rejected when review coverage is already complete. The
+combined finish summary,
 separator, and validation text must fit the event-size bound. Skipped and cancelled nodes do not claim artifact evidence. Only a
 `skipped` decomposed parent or `skipped` superseded leaf resolves without runtime completion; a
 `cancelled` node never satisfies workflow completion.

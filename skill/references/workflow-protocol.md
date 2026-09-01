@@ -24,11 +24,21 @@ specialists never mutate the graph.
 4. Reject capacity-stranding plans: every assessable leaf whose current recorded total or dimension
    scores reach an inclusive split threshold counts even when `stale` or `refinement_required`. It cannot be at maximum
    depth, and two unused node records remain reserved for it.
-5. Treat routes created by add, refine, or split as provisional. After the latest assessment and global
-   fixed point, use `node-route-auto` to derive the existing router request from persisted assessment,
-   rank only runtime-advertised candidates, and persist the route in the same mutation; inherit the
-   parent route when no candidate is available. Manual `node-route` is an advanced override.
-6. Read the compact, deterministic `next` action after each material mutation. An empty initialized
+5. Record `node-observe` when material execution evidence changes remaining complexity, ambiguity,
+   cost, confidence, or progress. Accept only the policy-derived projection. When `next` selects
+   `reconcile_runtime`, run `graph-reconcile` for one highest-live-critical-path actionable node, or use
+   `graph-expand-auto` when a bounded explicit topology is already known. Generated topology may be
+   nested or an arbitrary acyclic DAG; it must remain within node, depth, history, and scope bounds.
+6. Configure `judge-gate-add` before target completion when independent evidence is part of acceptance.
+   A successful target waits in `judging` while every configured evidence-only judge runs. Complete each
+   with `judge-complete`; an optional loop creates versioned acyclic iterations until a gate passes or
+   the hard iteration limit is exhausted. Never bypass a gate or loop with generic graph mutations.
+7. Treat routes created by add, refine, split, runtime expansion, or a loop iteration as provisional.
+   After the latest assessment and global fixed point, use `node-route-auto` to derive the existing
+   router request from persisted assessment, rank only runtime-advertised candidates, and persist the
+   route in the same mutation; inherit the parent route when no candidate is available. Manual
+   `node-route` is an advanced override.
+8. Read the compact, deterministic `next` action after each material mutation. An empty initialized
    workflow returns `plan`, never `finish`; apply a non-empty manifest before dispatch. Then inspect the tool
    surface before selecting claims. With callable delegation, select a maximal
    genuinely runnable subset of the ordered frontier: remaining capacity first, then dependency and
@@ -38,24 +48,33 @@ specialists never mutate the graph.
    and remaining-work load both stop through terminal-success bridges because downstream is
    concurrently runnable. Recompute after each claim rather than assuming the original frontier remains
    safe.
-7. Read each selected role TOML. Include native specification, effective requirements/outputs/
+9. Read `agents/roles/<role>.toml`, replacing `<role>` with each selected node's persisted role.
+   Include native specification, effective requirements/outputs/
    acceptance, and lineage provenance in its task packet. Run `node-claim` before delegation, then
    `node-start` after a child is definitely created, and `node-complete` only after inspecting outputs
    and acceptance evidence. Inline execution uses the same lifecycle and consumes the parent sequentially.
-8. Reconcile an ambiguous delegation before inline fallback or retry. Never duplicate uncertain work.
-9. Persist terminal results and evidence, then reassess affected work. Dependency effective-output
+10. Reconcile an ambiguous delegation before inline fallback or retry. Never duplicate uncertain work.
+11. Persist terminal results and evidence, then reassess affected work. Dependency effective-output
    changes, normalized terminal disposition, result/evidence, or retry can stale direct assessable
    dependents; nonterminal status transitions cannot.
-10. Repeat refinement and execution until no runnable work remains. Resolve blockers, validate the
+12. Repeat refinement and execution until no runnable work remains. Resolve blockers, validate the
    integrated result, confirm every declared artifact scope has attempt-scoped change evidence anchored
    to the original repository filesystem object and remains materialized, then use one
    `workflow-complete` payload to satisfy exactly the active requirements and finish atomically. Close
-   the private session. Evidence-only
+   the private session. Completed artifact work must be covered by a successful evidence-only review
+   in its transitive dependency ancestry or the completion payload must contain a non-blank
+   `review_waiver` reason. Evidence-only
    nodes use persisted result/evidence and empty scope maps.
 
 ## Mutation boundaries and recovery
 
-Active work is immutable to graph planning. Never refine, split, rewire, or replace a node whose launch
+Ordinary planning keeps active work immutable. Policy-driven runtime reconciliation is the narrow
+exception: it can checkpoint a consistent `running` attempt as terminal failure and then atomically
+replace that leaf. It cannot touch `claimed`, `bound`, or `reconcile_required` launches. A configured
+judge gate may follow a rewrite only to one completion exit. Once judgment is pending or resolved, or a
+loop is active around the node, generic structural operations are fenced.
+
+Active work is immutable to ordinary graph planning. Never refine, split, rewire, or replace a node whose launch
 is `claimed`, `reconcile_required`, `bound`, or `running`. Let it reach a terminal outcome first. A
 `failed` leaf with an `unclaimed` or `terminal` launch may then be refined or split, but its completed
 attempt record remains part of history.
@@ -108,6 +127,12 @@ a clean review does not justify a replacement judge. Use parallel judges only fo
 risk surfaces, merge their findings into one set, and decide from that merged evidence whether another
 wave is warranted. There is no arbitrary numeric ceiling that hides a real defect, but there is a hard
 convergence rule: no new concrete finding, no new wave.
+
+A successful evidence-only `review` node covers completed artifact nodes in its transitive dependency
+ancestry. If any completed artifact work remains uncovered at closeout, `next` requires
+`review_waiver`; `workflow-complete` accepts that optional field only in this case and records its
+non-blank reason in a durable `review_waived` event. Advanced `finish` provides the equivalent
+`--review-waiver` option. Do not waive a known unresolved finding.
 
 An explicit user instruction to stop, accept, or finish overrides speculative quality expansion. Stop
 spawning immediately, reconcile or interrupt active providers, preserve completed evidence, and close

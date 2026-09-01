@@ -52,7 +52,7 @@
 按照 INSTALL.md 安装 https://github.com/alanhoff/agent-coordinator
 ```
 
-该流程会将仓库克隆到临时目录，记录其提交 ID，组装一个全新的技能，为当前用户安装该技能，删除临时检出目录，并报告安装路径和源提交。仅当现有目标目录能够表明自身属于 Coordinator 时，才会替换该目录。
+该流程会将仓库克隆到临时目录，记录其提交 ID，为当前用户复制完整且自包含的 `skill/` 目录，删除临时检出目录，并报告安装路径和源提交。仅当现有目标目录能够表明自身属于 Coordinator 时，才会替换该目录。
 
 运行 Coordinator 需要 Python 3.11 或更高版本，不需要第三方运行时软件包。安装过程不会修改 Codex 设置，也不会注册全局自定义智能体配置文件。
 
@@ -209,25 +209,29 @@ Windows 状态位于 `%USERPROFILE%\.agent-coordinator\workflows`。
 <details>
 <summary>Docker 演示</summary>
 
-该演示使用固定版本的 OpenAI Codex 通用镜像，并要求在被忽略的根目录 `.env` 文件中设置 `OPENAI_API_KEY`。技能和源代码以只读方式挂载；可变输出保存在被忽略的 `data/` 目录中。
+该演示会构建一个一次性的 Node.js 容器，在其中安装 Codex，并以只读方式挂载本仓库的 Coordinator 技能。请在被忽略的 `demo/.env` 文件中设置 `OPENAI_API_KEY`：
 
-使用 Coordinator 生成后端：
-
-```sh
-docker compose run --rm coordinator
+```dotenv
+OPENAI_API_KEY=你的-api-密钥
 ```
 
-`data/project/` 必须是全新的；唯一允许存在的顶层条目是一个现有的普通 `.nvmrc` 文件。再次运行前若需清空 `data/`，请先保留其中需要的内容。
-
-生成的应用位于 `data/project/`，其后端位于 `data/project/backend/`。Codex 会话、Coordinator 状态和 SQLite 数据分别使用同级目录，生成的应用不纳入仓库自动化验证。
-
-手动启动生成的后端：
+从仓库根目录运行演示：
 
 ```sh
-docker compose up backend
+cd demo
+./run.sh
 ```
 
-随后即可通过 `http://localhost:3000` 访问 API，其 SQLite 数据库会持久保存在 `data/sqlite/todos.db`。
+每次运行都会先删除 `demo/home/`，再生成全新的应用。再次运行前，请先保留需要的输出。
+
+生成的应用及其 `todos.db` 数据库会保留在 `demo/home/app/` 中。Coordinator 状态保存在 `demo/home/state/`，Codex 状态保存在 `demo/home/codex/`。运行结束时，Compose 资源会被移除，但这些绑定挂载的文件仍会保留以供检查。
+
+生成的项目提供自己的 `npm start` 命令。请使用当前版本的 Node.js 运行：
+
+```sh
+cd demo/home/app
+npm start
+```
 
 </details>
 

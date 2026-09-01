@@ -34,7 +34,7 @@ an advanced override. Omit unset model/effort arguments from delegated invocatio
 
 Route only a non-blocked assessable leaf whose persisted assessment is current and `executable`, and
 only when every other non-blocked assessable leaf is also current and executable. Keep the router API
-unchanged and adapt schema-v6 assessment values to its existing 1–5 request fields as follows:
+unchanged and adapt persisted schema-v7 assessment values to its existing 1–5 request fields as follows:
 
 - `complexity = clamp(1, 5, ceil(assessment.total / 4))`
 - `ambiguity = clamp(1, 5, assessment.ambiguity_total + 1)`
@@ -45,3 +45,8 @@ Use the node objective for `summary` and its stage for `stage`. Assess `critical
 separately from current execution evidence because they are routing demand, not decomposition
 complexity. Never author a second complexity, ambiguity, coupling, or novelty estimate during routing.
 If evidence changes the assessment digest, reassess the node before constructing another request.
+
+Runtime projections affect dispatch and reconciliation priority only. `node-route-auto` continues to
+derive model demand from the current persisted assessment, so telemetry cannot silently replace the
+auditable rubric used to authorize a claim. Runtime-generated nodes receive fresh assessments and
+therefore route normally after reaching the global fixed point.
