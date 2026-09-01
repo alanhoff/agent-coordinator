@@ -207,7 +207,28 @@ jobs:
             download_dir="$RUNNER_TEMP/release-readback"
             mkdir "$download_dir"
             gh release download "$tag" --pattern "$ASSET_NAME" --dir "$download_dir"
-            cmp "$ASSET_PATH" "$download_dir/$ASSET_NAME"
+            PUBLISHED_ASSET="$download_dir/$ASSET_NAME" python3 - <<'PY'
+          import os
+          import zipfile
+
+          def logical_files(label, path):
+              with zipfile.ZipFile(path) as package:
+                  invalid = package.testzip()
+                  if invalid is not None:
+                      raise SystemExit(f"{label} archive failed CRC at {invalid}")
+                  names = [entry.filename for entry in package.infolist() if not entry.is_dir()]
+                  if len(names) != len(set(names)):
+                      raise SystemExit(f"{label} archive contains duplicate files")
+                  return {name: package.read(name) for name in names}
+
+          local = logical_files("local", os.environ["ASSET_PATH"])
+          published = logical_files("published", os.environ["PUBLISHED_ASSET"])
+          if local.keys() != published.keys():
+              raise SystemExit("published archive inventory differs from the validated local archive")
+          for name, content in local.items():
+              if published[name] != content:
+                  raise SystemExit(f"published archive content differs for {name}")
+          PY
           }
 
           if gh release view "$tag" >/dev/null 2>&1; then
