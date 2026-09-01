@@ -1,0 +1,29 @@
+services:
+  coordinator:
+    build:
+      context: ../
+      dockerfile: demo/Dockerfile
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      CODEX_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set in .env}
+    volumes:
+      - ./prompt.md:/home/node/prompt.md:ro
+      - ../skill:/home/node/.agents/skills/coordinator:ro
+      - ./home/app:/home/node/app:rw
+      - ./home/state:/home/node/.agent-coordinator:rw
+      - ./home/codex:/home/node/.codex:rw
+    working_dir: /home/node
+    command:
+      - -c
+      - |
+        set -e
+        curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh -l
+        codex exec \
+          --sandbox danger-full-access \
+          --ignore-user-config \
+          --model gpt-5.6-luna \
+          -c model_reasoning_effort=medium \
+          --dangerously-bypass-approvals-and-sandbox \
+          --skip-git-repo-check \
+          --cd ~/app \
+          - < prompt.md

@@ -1,8 +1,8 @@
 # Contributing
 
 Contributions are welcome through focused issues and pull requests. The runtime has one owner for each
-core invariant: `src/coordinator/state`, `routing`, and thin `cli` adapters. Preserve those boundaries
-and the no-project-footprint contract.
+core invariant under `skill/scripts/lib/coordinator`: `state`, `routing`, and thin `cli` adapters.
+Preserve those boundaries and the no-project-footprint contract.
 
 ## Development
 
@@ -18,8 +18,8 @@ Run the repository checks:
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m compileall -q src skill/scripts tests
-ruff check --no-cache src skill/scripts tests
+python3 -m compileall -q skill/scripts tests
+ruff check --no-cache skill/scripts tests
 ```
 
 Contract changes belong in `tests/test_contract.py`; state and routing behavior belong in their owning

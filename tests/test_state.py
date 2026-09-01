@@ -15,8 +15,9 @@ import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+RUNTIME = ROOT / "skill" / "scripts" / "lib"
 
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(RUNTIME))
 
 from coordinator.cli import state as state_cli  # noqa: E402
 from coordinator.state import store as state_owner  # noqa: E402
@@ -317,7 +318,7 @@ class DurableStateTests(unittest.TestCase):
         )
 
         state = StateStore().load(self.workflow_id)
-        self.assertEqual(state["schema_version"], 6)
+        self.assertEqual(state["schema_version"], 7)
         self.assertNotIn("git", state)
         self.assertEqual(
             {
@@ -987,6 +988,7 @@ class DurableStateTests(unittest.TestCase):
                 "available_parallelism",
                 "critical_path_load",
                 "dispatch_order",
+                "runtime",
                 "ready_nodes",
             },
         )
@@ -4190,7 +4192,7 @@ class DurableStateTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            env={**os.environ, "PYTHONPATH": str(RUNTIME)},
         )
         try:
             self.assertEqual(child.stdout.readline().strip(), "locked")

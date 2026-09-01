@@ -5,9 +5,9 @@ of returning shell commands for the user to run.
 
 1. Clone `https://github.com/alanhoff/agent-coordinator` into a temporary directory and record its
    commit ID.
-2. Assemble a fresh directory from the checkout: copy the contents of `skill/`, copy `LICENSE` into
-   its root, and copy `src/coordinator/` to `scripts/lib/coordinator/`.
-3. Install that complete directory at `~/.agents/skills/coordinator`. Replace an existing destination
+2. Treat `skill/` as the complete installation artifact. Copy that directory as a whole; do not merge
+   files from the checkout root or assemble its bundled runtime separately.
+3. Install an exact copy of `skill/` at `~/.agents/skills/coordinator`. Replace an existing destination
    only when its `SKILL.md` declares `name: coordinator`; never merge old and new contents. If the path
    belongs to something else, leave it untouched and ask the user where to install.
 4. Remove the temporary checkout and report the installed path and source commit.

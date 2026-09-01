@@ -321,3 +321,17 @@ Write-scope ordering uses live dependency reachability. It stops through a
 `done`, `skipped`, or `cancelled` bridge because downstream work is concurrently runnable; overlapping
 scopes on those live peers are therefore rejected. Recompute after every claim and terminal result;
 finish an inline attempt before selecting its successor.
+
+## Runtime projection
+
+The rubric-v2 assessment remains the authored planning baseline. During execution, `node-observe`
+records the same five dimensions and five ambiguity factors as **remaining** work, plus progress,
+confidence, nullable remaining cost, signals, and a note. The state owner derives the total, ambiguity
+total, recommendation, reason, and timestamp from the latest observation. It rejects decreasing
+progress and stored projections that do not recompute exactly.
+
+Runtime `refine` and `split` recommendations use the same inclusive convention thresholds as planning.
+A live projection can change critical-path ordering and can trigger `graph-reconcile`, but it never
+rewrites the original assessment. Runtime-generated children are scaled from the latest dimensions and
+must be bounded leaves with enough global capacity for every required future split. See
+`dynamic-runtime-graphs.md` for the observation payload and reconciliation behavior.

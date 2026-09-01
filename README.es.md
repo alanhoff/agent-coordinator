@@ -49,7 +49,7 @@ Pide a Codex que siga el [instalador incluido en el repositorio](INSTALL.md):
 Instala https://github.com/alanhoff/agent-coordinator siguiendo INSTALL.md
 ```
 
-El procedimiento clona el repositorio en un directorio temporal, registra su commit, ensambla una skill nueva, la instala para el usuario actual, elimina la copia temporal e informa de la ruta de instalación y del commit de origen. Solo reemplaza un destino existente si este se identifica como Coordinator.
+El procedimiento clona el repositorio en un directorio temporal, registra su commit, copia el directorio autocontenido `skill/` para el usuario actual, elimina la copia temporal e informa de la ruta de instalación y del commit de origen. Solo reemplaza un destino existente si este se identifica como Coordinator.
 
 Para ejecutar Coordinator se necesita Python 3.11 o posterior y no se requieren paquetes de terceros en tiempo de ejecución. La instalación no modifica la configuración de Codex ni registra perfiles globales de agentes personalizados.
 

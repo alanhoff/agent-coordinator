@@ -19,13 +19,19 @@ from typing import Any, Callable, Iterator, Mapping
 
 from coordinator.routing.selector import STAGES, RoutingError, choose
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+LEGACY_SCHEMA_VERSION = 6
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_COMMAND_BYTES = MAX_STATE_BYTES
 MAX_NODES = 128
 MAX_EVENTS = 512
 MAX_RECEIPTS = 2048
 MAX_ATTEMPTS = 32
+MAX_RUNTIME_OBSERVATIONS = 64
+MAX_RUNTIME_ADAPTATIONS = 256
+MAX_RUNTIME_LOOPS = 32
+MAX_JUDGES_PER_GATE = 8
+MAX_LOOP_ITERATIONS = 16
 MAX_TEXT = 32_768
 ROLES = (
     "architect",
@@ -37,7 +43,7 @@ ROLES = (
     "reviewer",
     "validator",
 )
-NODE_STATUSES = ("pending", "ready", "running", "blocked", "done", "failed", "skipped", "cancelled")
+NODE_STATUSES = ("pending", "ready", "running", "judging", "blocked", "done", "failed", "skipped", "cancelled")
 TERMINAL_NODE_STATUSES = frozenset(("done", "failed", "skipped", "cancelled"))
 SUCCESS_NODE_STATUSES = frozenset(("done", "skipped", "cancelled"))
 WORKFLOW_STATUSES = ("planning", "running", "blocked", "completed", "aborted")
@@ -45,6 +51,19 @@ LAUNCH_STATES = ("unclaimed", "claimed", "reconcile_required", "bound", "running
 COMPLEXITY_DIMENSIONS = ("breadth", "change_surface", "coupling", "novelty", "verification")
 AMBIGUITY_FACTORS = ("objective", "inputs", "boundaries", "dependencies", "acceptance")
 ASSESSMENT_STATES = ("executable", "split_required", "refinement_required", "stale", "decomposed")
+RUNTIME_RECOMMENDATIONS = ("stable", "refine", "split")
+RUNTIME_NODE_KINDS = ("task", "judge", "join")
+RUNTIME_SHAPES = (
+    "pipeline",
+    "parallel",
+    "fanout_fanin",
+    "map_reduce",
+    "diamond",
+    "dag",
+)
+GATE_MODES = ("all", "any", "quorum")
+GATE_STATUSES = ("configured", "pending", "passed", "failed")
+LOOP_STATUSES = ("active", "passed", "exhausted")
 ASSESSMENT_RUBRIC_VERSION = 2
 COVERAGE_FIELDS = ("requirements", "outputs", "acceptance")
 OBLIGATION_FIELDS = (
@@ -152,7 +171,7 @@ def _json_bytes(value: Any, *, indent: int | None = 2) -> bytes:
             )
             + suffix
         ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise StateError("state is not canonical JSON data") from exc
 
 
@@ -782,12 +801,13 @@ def _effective_obligations(node: Mapping[str, Any]) -> dict[str, list[str]]:
 
 
 def _dependency_snapshot(node_id: str, node: Mapping[str, Any]) -> dict[str, Any]:
+    provisional = node["status"] == "judging"
     return {
         "id": node_id,
         "outputs": _effective_obligations(node)["outputs"],
         "disposition": node["status"] if node["status"] in TERMINAL_NODE_STATUSES else "nonterminal",
-        "result": node["result"],
-        "evidence": node["evidence"],
+        "result": None if provisional else node["result"],
+        "evidence": None if provisional else node["evidence"],
     }
 
 
@@ -840,7 +860,7 @@ def _is_resolution_endpoint(node: Mapping[str, Any]) -> bool:
     return (
         _assessable_leaf(node)
         or node["launch"]["state"] in ("claimed", "reconcile_required", "bound", "running")
-        or node["status"] == "done"
+        or node["status"] in ("done", "judging")
     )
 
 
@@ -950,12 +970,53 @@ def _invalidate_direct_dependents(state: dict[str, Any], node_id: str) -> None:
             _invalidate_assessment(state, node)
 
 
+def _refresh_direct_dependents(state: dict[str, Any], node_id: str) -> None:
+    for dependent_id, node in state["nodes"].items():
+        if node_id in node["dependencies"] and _assessable_leaf(node):
+            _refresh_node_assessment(state, dependent_id)
+
+
+def _reconcile_direct_dependents_after_completion(
+    state: dict[str, Any], node_id: str
+) -> None:
+    """Refresh generated successors, but preserve explicit review for authored work."""
+    for dependent_id, node in state["nodes"].items():
+        if node_id not in node["dependencies"]:
+            continue
+        metadata = _runtime_metadata(state, dependent_id)
+        if (
+            metadata is not None
+            and metadata.get("generated_by") is not None
+            and _assessable_leaf(node)
+        ):
+            _refresh_node_assessment(state, dependent_id)
+        else:
+            _invalidate_assessment(state, node)
+
+
 def _active_blocked_node_ids(state: Mapping[str, Any]) -> set[str]:
-    return {
+    """Return directly blocked nodes plus runtime-generated replacement descendants."""
+    blocked = {
         item["node_id"]
         for item in state["blockers"]
         if item["status"] == "active" and item["node_id"] is not None
     }
+    pending = list(blocked)
+    while pending:
+        node_id = pending.pop()
+        node = state["nodes"].get(node_id)
+        if node is None:
+            continue
+        for child_id in node["lineage"]["child_ids"]:
+            metadata = _runtime_metadata(state, child_id)
+            if (
+                child_id not in blocked
+                and metadata is not None
+                and metadata.get("generated_by") == node_id
+            ):
+                blocked.add(child_id)
+                pending.append(child_id)
+    return blocked
 
 
 def _workflow_dispatch_blocked(state: Mapping[str, Any]) -> bool:
@@ -1105,7 +1166,7 @@ def _frontier_nodes(state: Mapping[str, Any]) -> list[str]:
             or node_id in blocked
         ):
             continue
-        if all(nodes[dependency]["status"] in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]):
+        if all(_dependency_satisfied(state, node_id, dependency) for dependency in node["dependencies"]):
             ready.append(node_id)
     return ready
 
@@ -1129,7 +1190,7 @@ def _critical_path_loads(state: Mapping[str, Any]) -> dict[str, int]:
         node = nodes[node_id]
         own = 0
         if node["status"] not in SUCCESS_NODE_STATUSES and not node["lineage"]["child_ids"]:
-            own = node["assessment"]["total"]
+            own = _runtime_load(state, node_id)
         downstream = 0
         if node["status"] not in SUCCESS_NODE_STATUSES:
             downstream = max((load(item) for item in dependents[node_id]), default=0)
@@ -1200,6 +1261,7 @@ def planning_diagnostics(state: Mapping[str, Any]) -> dict[str, Any]:
         "available_parallelism": min(frontier_width, max(0, usable - occupied)),
         "critical_path_load": _critical_path_loads(state),
         "dispatch_order": dispatch_order,
+        "runtime": _runtime_diagnostics(state),
     }
 
 
@@ -1211,6 +1273,422 @@ def _recovery_required(state: Mapping[str, Any]) -> bool:
     )
 
 
+def _empty_runtime_graph() -> dict[str, Any]:
+    return {
+        "generation": 0,
+        "observations": {},
+        "projections": {},
+        "node_metadata": {},
+        "gates": {},
+        "loops": {},
+        "adaptations": [],
+    }
+
+
+def _upgrade_state_document(value: Any) -> Any:
+    """Upgrade an exact schema-v6 document in memory; never repair unknown data."""
+    if not isinstance(value, dict) or value.get("schema_version") != LEGACY_SCHEMA_VERSION:
+        return value
+    legacy_keys = {
+        "schema_version", "workflow_id", "repository", "task", "status", "phase",
+        "revision", "created_at", "updated_at", "conventions", "nodes", "requirements",
+        "decisions", "blockers", "events", "controller", "receipts",
+    }
+    if set(value) != legacy_keys:
+        return value
+    upgraded = copy.deepcopy(value)
+    upgraded["schema_version"] = SCHEMA_VERSION
+    upgraded["runtime_graph"] = _empty_runtime_graph()
+    return upgraded
+
+
+def _runtime_metadata(state: Mapping[str, Any], node_id: str) -> Mapping[str, Any] | None:
+    runtime = state.get("runtime_graph")
+    if not isinstance(runtime, Mapping):
+        return None
+    metadata = runtime.get("node_metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    value = metadata.get(node_id)
+    return value if isinstance(value, Mapping) else None
+
+
+def _runtime_structural_lock(state: Mapping[str, Any], node_id: str) -> str | None:
+    """Explain why generic graph mutation must defer to the runtime reconciler."""
+    runtime = state.get("runtime_graph")
+    if not isinstance(runtime, Mapping):
+        return None
+    gates = runtime.get("gates")
+    if isinstance(gates, Mapping):
+        gate = gates.get(node_id)
+        if isinstance(gate, Mapping) and gate.get("status") in ("configured", "pending"):
+            return "node owns an active judge gate"
+    metadata = _runtime_metadata(state, node_id)
+    if metadata is None:
+        return None
+    if metadata.get("kind") == "judge":
+        return "node is a judge owned by a completion gate"
+    loop_id = metadata.get("loop_id")
+    loops = runtime.get("loops")
+    if isinstance(loop_id, str) and isinstance(loops, Mapping):
+        loop = loops.get(loop_id)
+        if isinstance(loop, Mapping) and loop.get("status") == "active":
+            return "node belongs to an active bounded feedback loop"
+    return None
+
+
+def _dependency_satisfied(state: Mapping[str, Any], node_id: str, dependency: str) -> bool:
+    target = state["nodes"][dependency]
+    if target["status"] in SUCCESS_NODE_STATUSES:
+        return True
+    metadata = _runtime_metadata(state, node_id)
+    return bool(
+        metadata
+        and metadata.get("kind") == "judge"
+        and metadata.get("judge_for") == dependency
+        and target["status"] == "judging"
+    )
+
+
+def _validate_runtime_graph(top: Mapping[str, Any]) -> None:
+    runtime = _keys(
+        top["runtime_graph"],
+        {"generation", "observations", "projections", "node_metadata", "gates", "loops", "adaptations"},
+        "runtime_graph",
+    )
+    generation = runtime["generation"]
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise StateError("runtime_graph.generation must be a non-negative integer")
+
+    observations = runtime["observations"]
+    if not isinstance(observations, dict) or len(observations) > MAX_NODES:
+        raise StateError("runtime_graph.observations must be a bounded object")
+    for node_id, raw_items in observations.items():
+        _identifier(node_id, "runtime observation node id")
+        if node_id not in top["nodes"]:
+            raise StateError("runtime observation references an unknown node")
+        if not isinstance(raw_items, list) or len(raw_items) > MAX_RUNTIME_OBSERVATIONS:
+            raise StateError("runtime observations must be a bounded list")
+        previous: dt.datetime | None = None
+        previous_progress: int | None = None
+        for index, raw_item in enumerate(raw_items):
+            field = f"runtime_graph.observations.{node_id}[{index}]"
+            item = _keys(
+                raw_item,
+                {
+                    "at", "progress", "dimensions", "ambiguity_factors",
+                    "estimated_remaining_cost", "confidence", "signals", "note",
+                },
+                field,
+            )
+            observed = _parse_time(item["at"], f"{field}.at")
+            if previous is not None and observed < previous:
+                raise StateError(f"{field}.at must be monotonically ordered")
+            previous = observed
+            for name in ("progress", "confidence"):
+                score = item[name]
+                if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
+                    raise StateError(f"{field}.{name} must be an integer from 0 through 100")
+            if previous_progress is not None and item["progress"] < previous_progress:
+                raise StateError(f"{field}.progress cannot move backwards")
+            previous_progress = item["progress"]
+            _validate_dimensions(item["dimensions"], f"{field}.dimensions")
+            _validate_ambiguity_factors(item["ambiguity_factors"], f"{field}.ambiguity_factors")
+            cost = item["estimated_remaining_cost"]
+            if cost is not None and (
+                not isinstance(cost, (int, float))
+                or isinstance(cost, bool)
+                or not math.isfinite(cost)
+                or cost < 0
+            ):
+                raise StateError(f"{field}.estimated_remaining_cost must be non-negative or null")
+            _text_list(item["signals"], f"{field}.signals", maximum=16, item_maximum=256)
+            _text(item["note"], f"{field}.note", blank=True, maximum=4096)
+
+    projections = runtime["projections"]
+    if not isinstance(projections, dict) or len(projections) > MAX_NODES:
+        raise StateError("runtime_graph.projections must be a bounded object")
+    for node_id, raw_projection in projections.items():
+        _identifier(node_id, "runtime projection node id")
+        if node_id not in top["nodes"] or node_id not in observations or not observations[node_id]:
+            raise StateError("runtime projection requires an observed existing node")
+        field = f"runtime_graph.projections.{node_id}"
+        projection = _keys(
+            raw_projection,
+            {
+                "progress", "dimensions", "total", "ambiguity_factors", "ambiguity_total",
+                "estimated_remaining_cost", "confidence", "recommendation", "reason", "observed_at",
+            },
+            field,
+        )
+        for name in ("progress", "confidence"):
+            score = projection[name]
+            if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
+                raise StateError(f"{field}.{name} must be an integer from 0 through 100")
+        dimensions = _validate_dimensions(projection["dimensions"], f"{field}.dimensions")
+        if projection["total"] != sum(dimensions.values()):
+            raise StateError(f"{field}.total must equal dimension scores")
+        factors = _validate_ambiguity_factors(projection["ambiguity_factors"], f"{field}.ambiguity_factors")
+        if projection["ambiguity_total"] != sum(factors.values()):
+            raise StateError(f"{field}.ambiguity_total must equal ambiguity scores")
+        cost = projection["estimated_remaining_cost"]
+        if cost is not None and (
+            not isinstance(cost, (int, float))
+            or isinstance(cost, bool)
+            or not math.isfinite(cost)
+            or cost < 0
+        ):
+            raise StateError(f"{field}.estimated_remaining_cost must be non-negative or null")
+        if projection["recommendation"] not in RUNTIME_RECOMMENDATIONS:
+            raise StateError(f"{field}.recommendation is invalid")
+        _text(projection["reason"], f"{field}.reason", maximum=4096)
+        _parse_time(projection["observed_at"], f"{field}.observed_at")
+        latest = observations[node_id][-1]
+        expected_projection = _runtime_projection_for(top, latest)
+        if projection != expected_projection:
+            raise StateError(
+                f"{field} must be the policy-derived projection of the latest observation"
+            )
+
+    gates = runtime["gates"]
+    if not isinstance(gates, dict) or len(gates) > MAX_NODES:
+        raise StateError("runtime_graph.gates must be a bounded object")
+
+    metadata = runtime["node_metadata"]
+    if not isinstance(metadata, dict) or len(metadata) > MAX_NODES:
+        raise StateError("runtime_graph.node_metadata must be a bounded object")
+    for node_id, raw_metadata in metadata.items():
+        _identifier(node_id, "runtime metadata node id")
+        if node_id not in top["nodes"]:
+            raise StateError("runtime metadata references an unknown node")
+        field = f"runtime_graph.node_metadata.{node_id}"
+        item = _keys(
+            raw_metadata,
+            {"kind", "graph_path", "shape", "iteration", "judge_for", "loop_id", "generated_by"},
+            field,
+        )
+        if item["kind"] not in RUNTIME_NODE_KINDS:
+            raise StateError(f"{field}.kind is invalid")
+        graph_path = _text_list(item["graph_path"], f"{field}.graph_path", required=True, identifiers=True, maximum=32)
+        if graph_path[-1] != node_id:
+            raise StateError(f"{field}.graph_path must end with the node id")
+        if item["shape"] is not None and item["shape"] not in RUNTIME_SHAPES:
+            raise StateError(f"{field}.shape is invalid")
+        if (
+            not isinstance(item["iteration"], int)
+            or isinstance(item["iteration"], bool)
+            or not 1 <= item["iteration"] <= MAX_LOOP_ITERATIONS
+        ):
+            raise StateError(f"{field}.iteration is out of range")
+        for name in ("judge_for", "loop_id", "generated_by"):
+            if item[name] is not None:
+                _identifier(item[name], f"{field}.{name}")
+        if item["generated_by"] is not None and item["generated_by"] not in top["nodes"]:
+            raise StateError(f"{field}.generated_by references an unknown node")
+        if item["kind"] == "judge":
+            if item["judge_for"] is None or item["judge_for"] not in top["nodes"]:
+                raise StateError(f"{field}.judge_for must reference an existing target")
+            if top["nodes"][node_id]["stage"] not in ("review", "validation"):
+                raise StateError(f"{field} judge stage must be review or validation")
+            if top["nodes"][node_id]["write_scopes"]:
+                raise StateError(f"{field} judge nodes must be evidence-only")
+            historical_gate = gates.get(item["judge_for"])
+            historical = bool(
+                historical_gate
+                and historical_gate["status"] in ("passed", "failed")
+                and top["nodes"][node_id]["status"] == "done"
+            )
+            if item["judge_for"] not in top["nodes"][node_id]["dependencies"] and not historical:
+                raise StateError(f"{field} live judge node must depend on its target")
+        elif item["judge_for"] is not None:
+            raise StateError(f"{field}.judge_for is valid only for judge nodes")
+
+    judge_owners: dict[str, str] = {}
+    for target_id, raw_gate in gates.items():
+        _identifier(target_id, "gate target id")
+        if target_id not in top["nodes"]:
+            raise StateError("gate references an unknown target")
+        field = f"runtime_graph.gates.{target_id}"
+        gate = _keys(
+            raw_gate,
+            {"target_id", "mode", "required", "judge_ids", "verdicts", "status", "created_at", "resolved_at"},
+            field,
+        )
+        if gate["target_id"] != target_id:
+            raise StateError(f"{field}.target_id must match its key")
+        target_metadata = metadata.get(target_id)
+        if not target_metadata or target_metadata["kind"] == "judge":
+            raise StateError(f"{field} target metadata must identify task or join work")
+        if gate["mode"] not in GATE_MODES:
+            raise StateError(f"{field}.mode is invalid")
+        judge_ids = _text_list(gate["judge_ids"], f"{field}.judge_ids", required=True, identifiers=True, maximum=MAX_JUDGES_PER_GATE)
+        expected_required = len(judge_ids) if gate["mode"] == "all" else 1
+        if gate["mode"] == "quorum":
+            expected_required = gate["required"]
+        if (
+            not isinstance(gate["required"], int)
+            or isinstance(gate["required"], bool)
+            or not 1 <= gate["required"] <= len(judge_ids)
+            or (gate["mode"] != "quorum" and gate["required"] != expected_required)
+        ):
+            raise StateError(f"{field}.required is inconsistent with gate mode")
+        for judge_id in judge_ids:
+            if judge_id not in top["nodes"]:
+                raise StateError(f"{field} references an unknown judge")
+            owner = judge_owners.setdefault(judge_id, target_id)
+            if owner != target_id:
+                raise StateError("a judge node cannot belong to multiple gates")
+            item = metadata.get(judge_id)
+            if not item or item["kind"] != "judge" or item["judge_for"] != target_id:
+                raise StateError(f"{field} judge metadata is inconsistent")
+            if (
+                item["loop_id"] != target_metadata["loop_id"]
+                or item["iteration"] != target_metadata["iteration"]
+            ):
+                raise StateError(f"{field} judge loop metadata is inconsistent")
+        verdicts = gate["verdicts"]
+        if not isinstance(verdicts, dict) or set(verdicts) - set(judge_ids):
+            raise StateError(f"{field}.verdicts references unknown judges")
+        for judge_id, verdict in verdicts.items():
+            if verdict not in ("pass", "fail") or top["nodes"][judge_id]["status"] != "done":
+                raise StateError(f"{field}.verdicts requires completed pass/fail judges")
+        if gate["status"] not in GATE_STATUSES:
+            raise StateError(f"{field}.status is invalid")
+        _parse_time(gate["created_at"], f"{field}.created_at")
+        if gate["resolved_at"] is not None:
+            _parse_time(gate["resolved_at"], f"{field}.resolved_at")
+        if (gate["status"] in ("passed", "failed")) != (gate["resolved_at"] is not None):
+            raise StateError(f"{field}.resolved_at must agree with terminal gate status")
+        if gate["status"] == "configured" and verdicts:
+            raise StateError(f"{field} configured gate cannot already contain verdicts")
+        if gate["status"] in ("passed", "failed") and top["status"] != "aborted":
+            if len(verdicts) != len(judge_ids):
+                raise StateError(f"{field} terminal gate requires every configured verdict")
+            passes = _gate_passes(gate)
+            if (gate["status"] == "passed") != passes:
+                raise StateError(f"{field}.status disagrees with its verdict policy")
+        target_status = top["nodes"][target_id]["status"]
+        if gate["status"] == "configured" and target_status in (
+            "judging", "done", "skipped", "cancelled"
+        ):
+            raise StateError(f"{field} configured gate requires unresolved target work")
+        if gate["status"] == "pending" and target_status != "judging":
+            raise StateError(f"{field} pending gate requires a judging target")
+        if gate["status"] == "passed" and target_status not in ("done", "skipped"):
+            raise StateError(f"{field} passed gate requires resolved target work")
+        if gate["status"] == "failed" and target_status not in ("failed", "skipped"):
+            aborted_cancel = top["status"] == "aborted" and target_status == "cancelled"
+            if not aborted_cancel:
+                raise StateError(f"{field} failed gate requires failed, superseded, or aborted target work")
+
+    loops = runtime["loops"]
+    if not isinstance(loops, dict) or len(loops) > MAX_RUNTIME_LOOPS:
+        raise StateError("runtime_graph.loops must be a bounded object")
+    for node_id, item in metadata.items():
+        loop_id = item["loop_id"]
+        if loop_id is not None and loop_id not in loops:
+            raise StateError(
+                f"runtime_graph.node_metadata.{node_id}.loop_id references an unknown loop"
+            )
+    for loop_id, raw_loop in loops.items():
+        _identifier(loop_id, "runtime loop id")
+        field = f"runtime_graph.loops.{loop_id}"
+        loop = _keys(
+            raw_loop,
+            {
+                "id", "root_node_id", "current_node_id", "iteration", "max_iterations",
+                "status", "gate_targets", "history", "created_at", "updated_at",
+            },
+            field,
+        )
+        if loop["id"] != loop_id:
+            raise StateError(f"{field}.id must match its key")
+        for name in ("root_node_id", "current_node_id"):
+            _identifier(loop[name], f"{field}.{name}")
+            if loop[name] not in top["nodes"]:
+                raise StateError(f"{field}.{name} references an unknown node")
+        for name in ("iteration", "max_iterations"):
+            value = loop[name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise StateError(f"{field}.{name} must be an integer")
+        if not 1 <= loop["iteration"] <= loop["max_iterations"] <= MAX_LOOP_ITERATIONS:
+            raise StateError(f"{field} iteration bounds are invalid")
+        if loop["status"] not in LOOP_STATUSES:
+            raise StateError(f"{field}.status is invalid")
+        gate_targets = _text_list(loop["gate_targets"], f"{field}.gate_targets", required=True, identifiers=True, maximum=MAX_LOOP_ITERATIONS)
+        root_metadata = metadata.get(loop["root_node_id"])
+        if not root_metadata or root_metadata["loop_id"] != loop_id:
+            raise StateError(f"{field}.root_node_id metadata is inconsistent")
+        if loop["current_node_id"] != gate_targets[-1] or len(gate_targets) != loop["iteration"]:
+            raise StateError(f"{field}.gate_targets must track every materialized iteration")
+        if any(target not in gates for target in gate_targets):
+            raise StateError(f"{field}.gate_targets references a node without a gate")
+        for iteration, target_id in enumerate(gate_targets, start=1):
+            target_metadata = metadata.get(target_id)
+            if (
+                not target_metadata
+                or target_metadata["loop_id"] != loop_id
+                or target_metadata["iteration"] != iteration
+            ):
+                raise StateError(f"{field}.gate_targets metadata is inconsistent")
+        history = loop["history"]
+        if not isinstance(history, list) or len(history) > MAX_LOOP_ITERATIONS:
+            raise StateError(f"{field}.history must be bounded")
+        for index, raw_entry in enumerate(history):
+            entry = _keys(raw_entry, {"iteration", "node_id", "gate_status", "at"}, f"{field}.history[{index}]")
+            if entry["iteration"] != index + 1 or entry["node_id"] != gate_targets[index]:
+                raise StateError(f"{field}.history must be consecutively aligned")
+            if entry["gate_status"] not in ("passed", "failed"):
+                raise StateError(f"{field}.history gate status is invalid")
+            if gates[entry["node_id"]]["status"] != entry["gate_status"]:
+                raise StateError(f"{field}.history must match the persisted gate outcome")
+            _parse_time(entry["at"], f"{field}.history[{index}].at")
+        if len(history) not in (loop["iteration"] - 1, loop["iteration"]):
+            raise StateError(f"{field}.history length is inconsistent")
+        _parse_time(loop["created_at"], f"{field}.created_at")
+        _parse_time(loop["updated_at"], f"{field}.updated_at")
+        current_meta = metadata.get(loop["current_node_id"])
+        if not current_meta or current_meta["loop_id"] != loop_id or current_meta["iteration"] != loop["iteration"]:
+            raise StateError(f"{field} current node metadata is inconsistent")
+        if loop["status"] == "active" and gates[loop["current_node_id"]]["status"] in ("passed", "failed"):
+            raise StateError(f"{field} active loop cannot point at a terminal gate")
+        if loop["status"] == "passed" and gates[loop["current_node_id"]]["status"] != "passed":
+            raise StateError(f"{field} passed loop requires a passed current gate")
+        if loop["status"] == "exhausted" and gates[loop["current_node_id"]]["status"] != "failed":
+            raise StateError(f"{field} exhausted loop requires a failed current gate")
+
+    adaptations = runtime["adaptations"]
+    if not isinstance(adaptations, list) or len(adaptations) > MAX_RUNTIME_ADAPTATIONS:
+        raise StateError("runtime_graph.adaptations must be a bounded list")
+    previous_generation = 0
+    ids: set[str] = set()
+    for index, raw_adaptation in enumerate(adaptations):
+        field = f"runtime_graph.adaptations[{index}]"
+        item = _keys(raw_adaptation, {"id", "kind", "node_id", "reason", "details", "at", "generation"}, field)
+        adaptation_id = _identifier(item["id"], f"{field}.id")
+        if adaptation_id in ids:
+            raise StateError("runtime adaptation identifiers must be unique")
+        ids.add(adaptation_id)
+        _identifier(item["kind"], f"{field}.kind")
+        if item["node_id"] is not None:
+            _identifier(item["node_id"], f"{field}.node_id")
+            if item["node_id"] not in top["nodes"]:
+                raise StateError(f"{field}.node_id references an unknown node")
+        _text(item["reason"], f"{field}.reason", maximum=4096)
+        if not isinstance(item["details"], dict) or len(_json_bytes(item["details"], indent=None)) > 16_384:
+            raise StateError(f"{field}.details must be a bounded JSON object")
+        _parse_time(item["at"], f"{field}.at")
+        if (
+            not isinstance(item["generation"], int)
+            or isinstance(item["generation"], bool)
+            or item["generation"] != previous_generation + 1
+        ):
+            raise StateError(f"{field}.generation must be consecutive")
+        previous_generation = item["generation"]
+    if previous_generation != generation:
+        raise StateError("runtime_graph.generation must equal the latest adaptation generation")
+
+
 def validate_state(state: Any) -> dict[str, Any]:
     """Validate one complete deserialized state document without normalizing it."""
     top = _keys(
@@ -1218,7 +1696,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         {
             "schema_version", "workflow_id", "repository", "task", "status", "phase",
             "revision", "created_at", "updated_at", "conventions", "nodes", "requirements",
-            "decisions", "blockers", "events", "controller", "receipts",
+            "decisions", "blockers", "events", "controller", "receipts", "runtime_graph",
         },
         "state",
     )
@@ -1560,14 +2038,14 @@ def validate_state(state: Any) -> dict[str, Any]:
                 or node[key] < 0
             ):
                 raise StateError(f"nodes.{node_id}.{key} must be non-negative or null")
-        if node["status"] == "done" and (not node["result"] or not node["evidence"]):
-            raise StateError(f"nodes.{node_id} done status requires result and evidence")
-        if node["status"] == "done" and (
+        if node["status"] in ("done", "judging") and (not node["result"] or not node["evidence"]):
+            raise StateError(f"nodes.{node_id} completed execution requires result and evidence")
+        if node["status"] in ("done", "judging") and (
             not node["attempts"]
             or set(node["attempts"][-1]["scope_baseline"]) != set(node["write_scopes"])
             or set(node["attempts"][-1]["scope_evidence"]) != set(node["write_scopes"])
         ):
-            raise StateError(f"nodes.{node_id} done status requires attempt evidence for every write scope")
+            raise StateError(f"nodes.{node_id} completed execution requires attempt evidence for every write scope")
         active_launch = launch["state"] in ("claimed", "reconcile_required", "bound", "running")
         aborted_recovery = (
             top["status"] == "aborted"
@@ -1578,8 +2056,10 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise StateError(f"nodes.{node_id} terminal status cannot retain an active launch")
         if node["status"] in ("pending", "blocked") and active_launch:
             raise StateError(f"nodes.{node_id} pending/blocked status cannot retain an active launch")
-        if launch["state"] == "terminal" and node["status"] not in TERMINAL_NODE_STATUSES:
-            raise StateError(f"nodes.{node_id} terminal launch requires terminal node status")
+        if launch["state"] == "terminal" and node["status"] not in TERMINAL_NODE_STATUSES and node["status"] != "judging":
+            raise StateError(f"nodes.{node_id} terminal launch requires terminal or judging node status")
+        if node["status"] == "judging" and launch["state"] != "terminal":
+            raise StateError(f"nodes.{node_id} judging status requires completed execution")
         if node["status"] == "running" and launch["state"] not in (
             "running",
             "reconcile_required",
@@ -1670,7 +2150,10 @@ def validate_state(state: Any) -> dict[str, Any]:
         raise StateError("active launch claims exceed usable controller capacity")
     raw_over_budget_leaves: list[str] = []
     for node_id, node in top["nodes"].items():
-        if node["status"] == "ready" and any(top["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]):
+        if node["status"] == "ready" and any(
+            not _dependency_satisfied(top, node_id, dependency)
+            for dependency in node["dependencies"]
+        ):
             raise StateError(f"nodes.{node_id} cannot be ready before its dependencies")
 
     if not isinstance(top["requirements"], dict) or len(top["requirements"]) > 256:
@@ -1911,6 +2394,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         if receipt["revision"] > top["revision"]:
             raise StateError("receipt revision cannot exceed the state revision")
         _parse_time(receipt["at"], "receipt at")
+    _validate_runtime_graph(top)
     reconcile_required = _recovery_required(top)
     if reconcile_required != (controller["recovery_status"] == "reconcile_required"):
         raise StateError("controller recovery status disagrees with launch reconciliation state")
@@ -1983,6 +2467,7 @@ def new_state(
         "decisions": [],
         "blockers": [],
         "events": [],
+        "runtime_graph": _empty_runtime_graph(),
         "controller": {
             "epoch": 1,
             "origin_session_id": _identifier(session_id, "session_id"),
@@ -2113,7 +2598,7 @@ class StateStore:
 
     def load(self, workflow_id: str) -> dict[str, Any]:
         expected = _identifier(workflow_id, "workflow_id")
-        state = validate_state(self._read_json(self._state_path(expected)))
+        state = validate_state(_upgrade_state_document(self._read_json(self._state_path(expected))))
         if state["workflow_id"] != expected:
             raise StateError("state filename and workflow identifier differ", code="corrupt_state", exit_code=20)
         return state
@@ -2128,7 +2613,7 @@ class StateStore:
             return
         for path in sorted(self.workflows.glob("*.json")):
             try:
-                state = validate_state(self._read_json(path))
+                state = validate_state(_upgrade_state_document(self._read_json(path)))
                 if state["workflow_id"] != path.stem:
                     raise StateError("state filename and workflow identifier differ", code="corrupt_state", exit_code=20)
                 yield path, state, None
@@ -3046,10 +3531,10 @@ def _start_node(state: dict[str, Any], node_id: str, child_id: str) -> dict[str,
     if child_id in historical:
         raise StateError("child_id was already used by an earlier attempt")
     if any(
-        state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES
+        not _dependency_satisfied(state, node_id, dependency)
         for dependency in node["dependencies"]
     ):
-        raise StateError("node dependencies are not terminal-successful")
+        raise StateError("node dependencies are not satisfied")
     node["launch"].update(
         {
             "state": "running",
@@ -3073,6 +3558,7 @@ def _complete_node(
     result: str,
     evidence: str,
     actual_cost: float | None,
+    judge_completion: bool = False,
 ) -> dict[str, Any]:
     node = state["nodes"].get(node_id)
     if node is None:
@@ -3081,6 +3567,14 @@ def _complete_node(
         raise StateError("node-complete requires a running node and launch")
     if outcome not in ("succeeded", "failed"):
         raise StateError("node-complete outcome is invalid")
+    metadata = _runtime_metadata(state, node_id)
+    if (
+        outcome == "succeeded"
+        and not judge_completion
+        and metadata is not None
+        and metadata.get("kind") == "judge"
+    ):
+        raise StateError("runtime judge nodes must use judge-complete")
     result = _text(result, "node result")
     evidence = _text(evidence, "node evidence")
     if actual_cost is not None and (
@@ -3091,11 +3585,18 @@ def _complete_node(
     ):
         raise StateError("actual_cost must be non-negative or null")
     prior_dependency_snapshot = _dependency_snapshot(node_id, node)
+    gate = state["runtime_graph"]["gates"].get(node_id)
     if outcome == "succeeded":
         node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(
             state, node
         )
-        node["status"] = "done"
+        if gate is not None:
+            if gate["status"] != "configured":
+                raise StateError("judge gate is not ready for a new completion attempt")
+            node["status"] = "judging"
+            gate["status"] = "pending"
+        else:
+            node["status"] = "done"
     else:
         node["status"] = "failed"
     node["result"] = result
@@ -3108,7 +3609,16 @@ def _complete_node(
     if node["status"] == "failed" and _assessable_leaf(node):
         _invalidate_assessment(state, node)
     if _dependency_snapshot(node_id, node) != prior_dependency_snapshot:
-        _invalidate_direct_dependents(state, node_id)
+        _reconcile_direct_dependents_after_completion(state, node_id)
+    if outcome == "succeeded" and gate is not None:
+        for judge_id in gate["judge_ids"]:
+            _refresh_node_assessment(state, judge_id)
+        return add_event(
+            state,
+            "node_awaiting_judges",
+            f"node outcome={outcome}; gate={gate['mode']}",
+            node_id,
+        )
     return add_event(
         state,
         "node_completed",
@@ -3149,16 +3659,1426 @@ def _finish_workflow_state(
     )
 
 
+
+
+def _record_runtime_adaptation(
+    state: dict[str, Any],
+    *,
+    kind: str,
+    node_id: str | None,
+    reason: str,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = state["runtime_graph"]
+    if len(runtime["adaptations"]) >= MAX_RUNTIME_ADAPTATIONS:
+        raise StateError(
+            "runtime adaptation history capacity is exhausted",
+            code="capacity_exceeded",
+            exit_code=20,
+        )
+    runtime["generation"] += 1
+    generation = runtime["generation"]
+    item = {
+        "id": f"adapt-{generation:04d}",
+        "kind": _identifier(kind, "runtime adaptation kind"),
+        "node_id": None if node_id is None else _identifier(node_id, "runtime adaptation node id"),
+        "reason": _text(reason, "runtime adaptation reason", maximum=4096),
+        "details": copy.deepcopy(dict(details or {})),
+        "at": now_iso(),
+        "generation": generation,
+    }
+    if len(_json_bytes(item["details"], indent=None)) > 16_384:
+        raise StateError("runtime adaptation details exceed 16384 bytes")
+    runtime["adaptations"].append(item)
+    return item
+
+
+def _runtime_projection_for(
+    state: Mapping[str, Any], observation: Mapping[str, Any]
+) -> dict[str, Any]:
+    dimensions = {
+        name: observation["dimensions"][name] for name in COMPLEXITY_DIMENSIONS
+    }
+    factors = {
+        name: observation["ambiguity_factors"][name] for name in AMBIGUITY_FACTORS
+    }
+    total = sum(dimensions.values())
+    ambiguity_total = sum(factors.values())
+    policy = state["conventions"]
+    if (
+        ambiguity_total >= policy["node_ambiguity_refine_threshold"]
+        or any(
+            factors[name] >= policy["factor_ambiguity_refine_threshold"]
+            for name in AMBIGUITY_FACTORS
+        )
+    ):
+        recommendation = "refine"
+        reason = "live ambiguity exceeds the refinement policy"
+    elif (
+        total >= policy["node_complexity_split_threshold"]
+        or any(
+            dimensions[name] >= policy["dimension_complexity_split_threshold"]
+            for name in COMPLEXITY_DIMENSIONS
+        )
+    ):
+        recommendation = "split"
+        reason = "live remaining complexity exceeds the decomposition policy"
+    else:
+        recommendation = "stable"
+        reason = "live work remains within bounded execution policy"
+    return {
+        "progress": observation["progress"],
+        "dimensions": dimensions,
+        "total": total,
+        "ambiguity_factors": factors,
+        "ambiguity_total": ambiguity_total,
+        "estimated_remaining_cost": observation["estimated_remaining_cost"],
+        "confidence": observation["confidence"],
+        "recommendation": recommendation,
+        "reason": reason,
+        "observed_at": observation["at"],
+    }
+
+
+def _append_runtime_observation(
+    state: dict[str, Any], node_id: str, raw: Mapping[str, Any]
+) -> dict[str, Any]:
+    node_id = _identifier(node_id, "node_id")
+    node = state["nodes"].get(node_id)
+    if node is None:
+        raise StateError("unknown node")
+    metadata = _runtime_metadata(state, node_id)
+    if metadata is not None and metadata.get("kind") == "judge":
+        raise StateError("judge nodes cannot be structurally adapted; complete the verdict")
+    if node["lineage"]["child_ids"] or node["status"] in ("done", "skipped", "cancelled", "judging"):
+        raise StateError("runtime observation requires live or retryable leaf work")
+    checked = _keys(
+        raw,
+        {
+            "progress", "dimensions", "ambiguity_factors",
+            "estimated_remaining_cost", "confidence", "signals", "note",
+        },
+        "observation",
+    )
+    progress = checked["progress"]
+    confidence = checked["confidence"]
+    for name, value in (("progress", progress), ("confidence", confidence)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
+            raise StateError(f"observation.{name} must be an integer from 0 through 100")
+    dimensions = _validate_dimensions(checked["dimensions"], "observation.dimensions")
+    factors = _validate_ambiguity_factors(
+        checked["ambiguity_factors"], "observation.ambiguity_factors"
+    )
+    cost = checked["estimated_remaining_cost"]
+    if cost is not None and (
+        not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(cost)
+        or cost < 0
+    ):
+        raise StateError("observation.estimated_remaining_cost must be non-negative or null")
+    signals = _text_list(
+        checked["signals"], "observation.signals", maximum=16, item_maximum=256
+    )
+    note = _text(checked["note"], "observation.note", blank=True, maximum=4096)
+    items = state["runtime_graph"]["observations"].setdefault(node_id, [])
+    if len(items) >= MAX_RUNTIME_OBSERVATIONS:
+        raise StateError(
+            "node runtime observation capacity is exhausted",
+            code="capacity_exceeded",
+            exit_code=20,
+        )
+    if items and progress < items[-1]["progress"]:
+        raise StateError("runtime progress cannot move backwards")
+    observation = {
+        "at": now_iso(),
+        "progress": progress,
+        "dimensions": dimensions,
+        "ambiguity_factors": factors,
+        "estimated_remaining_cost": cost,
+        "confidence": confidence,
+        "signals": signals,
+        "note": note,
+    }
+    items.append(observation)
+    projection = _runtime_projection_for(state, observation)
+    state["runtime_graph"]["projections"][node_id] = projection
+    _record_runtime_adaptation(
+        state,
+        kind="observation",
+        node_id=node_id,
+        reason=projection["reason"],
+        details={
+            "progress": progress,
+            "confidence": confidence,
+            "recommendation": projection["recommendation"],
+            "remaining_total": projection["total"],
+            "signals": signals,
+        },
+    )
+    add_event(
+        state,
+        "runtime_observed",
+        f"recommendation={projection['recommendation']} progress={progress}",
+        node_id,
+    )
+    return projection
+
+
+def _runtime_load(state: Mapping[str, Any], node_id: str) -> int:
+    projection = state["runtime_graph"]["projections"].get(node_id)
+    if not projection:
+        return state["nodes"][node_id]["assessment"]["total"]
+    remaining = projection["total"]
+    cost = projection["estimated_remaining_cost"]
+    cost_load = 0 if cost is None else min(20, int(math.ceil(math.log2(cost + 1))))
+    uncertainty = 1 if projection["confidence"] < 50 else 0
+    return max(0, remaining + cost_load + uncertainty)
+
+
+def _derived_runtime_id(nodes: Mapping[str, Any], base: str, suffix: str) -> str:
+    raw = re.sub(r"[^a-zA-Z0-9._-]+", "-", f"{base}.{suffix}").strip("-.")
+    candidate = raw[:128]
+    if candidate and candidate not in nodes and ID_RE.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(f"{base}\0{suffix}".encode()).hexdigest()[:16]
+    stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", base).strip("-.")[:110] or "node"
+    candidate = f"{stem}-{digest}"[:128]
+    counter = 1
+    while candidate in nodes:
+        tail = f"-{counter}"
+        candidate = (f"{stem}-{digest}"[: 128 - len(tail)] + tail)
+        counter += 1
+    return _identifier(candidate, "derived node id")
+
+
+def _scaled_runtime_assessment(
+    parent: Mapping[str, Any],
+    *,
+    artifact: bool,
+    fraction: float,
+    rationale: str,
+    source_dimensions: Mapping[str, int] | None = None,
+    policy: Mapping[str, int],
+) -> dict[str, Any]:
+    source = (
+        parent["assessment"]["dimensions"]
+        if source_dimensions is None
+        else source_dimensions
+    )
+    source_total = sum(source[name] for name in COMPLEXITY_DIMENSIONS)
+    dimensions: dict[str, int] = {}
+    for name in COMPLEXITY_DIMENSIONS:
+        if name == "change_surface" and not artifact:
+            value = 0
+        else:
+            value = min(4, max(0, int(math.ceil(source[name] * fraction))))
+            if artifact and name == "change_surface":
+                value = max(1, value)
+        dimensions[name] = value
+    if source_total > 0 and sum(dimensions.values()) >= source_total:
+        for name in ("breadth", "coupling", "novelty", "verification"):
+            if dimensions[name] > 0:
+                dimensions[name] -= 1
+                break
+    dimension_limit = policy["dimension_complexity_split_threshold"] - 1
+    for name in COMPLEXITY_DIMENSIONS:
+        minimum = 1 if artifact and name == "change_surface" else 0
+        if dimension_limit < minimum:
+            raise StateError("runtime policy cannot produce a bounded artifact child")
+        dimensions[name] = min(dimensions[name], dimension_limit)
+    total_limit = policy["node_complexity_split_threshold"] - 1
+    while sum(dimensions.values()) > total_limit:
+        reducible = [
+            name
+            for name in COMPLEXITY_DIMENSIONS
+            if dimensions[name] > (1 if artifact and name == "change_surface" else 0)
+        ]
+        if not reducible:
+            raise StateError("runtime policy cannot produce a bounded child assessment")
+        selected = sorted(reducible, key=lambda name: (-dimensions[name], name))[0]
+        dimensions[selected] -= 1
+    return {
+        "dimensions": dimensions,
+        "ambiguity_factors": {name: 0 for name in AMBIGUITY_FACTORS},
+        "rationale": rationale,
+    }
+
+
+def _node_manifest_from_parent(
+    state: Mapping[str, Any],
+    parent_id: str,
+    *,
+    node_id: str,
+    title: str,
+    stage: str,
+    objective: str,
+    inputs: list[str],
+    outputs: list[str],
+    dependencies: list[str],
+    write_scopes: list[str],
+    acceptance: list[str],
+    artifact: bool,
+    fraction: float,
+    source_dimensions: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    parent = state["nodes"][parent_id]
+    return {
+        "id": node_id,
+        "title": title,
+        "stage": stage,
+        "priority": parent["priority"],
+        "dependencies": dependencies,
+        "write_scopes": write_scopes,
+        "role": parent["role"],
+        "model": None,
+        "effort": None,
+        "acceptance": acceptance,
+        "route_rationale": "runtime-generated node requires fresh route",
+        "estimated_cost": None,
+        "spec": {
+            "objective": objective,
+            "inputs": inputs,
+            "outputs": outputs,
+            "constraints": list(parent["spec"]["constraints"]),
+            "non_goals": list(parent["spec"]["non_goals"]),
+            "requirement_ids": list(parent["spec"]["requirement_ids"]),
+            "open_questions": [],
+        },
+        "assessment": _scaled_runtime_assessment(
+            parent,
+            artifact=artifact,
+            fraction=fraction,
+            rationale="bounded runtime-generated child based on latest execution evidence",
+            source_dimensions=source_dimensions,
+            policy=_planning_policy(state),
+        ),
+    }
+
+
+def _plan_manifest_from_record(node: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a validated internal node record back to the strict plan surface."""
+    return {
+        "id": node["id"],
+        "title": node["title"],
+        "stage": node["stage"],
+        "priority": node["priority"],
+        "dependencies": list(node["dependencies"]),
+        "write_scopes": list(node["write_scopes"]),
+        "role": node["role"],
+        "model": node["model"],
+        "effort": node["effort"],
+        "acceptance": list(node["acceptance"]),
+        "route_rationale": node["route"]["rationale"],
+        "estimated_cost": node["estimated_cost"],
+        "spec": copy.deepcopy(node["spec"]),
+        "assessment": {
+            "dimensions": dict(node["assessment"]["dimensions"]),
+            "ambiguity_factors": dict(node["assessment"]["ambiguity_factors"]),
+            "rationale": node["assessment"]["rationale"],
+        },
+    }
+
+
+def _shape_for_expansion(
+    state: Mapping[str, Any],
+    parent_id: str,
+    requested: str,
+    fragments: list[Mapping[str, Any]],
+    join: Mapping[str, Any] | None,
+    workload: str,
+) -> str:
+    fragment_ids = {fragment["id"] for fragment in fragments}
+    internal_dependencies = {
+        (dependency, fragment["id"])
+        for fragment in fragments
+        for dependency in fragment["dependencies"]
+        if dependency in fragment_ids
+    }
+    if requested != "auto":
+        if requested not in RUNTIME_SHAPES:
+            raise StateError("expansion shape is invalid")
+        shape = requested
+    elif internal_dependencies:
+        shape = "dag"
+    elif join is not None and workload == "homogeneous":
+        shape = "map_reduce"
+    elif join is not None and len(fragments) == 2 and any(
+        fragment.get("stage") in ("review", "validation") for fragment in fragments
+    ):
+        shape = "diamond"
+    elif join is not None:
+        shape = "fanout_fanin"
+    else:
+        scopes = [fragment.get("write_scopes", []) for fragment in fragments]
+        overlap = any(
+            scopes_overlap(left, right, case_sensitive=state["conventions"]["write_scope_case_sensitive"], platform=state["conventions"]["platform"])
+            for index, group in enumerate(scopes)
+            for left in group
+            for later in scopes[index + 1 :]
+            for right in later
+        )
+        shape = "pipeline" if overlap else "parallel"
+    if shape in ("fanout_fanin", "map_reduce", "diamond") and join is None:
+        raise StateError(f"{shape} expansion requires a join node")
+    if shape == "diamond" and len(fragments) < 2:
+        raise StateError("diamond expansion requires at least two branches")
+    if shape in ("parallel", "fanout_fanin", "map_reduce", "diamond") and internal_dependencies:
+        raise StateError(f"{shape} expansion requires independent branches; use dag")
+    return shape
+
+
+def _runtime_dag_exits(fragments: list[Mapping[str, Any]]) -> list[str]:
+    """Validate one fragment-local DAG and return its deterministic sink nodes."""
+    fragment_ids = {fragment["id"] for fragment in fragments}
+    indegree = {node_id: 0 for node_id in fragment_ids}
+    dependents = {node_id: set() for node_id in fragment_ids}
+    for fragment in fragments:
+        node_id = fragment["id"]
+        for dependency in fragment["dependencies"]:
+            if dependency not in fragment_ids or node_id in dependents[dependency]:
+                continue
+            dependents[dependency].add(node_id)
+            indegree[node_id] += 1
+    frontier = sorted(node_id for node_id, count in indegree.items() if count == 0)
+    visited = 0
+    while frontier:
+        node_id = frontier.pop(0)
+        visited += 1
+        for dependent in sorted(dependents[node_id]):
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                frontier.append(dependent)
+                frontier.sort()
+    if visited != len(fragment_ids):
+        raise StateError("dag expansion contains an internal dependency cycle")
+    return sorted(node_id for node_id, values in dependents.items() if not values)
+
+
+def _runtime_graph_path(state: Mapping[str, Any], parent_id: str, child_id: str) -> list[str]:
+    parent_meta = _runtime_metadata(state, parent_id)
+    prefix = list(parent_meta["graph_path"]) if parent_meta else [parent_id]
+    path = [*prefix, child_id]
+    if len(path) > 32:
+        raise StateError(
+            "runtime graph nesting exceeds the 32-level path bound",
+            code="capacity_exceeded",
+            exit_code=20,
+        )
+    return path
+
+
+def _annotate_runtime_expansion(
+    state: dict[str, Any],
+    *,
+    parent_id: str,
+    child_ids: list[str],
+    join_id: str | None,
+    shape: str,
+    reason: str,
+) -> None:
+    runtime = state["runtime_graph"]
+    parent_meta = runtime["node_metadata"].get(parent_id)
+    if parent_meta is None:
+        parent_meta = {
+            "kind": "task",
+            "graph_path": [parent_id],
+            "shape": shape,
+            "iteration": 1,
+            "judge_for": None,
+            "loop_id": None,
+            "generated_by": None,
+        }
+        runtime["node_metadata"][parent_id] = parent_meta
+    else:
+        parent_meta["shape"] = shape
+    for child_id in child_ids:
+        runtime["node_metadata"][child_id] = {
+            "kind": "join" if child_id == join_id else "task",
+            "graph_path": _runtime_graph_path(state, parent_id, child_id),
+            "shape": None,
+            "iteration": parent_meta["iteration"],
+            "judge_for": None,
+            "loop_id": parent_meta["loop_id"],
+            "generated_by": parent_id,
+        }
+    _record_runtime_adaptation(
+        state,
+        kind="expand",
+        node_id=parent_id,
+        reason=reason,
+        details={"shape": shape, "child_ids": child_ids, "join_id": join_id},
+    )
+
+
+def _checkpoint_running_for_adaptation(
+    state: dict[str, Any], node_id: str, reason: str
+) -> None:
+    node = state["nodes"][node_id]
+    if node["status"] != "running":
+        return
+    if node["launch"]["state"] != "running" or not node["attempts"]:
+        raise StateError("running adaptation requires a consistent active attempt")
+    node["attempts"][-1].update(
+        {"finished_at": now_iso(), "outcome": "adapted at runtime"}
+    )
+    node["status"] = "failed"
+    node["result"] = "runtime adaptation requested"
+    node["evidence"] = reason
+    node["launch"]["state"] = "terminal"
+    _refresh_recovery_status(state)
+
+
+def _runtime_generated_split(state: dict[str, Any], node_id: str) -> dict[str, Any]:
+    node = state["nodes"].get(node_id)
+    if node is None:
+        raise StateError("unknown node")
+    metadata = _runtime_metadata(state, node_id)
+    if metadata is not None and metadata.get("kind") == "judge":
+        raise StateError("judge nodes cannot be structurally adapted")
+    projection = state["runtime_graph"]["projections"].get(node_id)
+    if not projection or projection["recommendation"] == "stable":
+        raise StateError("node has no actionable runtime recommendation")
+    if node["lineage"]["child_ids"] or node["status"] not in ("pending", "ready", "blocked", "running", "failed"):
+        raise StateError("runtime reconcile requires adaptable leaf work")
+    if node["launch"]["state"] not in ("unclaimed", "running", "terminal"):
+        raise StateError("runtime reconcile cannot adapt an uncertain or merely claimed launch")
+    source_gate = state["runtime_graph"]["gates"].get(node_id)
+    if source_gate is not None and source_gate["status"] != "configured":
+        raise StateError("runtime reconcile cannot move an active or resolved judge gate")
+    reason = projection["reason"]
+    _checkpoint_running_for_adaptation(state, node_id, reason)
+    discovery_id = _derived_runtime_id(state["nodes"], node_id, "discover")
+    execution_id = _derived_runtime_id(
+        {**state["nodes"], discovery_id: {}}, node_id, "execute"
+    )
+    findings = f"runtime findings for {node_id}"
+    discovery = _node_manifest_from_parent(
+        state,
+        node_id,
+        node_id=discovery_id,
+        title=f"Investigate runtime change: {node['title']}",
+        stage="research",
+        objective=f"Resolve live uncertainty and bound remaining work for: {node['spec']['objective']}",
+        inputs=list(node["spec"]["inputs"]),
+        outputs=[findings],
+        dependencies=list(node["dependencies"]),
+        write_scopes=[],
+        acceptance=["Runtime findings identify bounded work and explicit acceptance evidence"],
+        artifact=False,
+        fraction=0.40,
+        source_dimensions=projection["dimensions"],
+    )
+    execution = _node_manifest_from_parent(
+        state,
+        node_id,
+        node_id=execution_id,
+        title=f"Execute adapted work: {node['title']}",
+        stage=node["stage"],
+        objective=node["spec"]["objective"],
+        inputs=_ordered_union(list(node["spec"]["inputs"]), [findings]),
+        outputs=list(node["spec"]["outputs"]),
+        dependencies=[discovery_id],
+        write_scopes=list(node["write_scopes"]),
+        acceptance=list(node["acceptance"]),
+        artifact=bool(node["write_scopes"]),
+        fraction=0.55,
+        source_dimensions=projection["dimensions"],
+    )
+    effective = _effective_obligations(node)
+    coverage = {
+        field: {item: [execution_id] for item in effective[field]}
+        for field in COVERAGE_FIELDS
+    }
+    dependents = sorted(
+        other_id
+        for other_id, other in state["nodes"].items()
+        if node_id in other["dependencies"]
+    )
+    plan = {
+        "parent_id": node_id,
+        "reason": reason,
+        "children": [discovery, execution],
+        "coverage": coverage,
+        "dependent_replacements": {dependent: [execution_id] for dependent in dependents if state["nodes"][dependent]["status"] not in SUCCESS_NODE_STATUSES},
+    }
+    event = _apply_split_plan(state, plan, runtime=True)
+    _annotate_runtime_expansion(
+        state,
+        parent_id=node_id,
+        child_ids=[discovery_id, execution_id],
+        join_id=execution_id,
+        shape="pipeline",
+        reason=reason,
+    )
+    gate_retarget = _retarget_configured_gate(state, node_id, execution_id)
+    return {
+        "event": event,
+        "node_id": node_id,
+        "shape": "pipeline",
+        "child_ids": [discovery_id, execution_id],
+        "gate_retarget": gate_retarget,
+    }
+
+
+def _runtime_diagnostics(state: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = state["runtime_graph"]
+    actionable = {
+        recommendation: sorted(
+            node_id
+            for node_id, projection in runtime["projections"].items()
+            if projection["recommendation"] == recommendation
+            and not state["nodes"][node_id]["lineage"]["child_ids"]
+            and state["nodes"][node_id]["status"] in ("pending", "ready", "blocked", "running", "failed")
+            and state["nodes"][node_id]["launch"]["state"] in ("unclaimed", "running", "terminal")
+        )
+        for recommendation in ("refine", "split")
+    }
+    return {
+        "generation": runtime["generation"],
+        "actionable": actionable,
+        "pending_gates": sorted(
+            target for target, gate in runtime["gates"].items() if gate["status"] == "pending"
+        ),
+        "active_loops": sorted(
+            loop_id for loop_id, loop in runtime["loops"].items() if loop["status"] == "active"
+        ),
+    }
+
+
+def _default_runtime_metadata(
+    state: Mapping[str, Any],
+    node_id: str,
+    *,
+    kind: str = "task",
+    generated_by: str | None = None,
+    judge_for: str | None = None,
+    loop_id: str | None = None,
+    iteration: int = 1,
+) -> dict[str, Any]:
+    if generated_by is None:
+        path = [node_id]
+    else:
+        path = _runtime_graph_path(state, generated_by, node_id)
+    return {
+        "kind": kind,
+        "graph_path": path,
+        "shape": None,
+        "iteration": iteration,
+        "judge_for": judge_for,
+        "loop_id": loop_id,
+        "generated_by": generated_by,
+    }
+
+
+def _configure_judge_gate(
+    state: dict[str, Any], target_id: str, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    target_id = _identifier(target_id, "target_id")
+    target = state["nodes"].get(target_id)
+    if target is None:
+        raise StateError("unknown gate target")
+    target_metadata = _runtime_metadata(state, target_id)
+    if target_metadata is not None and target_metadata.get("kind") == "judge":
+        raise StateError("judge nodes cannot own another completion gate")
+    if target_metadata is not None and target_metadata.get("loop_id") is not None:
+        raise StateError("work already owned by a feedback loop cannot receive another judge gate")
+    if target["lineage"]["child_ids"] or target["status"] in TERMINAL_NODE_STATUSES or target["status"] == "judging":
+        raise StateError("judge gate requires live leaf work before completion")
+    if target_id in state["runtime_graph"]["gates"]:
+        raise StateError("target already has a judge gate")
+    checked = _keys(plan, {"mode", "required", "judges", "loop"}, "gate")
+    mode = checked["mode"]
+    if mode not in GATE_MODES:
+        raise StateError("gate.mode is invalid")
+    if not isinstance(checked["judges"], list) or not 1 <= len(checked["judges"]) <= MAX_JUDGES_PER_GATE:
+        raise StateError(f"gate.judges must contain 1..{MAX_JUDGES_PER_GATE} nodes")
+    judges = [
+        _plan_node_record(raw, index)
+        for index, raw in enumerate(checked["judges"])
+    ]
+    judge_ids = [judge["id"] for judge in judges]
+    if len(set(judge_ids)) != len(judge_ids):
+        raise StateError("gate judge identifiers must be unique")
+    collisions = set(judge_ids) & set(state["nodes"])
+    if collisions:
+        raise StateError("gate judge identifiers already exist: " + ", ".join(sorted(collisions)))
+    if len(state["nodes"]) + len(judges) > MAX_NODES:
+        raise StateError("node capacity would be exceeded", code="capacity_exceeded", exit_code=20)
+    required = checked["required"]
+    if not isinstance(required, int) or isinstance(required, bool):
+        raise StateError("gate.required must be an integer")
+    expected = len(judges) if mode == "all" else 1
+    if mode == "quorum":
+        if not 1 <= required <= len(judges):
+            raise StateError("quorum gate.required must be within judge count")
+    elif required != expected:
+        raise StateError(f"{mode} gate.required must equal {expected}")
+    for judge in judges:
+        if judge["write_scopes"]:
+            raise StateError("judge nodes must be evidence-only")
+        if judge["assessment"]["dimensions"]["change_surface"] != 0:
+            raise StateError("judge change_surface must be zero")
+        judge["dependencies"] = _ordered_union(judge["dependencies"], [target_id])
+        if judge["stage"] not in ("review", "validation"):
+            raise StateError("judge stage must be review or validation")
+    loop_spec = checked["loop"]
+    loop_id: str | None = None
+    max_iterations = 1
+    if loop_spec is not None:
+        loop = _keys(loop_spec, {"id", "max_iterations"}, "gate.loop")
+        loop_id = _identifier(loop["id"], "gate.loop.id")
+        max_iterations = loop["max_iterations"]
+        if (
+            not isinstance(max_iterations, int)
+            or isinstance(max_iterations, bool)
+            or not 2 <= max_iterations <= MAX_LOOP_ITERATIONS
+        ):
+            raise StateError(f"gate.loop.max_iterations must be 2..{MAX_LOOP_ITERATIONS}")
+        if loop_id in state["runtime_graph"]["loops"]:
+            raise StateError("runtime loop identifier already exists")
+        if len(state["runtime_graph"]["loops"]) >= MAX_RUNTIME_LOOPS:
+            raise StateError(
+                "runtime loop capacity is exhausted",
+                code="capacity_exceeded",
+                exit_code=20,
+            )
+    for judge in judges:
+        state["nodes"][judge["id"]] = judge
+        _refresh_node_assessment(state, judge["id"])
+    now = now_iso()
+    state["runtime_graph"]["gates"][target_id] = {
+        "target_id": target_id,
+        "mode": mode,
+        "required": required,
+        "judge_ids": judge_ids,
+        "verdicts": {},
+        "status": "configured",
+        "created_at": now,
+        "resolved_at": None,
+    }
+    target_meta = state["runtime_graph"]["node_metadata"].get(target_id)
+    if target_meta is None:
+        target_meta = _default_runtime_metadata(state, target_id, loop_id=loop_id)
+        state["runtime_graph"]["node_metadata"][target_id] = target_meta
+    elif loop_id is not None:
+        target_meta["loop_id"] = loop_id
+        target_meta["iteration"] = 1
+    for judge_id in judge_ids:
+        state["runtime_graph"]["node_metadata"][judge_id] = _default_runtime_metadata(
+            state,
+            judge_id,
+            kind="judge",
+            generated_by=target_id,
+            judge_for=target_id,
+            loop_id=loop_id,
+        )
+    if loop_id is not None:
+        state["runtime_graph"]["loops"][loop_id] = {
+            "id": loop_id,
+            "root_node_id": target_id,
+            "current_node_id": target_id,
+            "iteration": 1,
+            "max_iterations": max_iterations,
+            "status": "active",
+            "gate_targets": [target_id],
+            "history": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+    adaptation = _record_runtime_adaptation(
+        state,
+        kind="gate_configured",
+        node_id=target_id,
+        reason="completion now requires independent judge evidence",
+        details={
+            "mode": mode,
+            "required": required,
+            "judge_ids": judge_ids,
+            "loop_id": loop_id,
+            "max_iterations": max_iterations,
+        },
+    )
+    add_event(state, "judge_gate_configured", f"mode={mode} judges={len(judges)}", target_id)
+    return {"gate": copy.deepcopy(state["runtime_graph"]["gates"][target_id]), "adaptation": adaptation}
+
+
+def _retarget_configured_gate(
+    state: dict[str, Any], source_id: str, target_id: str
+) -> dict[str, Any] | None:
+    """Move a not-yet-started gate to one replacement exit after runtime expansion."""
+    runtime = state["runtime_graph"]
+    gate = runtime["gates"].get(source_id)
+    if gate is None:
+        return None
+    if gate["status"] != "configured":
+        raise StateError("runtime adaptation can retarget only a configured judge gate")
+    if target_id in runtime["gates"]:
+        raise StateError("runtime adaptation target already has a judge gate")
+    target_meta = runtime["node_metadata"].get(target_id)
+    if target_meta is None:
+        raise StateError("runtime gate retarget requires replacement node metadata")
+    source_meta = runtime["node_metadata"].get(source_id)
+
+    runtime["gates"].pop(source_id)
+    gate["target_id"] = target_id
+    runtime["gates"][target_id] = gate
+    for judge_id in gate["judge_ids"]:
+        judge = state["nodes"][judge_id]
+        judge["dependencies"] = _ordered_union(
+            [
+                target_id if dependency == source_id else dependency
+                for dependency in judge["dependencies"]
+                if dependency != source_id
+            ],
+            [target_id],
+        )
+        judge_meta = runtime["node_metadata"][judge_id]
+        judge_meta.update(
+            {
+                "graph_path": _runtime_graph_path(state, target_id, judge_id),
+                "iteration": target_meta["iteration"],
+                "judge_for": target_id,
+                "loop_id": target_meta["loop_id"],
+                "generated_by": target_id,
+            }
+        )
+        _refresh_node_assessment(state, judge_id)
+
+    loop_id = None if source_meta is None else source_meta["loop_id"]
+    if loop_id is not None:
+        loop = runtime["loops"].get(loop_id)
+        if loop is None or loop["status"] != "active" or loop["current_node_id"] != source_id:
+            raise StateError("runtime gate retarget found inconsistent active loop state")
+        if not loop["gate_targets"] or loop["gate_targets"][-1] != source_id:
+            raise StateError("runtime gate retarget found inconsistent loop target history")
+        loop["current_node_id"] = target_id
+        loop["gate_targets"][-1] = target_id
+        loop["updated_at"] = now_iso()
+
+    adaptation = _record_runtime_adaptation(
+        state,
+        kind="gate_retargeted",
+        node_id=target_id,
+        reason="runtime expansion moved completion judgment to its single replacement exit",
+        details={
+            "source_id": source_id,
+            "target_id": target_id,
+            "judge_ids": list(gate["judge_ids"]),
+            "loop_id": loop_id,
+        },
+    )
+    add_event(
+        state,
+        "judge_gate_retargeted",
+        f"source={source_id}",
+        target_id,
+    )
+    return adaptation
+
+
+def _gate_passes(gate: Mapping[str, Any]) -> bool:
+    passes = sum(value == "pass" for value in gate["verdicts"].values())
+    if gate["mode"] == "all":
+        return passes == len(gate["judge_ids"])
+    if gate["mode"] == "any":
+        return passes >= 1
+    return passes >= gate["required"]
+
+
+def _reset_cloned_node(node: dict[str, Any], new_id: str, title: str) -> None:
+    node["id"] = new_id
+    node["title"] = title
+    node["route"] = {"rationale": "runtime iteration requires fresh route", "routed_at": now_iso(), "attempt": 0}
+    node["launch"] = {
+        "state": "unclaimed",
+        "request_id": None,
+        "child_id": None,
+        "claimed_at": None,
+        "reconciliation": None,
+    }
+    node["attempts"] = []
+    node["status"] = "pending"
+    node["result"] = None
+    node["evidence"] = None
+    node["actual_cost"] = None
+    node["superseded_by"] = None
+    node["lineage"]["child_ids"] = []
+    node["lineage"]["split_reason"] = None
+
+
+def _materialize_loop_iteration(
+    state: dict[str, Any], loop_id: str, failed_target_id: str
+) -> dict[str, Any]:
+    runtime = state["runtime_graph"]
+    loop = runtime["loops"][loop_id]
+    if loop["current_node_id"] != failed_target_id or loop["status"] != "active":
+        raise StateError("loop current iteration is inconsistent")
+    next_iteration = loop["iteration"] + 1
+    if next_iteration > loop["max_iterations"]:
+        raise StateError("loop iteration budget is exhausted")
+    failed_target = state["nodes"][failed_target_id]
+    old_gate = runtime["gates"][failed_target_id]
+    required_nodes = 1 + len(old_gate["judge_ids"])
+    if len(state["nodes"]) + required_nodes > MAX_NODES:
+        raise StateError("loop cannot materialize within node capacity", code="capacity_exceeded", exit_code=20)
+    new_target_id = _derived_runtime_id(state["nodes"], loop["root_node_id"], f"iter-{next_iteration}")
+    new_target = copy.deepcopy(failed_target)
+    _reset_cloned_node(
+        new_target,
+        new_target_id,
+        f"{failed_target['title']} [iteration {next_iteration}]",
+    )
+    if failed_target["lineage"]["parent_id"] is not None:
+        parent_id = failed_target["lineage"]["parent_id"]
+        state["nodes"][parent_id]["lineage"]["child_ids"].append(new_target_id)
+    state["nodes"][new_target_id] = new_target
+
+    new_judge_ids: list[str] = []
+    for old_judge_id in old_gate["judge_ids"]:
+        old_judge = state["nodes"][old_judge_id]
+        new_judge_id = _derived_runtime_id(state["nodes"], old_judge_id, f"iter-{next_iteration}")
+        new_judge = copy.deepcopy(old_judge)
+        _reset_cloned_node(
+            new_judge,
+            new_judge_id,
+            f"{old_judge['title']} [iteration {next_iteration}]",
+        )
+        new_judge["dependencies"] = _ordered_union(
+            [
+                new_target_id if dependency == failed_target_id else dependency
+                for dependency in old_judge["dependencies"]
+            ],
+            [new_target_id],
+        )
+        state["nodes"][new_judge_id] = new_judge
+        new_judge_ids.append(new_judge_id)
+
+    downstream: list[str] = []
+    old_judges = set(old_gate["judge_ids"])
+    for node_id, node in state["nodes"].items():
+        if node_id in (failed_target_id, new_target_id) or failed_target_id not in node["dependencies"]:
+            continue
+        if node_id in old_judges:
+            node["dependencies"] = [value for value in node["dependencies"] if value != failed_target_id]
+        else:
+            if node["status"] not in ("pending", "ready", "blocked", "failed") or node["launch"]["state"] not in ("unclaimed", "terminal"):
+                raise StateError("loop cannot rewire an active downstream node")
+            node["dependencies"] = list(
+                dict.fromkeys(new_target_id if value == failed_target_id else value for value in node["dependencies"])
+            )
+            _refresh_node_assessment(state, node_id)
+            downstream.append(node_id)
+
+    failed_target["status"] = "skipped"
+    failed_target["result"] = "superseded"
+    failed_target["evidence"] = "judge gate failed; next bounded iteration materialized"
+    failed_target["superseded_by"] = new_target_id
+    failed_target["launch"] = {
+        "state": "unclaimed",
+        "request_id": None,
+        "child_id": None,
+        "claimed_at": None,
+        "reconciliation": "completed iteration was superseded by judge feedback",
+    }
+
+    source_meta = runtime["node_metadata"][failed_target_id]
+    source_prefix = list(source_meta["graph_path"][:-1])
+    next_target_path = [*source_prefix, new_target_id]
+    if len(next_target_path) > 32:
+        raise StateError(
+            "runtime loop materialization exceeds the 32-level path bound",
+            code="capacity_exceeded",
+            exit_code=20,
+        )
+    runtime["node_metadata"][new_target_id] = {
+        **copy.deepcopy(source_meta),
+        "graph_path": next_target_path,
+        "iteration": next_iteration,
+        "generated_by": failed_target_id,
+    }
+    for old_judge_id, new_judge_id in zip(old_gate["judge_ids"], new_judge_ids):
+        judge_path = [*next_target_path, new_judge_id]
+        if len(judge_path) > 32:
+            raise StateError(
+                "runtime loop judge nesting exceeds the 32-level path bound",
+                code="capacity_exceeded",
+                exit_code=20,
+            )
+        runtime["node_metadata"][new_judge_id] = {
+            **copy.deepcopy(runtime["node_metadata"][old_judge_id]),
+            "graph_path": judge_path,
+            "iteration": next_iteration,
+            "judge_for": new_target_id,
+            "generated_by": new_target_id,
+        }
+    now = now_iso()
+    runtime["gates"][new_target_id] = {
+        "target_id": new_target_id,
+        "mode": old_gate["mode"],
+        "required": old_gate["required"],
+        "judge_ids": new_judge_ids,
+        "verdicts": {},
+        "status": "configured",
+        "created_at": now,
+        "resolved_at": None,
+    }
+    loop["history"].append(
+        {"iteration": loop["iteration"], "node_id": failed_target_id, "gate_status": "failed", "at": now}
+    )
+    loop["iteration"] = next_iteration
+    loop["current_node_id"] = new_target_id
+    loop["gate_targets"].append(new_target_id)
+    loop["updated_at"] = now
+    _refresh_node_assessment(state, new_target_id)
+    for judge_id in new_judge_ids:
+        _refresh_node_assessment(state, judge_id)
+    adaptation = _record_runtime_adaptation(
+        state,
+        kind="loop_iteration",
+        node_id=new_target_id,
+        reason="judge quorum rejected the prior iteration",
+        details={
+            "loop_id": loop_id,
+            "iteration": next_iteration,
+            "supersedes": failed_target_id,
+            "judge_ids": new_judge_ids,
+            "rewired_downstream": sorted(downstream),
+        },
+    )
+    add_event(state, "loop_iteration_created", f"loop={loop_id} iteration={next_iteration}", new_target_id)
+    return {
+        "loop_id": loop_id,
+        "iteration": next_iteration,
+        "target_id": new_target_id,
+        "judge_ids": new_judge_ids,
+        "adaptation": adaptation,
+    }
+
+
+def _complete_judge(
+    state: dict[str, Any],
+    judge_id: str,
+    *,
+    verdict: str,
+    result: str,
+    evidence: str,
+    actual_cost: float | None,
+) -> dict[str, Any]:
+    judge_id = _identifier(judge_id, "judge_id")
+    metadata = _runtime_metadata(state, judge_id)
+    if not metadata or metadata["kind"] != "judge" or metadata["judge_for"] is None:
+        raise StateError("node is not a configured judge")
+    if verdict not in ("pass", "fail"):
+        raise StateError("judge verdict must be pass or fail")
+    target_id = metadata["judge_for"]
+    gate = state["runtime_graph"]["gates"].get(target_id)
+    if gate is None or gate["status"] != "pending" or judge_id not in gate["judge_ids"]:
+        raise StateError("judge gate is not awaiting this verdict")
+    event = _complete_node(
+        state,
+        judge_id,
+        outcome="succeeded",
+        result=result,
+        evidence=evidence,
+        actual_cost=actual_cost,
+        judge_completion=True,
+    )
+    gate["verdicts"][judge_id] = verdict
+    outcome: dict[str, Any] = {
+        "event": event,
+        "target_id": target_id,
+        "verdict": verdict,
+        "gate_status": gate["status"],
+    }
+    if len(gate["verdicts"]) != len(gate["judge_ids"]):
+        return outcome
+
+    target = state["nodes"][target_id]
+    prior_snapshot = _dependency_snapshot(target_id, target)
+    passed = _gate_passes(gate)
+    gate["status"] = "passed" if passed else "failed"
+    gate["resolved_at"] = now_iso()
+    for completed_judge_id in gate["judge_ids"]:
+        completed_judge = state["nodes"][completed_judge_id]
+        completed_judge["dependencies"] = [
+            dependency
+            for dependency in completed_judge["dependencies"]
+            if dependency != target_id
+        ]
+        _refresh_node_assessment(state, completed_judge_id)
+    loop_id = state["runtime_graph"]["node_metadata"][target_id]["loop_id"]
+    if passed:
+        target["status"] = "done"
+        if loop_id is not None:
+            loop = state["runtime_graph"]["loops"][loop_id]
+            loop["status"] = "passed"
+            loop["history"].append(
+                {"iteration": loop["iteration"], "node_id": target_id, "gate_status": "passed", "at": gate["resolved_at"]}
+            )
+            loop["updated_at"] = gate["resolved_at"]
+        _record_runtime_adaptation(
+            state,
+            kind="gate_passed",
+            node_id=target_id,
+            reason="judge gate accepted completion evidence",
+            details={"verdicts": dict(gate["verdicts"]), "mode": gate["mode"]},
+        )
+        add_event(state, "judge_gate_passed", f"mode={gate['mode']}", target_id)
+    elif loop_id is not None:
+        loop = state["runtime_graph"]["loops"][loop_id]
+        if loop["iteration"] < loop["max_iterations"]:
+            outcome["next_iteration"] = _materialize_loop_iteration(state, loop_id, target_id)
+        else:
+            target["status"] = "failed"
+            loop["status"] = "exhausted"
+            loop["history"].append(
+                {"iteration": loop["iteration"], "node_id": target_id, "gate_status": "failed", "at": gate["resolved_at"]}
+            )
+            loop["updated_at"] = gate["resolved_at"]
+            _record_runtime_adaptation(
+                state,
+                kind="loop_exhausted",
+                node_id=target_id,
+                reason="judge gate failed at the hard iteration limit",
+                details={"loop_id": loop_id, "max_iterations": loop["max_iterations"]},
+            )
+            add_event(state, "runtime_loop_exhausted", f"loop={loop_id}", target_id)
+    else:
+        target["status"] = "failed"
+        _record_runtime_adaptation(
+            state,
+            kind="gate_failed",
+            node_id=target_id,
+            reason="judge gate rejected completion evidence",
+            details={"verdicts": dict(gate["verdicts"]), "mode": gate["mode"]},
+        )
+        add_event(state, "judge_gate_failed", f"mode={gate['mode']}", target_id)
+    if target_id in state["nodes"] and _dependency_snapshot(target_id, state["nodes"][target_id]) != prior_snapshot:
+        if passed and loop_id is not None:
+            _refresh_direct_dependents(state, target_id)
+        elif passed:
+            _reconcile_direct_dependents_after_completion(state, target_id)
+        else:
+            _invalidate_direct_dependents(state, target_id)
+    outcome["gate_status"] = gate["status"]
+    return outcome
+
+
+def _expand_runtime_graph(state: dict[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
+    checked = _keys(
+        plan,
+        {"parent_id", "reason", "shape", "workload", "fragments", "join"},
+        "expansion",
+    )
+    parent_id = _identifier(checked["parent_id"], "expansion.parent_id")
+    parent = state["nodes"].get(parent_id)
+    if parent is None:
+        raise StateError("expansion parent is unknown")
+    metadata = _runtime_metadata(state, parent_id)
+    if metadata is not None and metadata.get("kind") == "judge":
+        raise StateError("judge nodes cannot be structurally expanded")
+    if parent["lineage"]["child_ids"] or parent["status"] not in ("pending", "ready", "blocked", "running", "failed"):
+        raise StateError("runtime expansion requires adaptable leaf work")
+    if parent["launch"]["state"] not in ("unclaimed", "running", "terminal"):
+        raise StateError("runtime expansion cannot alter an uncertain launch")
+    reason = _text(checked["reason"], "expansion.reason", maximum=4096)
+    workload = checked["workload"]
+    if workload not in ("homogeneous", "heterogeneous"):
+        raise StateError("expansion.workload is invalid")
+    raw_fragments = checked["fragments"]
+    if not isinstance(raw_fragments, list) or not 2 <= len(raw_fragments) <= 16:
+        raise StateError("expansion.fragments must contain 2..16 nodes")
+    fragments = [
+        _plan_manifest_from_record(_plan_node_record(raw, index))
+        for index, raw in enumerate(raw_fragments)
+    ]
+    if checked["shape"] == "auto":
+        fragments.sort(key=lambda item: item["id"])
+    join = (
+        None
+        if checked["join"] is None
+        else _plan_manifest_from_record(
+            _plan_node_record(checked["join"], len(fragments))
+        )
+    )
+    manifests = [*fragments, *([] if join is None else [join])]
+    ids = [node["id"] for node in manifests]
+    if len(ids) != len(set(ids)) or set(ids) & set(state["nodes"]):
+        raise StateError("expansion node identifiers must be unique and new")
+    if len(state["nodes"]) + len(ids) > MAX_NODES:
+        raise StateError("node capacity would be exceeded", code="capacity_exceeded", exit_code=20)
+    shape = _shape_for_expansion(
+        state,
+        parent_id,
+        checked["shape"],
+        fragments,
+        join,
+        workload,
+    )
+    parent_dependencies = list(parent["dependencies"])
+    branch_ids = [node["id"] for node in fragments]
+    if shape == "pipeline":
+        for index, fragment in enumerate(fragments):
+            inherited = parent_dependencies if index == 0 else [fragments[index - 1]["id"]]
+            fragment["dependencies"] = _ordered_union(inherited, fragment["dependencies"])
+    else:
+        for fragment in fragments:
+            fragment["dependencies"] = _ordered_union(parent_dependencies, fragment["dependencies"])
+    if join is not None:
+        join["dependencies"] = _ordered_union(branch_ids, join["dependencies"])
+        exits = [join["id"]]
+    elif shape == "pipeline":
+        exits = [fragments[-1]["id"]]
+    elif shape == "dag":
+        exits = _runtime_dag_exits(fragments)
+    else:
+        exits = branch_ids
+    source_gate = state["runtime_graph"]["gates"].get(parent_id)
+    if source_gate is not None:
+        if source_gate["status"] != "configured":
+            raise StateError("runtime expansion cannot move an active or resolved judge gate")
+        if len(exits) != 1:
+            raise StateError(
+                "runtime expansion of gated work requires one completion exit; add a join node"
+            )
+    _checkpoint_running_for_adaptation(state, parent_id, reason)
+    effective = _effective_obligations(parent)
+    coverage = {
+        field: {item: list(exits) for item in effective[field]}
+        for field in COVERAGE_FIELDS
+    }
+    direct_dependents = sorted(
+        node_id
+        for node_id, node in state["nodes"].items()
+        if parent_id in node["dependencies"] and node["status"] not in SUCCESS_NODE_STATUSES
+    )
+    split_plan = {
+        "parent_id": parent_id,
+        "reason": reason,
+        "children": manifests,
+        "coverage": coverage,
+        "dependent_replacements": {node_id: list(exits) for node_id in direct_dependents},
+    }
+    event = _apply_split_plan(state, split_plan, runtime=True)
+    _annotate_runtime_expansion(
+        state,
+        parent_id=parent_id,
+        child_ids=ids,
+        join_id=None if join is None else join["id"],
+        shape=shape,
+        reason=reason,
+    )
+    gate_retarget = _retarget_configured_gate(state, parent_id, exits[0]) if source_gate is not None else None
+    return {
+        "event": event,
+        "shape": shape,
+        "child_ids": ids,
+        "exit_ids": exits,
+        "gate_retarget": gate_retarget,
+    }
+
+
+def _reconcile_runtime_graph(state: dict[str, Any]) -> dict[str, Any]:
+    candidates = []
+    for node_id, projection in state["runtime_graph"]["projections"].items():
+        node = state["nodes"][node_id]
+        if (
+            projection["recommendation"] != "stable"
+            and not node["lineage"]["child_ids"]
+            and node["status"] in ("pending", "ready", "blocked", "running", "failed")
+            and node["launch"]["state"] in ("unclaimed", "running", "terminal")
+        ):
+            candidates.append(node_id)
+    if not candidates:
+        raise StateError("no actionable runtime projection is available")
+    loads = _critical_path_loads(state)
+    selected = sorted(candidates, key=lambda item: (-loads[item], item))[0]
+    result = _runtime_generated_split(state, selected)
+    return {"changed": True, **result}
+
+def _apply_split_plan(
+    state: dict[str, Any],
+    plan: Mapping[str, Any],
+    *,
+    runtime: bool = False,
+) -> dict[str, Any]:
+    """Apply one validated bounded decomposition atomically."""
+    parent_id = _identifier(plan["parent_id"], "plan.parent_id")
+    parent = state["nodes"].get(parent_id)
+    if parent is None:
+        raise StateError("split parent is unknown")
+    if not runtime:
+        lock_reason = _runtime_structural_lock(state, parent_id)
+        if lock_reason is not None:
+            raise StateError(
+                "node-split cannot mutate runtime-controlled work: " + lock_reason
+            )
+    _require_rewritable_leaf(parent, "node-split")
+    reason = _text(plan["reason"], "plan.reason", maximum=4096)
+    if not runtime:
+        if (
+            parent["assessment"]["input_digest"] != _assessment_input_digest(state, parent)
+            or parent["assessment"]["state"] != _derived_assessment_state(state, parent)
+        ):
+            raise StateError("node-split requires a current parent assessment")
+        failed_executable = (
+            parent["status"] == "failed" and parent["assessment"]["state"] == "executable"
+        )
+        if parent["assessment"]["state"] != "split_required" and not failed_executable:
+            raise StateError("node-split requires split-required or current executable failed work")
+    depth = parent["lineage"]["depth"] + 1
+    if depth > state["conventions"]["max_refinement_depth"]:
+        raise StateError("node-split exceeds max_refinement_depth")
+    if not isinstance(plan["children"], list) or not 2 <= len(plan["children"]) <= MAX_NODES:
+        raise StateError("plan.children must contain at least two bounded child definitions")
+    if len(state["nodes"]) + len(plan["children"]) > MAX_NODES:
+        raise StateError("node capacity would be exceeded", code="capacity_exceeded", exit_code=20)
+
+    children = [
+        _split_child_record(raw, parent_id=parent_id, depth=depth, index=index)
+        for index, raw in enumerate(plan["children"])
+    ]
+    child_ids = [child["id"] for child in children]
+    child_id_set = set(child_ids)
+    if len(child_id_set) != len(child_ids):
+        raise StateError("plan.children identifiers must be unique")
+    collisions = child_id_set & set(state["nodes"])
+    if collisions:
+        raise StateError("plan.children identifiers already exist: " + ", ".join(sorted(collisions)))
+    known_ids = set(state["nodes"]) | child_id_set
+    for child in children:
+        unknown = set(child["dependencies"]) - known_ids
+        if unknown:
+            raise StateError(
+                f"plan child {child['id']} has unresolved dependencies: " + ", ".join(sorted(unknown))
+            )
+
+    coverage = _keys(plan["coverage"], set(COVERAGE_FIELDS), "plan.coverage")
+    effective_obligations = _effective_obligations(parent)
+    coverage_mappings = {
+        field: _coverage_mapping(
+            coverage[field],
+            effective_obligations[field],
+            child_id_set,
+            f"plan.coverage.{field}",
+        )
+        for field in COVERAGE_FIELDS
+    }
+    artifact_children = [child for child in children if child["write_scopes"]]
+    if effective_obligations["write_scopes"] and not artifact_children:
+        raise StateError(
+            "node-split cannot convert artifact-scoped work into evidence-only children"
+        )
+    direct_dependents = sorted(
+        node_id for node_id, node in state["nodes"].items() if parent_id in node["dependencies"]
+    )
+    rewritable_dependents: list[str] = []
+    terminal_dependents: list[str] = []
+    for dependent_id in direct_dependents:
+        dependent = state["nodes"][dependent_id]
+        if dependent["status"] in SUCCESS_NODE_STATUSES:
+            terminal_dependents.append(dependent_id)
+        else:
+            _require_rewritable_leaf(dependent, "node-split dependent rewiring")
+            rewritable_dependents.append(dependent_id)
+    dependent_replacements = _coverage_mapping(
+        plan["dependent_replacements"], rewritable_dependents, child_id_set,
+        "plan.dependent_replacements",
+    )
+
+    for child in children:
+        state["nodes"][child["id"]] = child
+    for field, mapping in coverage_mappings.items():
+        for obligation, selected in mapping.items():
+            for child_id in selected:
+                child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
+                child_obligations[field] = _ordered_union(
+                    child_obligations[field], [obligation]
+                )
+    for child_id in child_ids:
+        child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
+        for field in ("objectives", "inputs", "constraints", "non_goals"):
+            child_obligations[field] = _ordered_union(
+                child_obligations[field], effective_obligations[field]
+            )
+    for child in artifact_children:
+        child_obligations = state["nodes"][child["id"]]["lineage"]["obligations"]
+        child_obligations["write_scopes"] = _ordered_union(
+            child_obligations["write_scopes"],
+            effective_obligations["write_scopes"],
+        )
+    for child_id in child_ids:
+        _refresh_node_assessment(state, child_id)
+    if any(
+        _raw_over_budget(state, state["nodes"][child_id])
+        and state["nodes"][child_id]["lineage"]["depth"]
+        >= state["conventions"]["max_refinement_depth"]
+        for child_id in child_ids
+    ):
+        raise StateError("max_refinement_depth requires bounded final children")
+    if not runtime and any(
+        state["nodes"][child_id]["assessment"]["total"] >= parent["assessment"]["total"]
+        for child_id in child_ids
+    ):
+        raise StateError("every split child must have lower total complexity than its parent")
+    parent_dependencies = list(parent["dependencies"])
+    parent["dependencies"] = []
+
+    for dependent_id in rewritable_dependents:
+        dependent = state["nodes"][dependent_id]
+        rewired: list[str] = []
+        for dependency in dependent["dependencies"]:
+            replacements = dependent_replacements[dependent_id] if dependency == parent_id else [dependency]
+            for replacement in replacements:
+                if replacement not in rewired:
+                    rewired.append(replacement)
+        dependent["dependencies"] = rewired
+        if runtime:
+            _refresh_node_assessment(state, dependent_id)
+        else:
+            _invalidate_assessment(state, dependent)
+    for dependent_id in terminal_dependents:
+        dependent = state["nodes"][dependent_id]
+        dependent["dependencies"] = [
+            dependency for dependency in dependent["dependencies"] if dependency != parent_id
+        ]
+
+    for dependency in parent_dependencies:
+        if not any(
+            _child_reaches_prerequisite(
+                state["nodes"], child_id, dependency, child_id_set
+            )
+            for child_id in child_ids
+        ):
+            raise StateError(f"split silently drops parent prerequisite {dependency}")
+
+    parent["lineage"]["child_ids"] = child_ids
+    parent["lineage"]["split_reason"] = reason
+    parent["assessment"]["state"] = "decomposed"
+    parent["status"] = "skipped"
+    if parent["result"] is None:
+        parent["result"] = "decomposed"
+    if parent["evidence"] is None:
+        parent["evidence"] = reason
+    return add_event(state, "node_split", reason, parent_id)
+
+
 def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
     """Return one compact, deterministic controller action without mutating state."""
+    planning = planning_diagnostics(state)
+    runtime = _runtime_diagnostics(state)
     base: dict[str, Any] = {
         "revision": state["revision"],
         "workflow_status": state["status"],
         "phase": state["phase"],
-        "available_parallelism": planning_diagnostics(state)[
-            "available_parallelism"
-        ],
-        "warnings": [],
+        "available_parallelism": planning["available_parallelism"],
+        "runtime_generation": runtime["generation"],
+        "warnings": (
+            ["judge gates pending: " + ", ".join(runtime["pending_gates"])]
+            if runtime["pending_gates"]
+            else []
+        ),
     }
 
     def action(
@@ -3202,7 +5122,12 @@ def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
             "provider outcomes must be reconciled before retry or completion",
             command="node-update",
             node_ids=uncertain,
-            required=["launch_state", "reconciliation"],
+            required=[
+                "launch_state",
+                "reconciliation",
+                "child_id for bound or running",
+                "status and attempt_outcome for terminal",
+            ],
         )
     aborted_bound = sorted(
         node_id
@@ -3243,6 +5168,18 @@ def next_action(state: Mapping[str, Any]) -> dict[str, Any]:
                 if requirement["status"] == "active"
             ),
             required=["plan_file"],
+        )
+    actionable_runtime = sorted(
+        set(runtime["actionable"]["refine"]) | set(runtime["actionable"]["split"]),
+        key=lambda item: (-planning["critical_path_load"].get(item, 0), item),
+    )
+    if actionable_runtime:
+        return action(
+            "reconcile_runtime",
+            "live execution evidence requires bounded graph adaptation",
+            command="graph-reconcile",
+            node_ids=actionable_runtime,
+            required=[],
         )
     blocked_nodes = _active_blocked_node_ids(state)
     assessable = [
@@ -3623,157 +5560,146 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         _keys(plan, {"parent_id", "reason", "children", "coverage", "dependent_replacements"}, "plan")
 
         def split(state: dict[str, Any]) -> dict[str, Any]:
-            parent_id = _identifier(plan["parent_id"], "plan.parent_id")
-            parent = state["nodes"].get(parent_id)
-            if parent is None:
-                raise StateError("split parent is unknown")
-            _require_rewritable_leaf(parent, "node-split")
-            reason = _text(plan["reason"], "plan.reason", maximum=4096)
-            if (
-                parent["assessment"]["input_digest"] != _assessment_input_digest(state, parent)
-                or parent["assessment"]["state"] != _derived_assessment_state(state, parent)
-            ):
-                raise StateError("node-split requires a current parent assessment")
-            failed_executable = (
-                parent["status"] == "failed" and parent["assessment"]["state"] == "executable"
-            )
-            if parent["assessment"]["state"] != "split_required" and not failed_executable:
-                raise StateError("node-split requires split-required or current executable failed work")
-            depth = parent["lineage"]["depth"] + 1
-            if depth > state["conventions"]["max_refinement_depth"]:
-                raise StateError("node-split exceeds max_refinement_depth")
-            if not isinstance(plan["children"], list) or not 2 <= len(plan["children"]) <= MAX_NODES:
-                raise StateError("plan.children must contain at least two bounded child definitions")
-            if len(state["nodes"]) + len(plan["children"]) > MAX_NODES:
-                raise StateError("node capacity would be exceeded", code="capacity_exceeded", exit_code=20)
-
-            children = [
-                _split_child_record(raw, parent_id=parent_id, depth=depth, index=index)
-                for index, raw in enumerate(plan["children"])
-            ]
-            child_ids = [child["id"] for child in children]
-            child_id_set = set(child_ids)
-            if len(child_id_set) != len(child_ids):
-                raise StateError("plan.children identifiers must be unique")
-            collisions = child_id_set & set(state["nodes"])
-            if collisions:
-                raise StateError("plan.children identifiers already exist: " + ", ".join(sorted(collisions)))
-            known_ids = set(state["nodes"]) | child_id_set
-            for child in children:
-                unknown = set(child["dependencies"]) - known_ids
-                if unknown:
-                    raise StateError(
-                        f"plan child {child['id']} has unresolved dependencies: " + ", ".join(sorted(unknown))
-                    )
-
-            coverage = _keys(plan["coverage"], set(COVERAGE_FIELDS), "plan.coverage")
-            effective_obligations = _effective_obligations(parent)
-            coverage_mappings = {
-                field: _coverage_mapping(
-                    coverage[field],
-                    effective_obligations[field],
-                    child_id_set,
-                    f"plan.coverage.{field}",
-                )
-                for field in COVERAGE_FIELDS
-            }
-            artifact_children = [child for child in children if child["write_scopes"]]
-            if effective_obligations["write_scopes"] and not artifact_children:
-                raise StateError(
-                    "node-split cannot convert artifact-scoped work into evidence-only children"
-                )
-            direct_dependents = sorted(
-                node_id for node_id, node in state["nodes"].items() if parent_id in node["dependencies"]
-            )
-            rewritable_dependents: list[str] = []
-            terminal_dependents: list[str] = []
-            for dependent_id in direct_dependents:
-                dependent = state["nodes"][dependent_id]
-                if dependent["status"] in SUCCESS_NODE_STATUSES:
-                    terminal_dependents.append(dependent_id)
-                else:
-                    _require_rewritable_leaf(dependent, "node-split dependent rewiring")
-                    rewritable_dependents.append(dependent_id)
-            dependent_replacements = _coverage_mapping(
-                plan["dependent_replacements"], rewritable_dependents, child_id_set,
-                "plan.dependent_replacements",
-            )
-
-            for child in children:
-                state["nodes"][child["id"]] = child
-            for field, mapping in coverage_mappings.items():
-                for obligation, selected in mapping.items():
-                    for child_id in selected:
-                        child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
-                        child_obligations[field] = _ordered_union(
-                            child_obligations[field], [obligation]
-                        )
-            for child_id in child_ids:
-                child_obligations = state["nodes"][child_id]["lineage"]["obligations"]
-                for field in ("objectives", "inputs", "constraints", "non_goals"):
-                    child_obligations[field] = _ordered_union(
-                        child_obligations[field], effective_obligations[field]
-                    )
-            for child in artifact_children:
-                child_obligations = state["nodes"][child["id"]]["lineage"]["obligations"]
-                child_obligations["write_scopes"] = _ordered_union(
-                    child_obligations["write_scopes"],
-                    effective_obligations["write_scopes"],
-                )
-            for child_id in child_ids:
-                _refresh_node_assessment(state, child_id)
-            if any(
-                _raw_over_budget(state, state["nodes"][child_id])
-                and state["nodes"][child_id]["lineage"]["depth"]
-                >= state["conventions"]["max_refinement_depth"]
-                for child_id in child_ids
-            ):
-                raise StateError("max_refinement_depth requires bounded final children")
-            if any(
-                state["nodes"][child_id]["assessment"]["total"] >= parent["assessment"]["total"]
-                for child_id in child_ids
-            ):
-                raise StateError("every split child must have lower total complexity than its parent")
-            parent_dependencies = list(parent["dependencies"])
-            parent["dependencies"] = []
-
-            for dependent_id in rewritable_dependents:
-                dependent = state["nodes"][dependent_id]
-                rewired: list[str] = []
-                for dependency in dependent["dependencies"]:
-                    replacements = dependent_replacements[dependent_id] if dependency == parent_id else [dependency]
-                    for replacement in replacements:
-                        if replacement not in rewired:
-                            rewired.append(replacement)
-                dependent["dependencies"] = rewired
-                _invalidate_assessment(state, dependent)
-            for dependent_id in terminal_dependents:
-                dependent = state["nodes"][dependent_id]
-                dependent["dependencies"] = [
-                    dependency for dependency in dependent["dependencies"] if dependency != parent_id
-                ]
-
-            for dependency in parent_dependencies:
-                if not any(
-                    _child_reaches_prerequisite(
-                        state["nodes"], child_id, dependency, child_id_set
-                    )
-                    for child_id in child_ids
-                ):
-                    raise StateError(f"split silently drops parent prerequisite {dependency}")
-
-            parent["lineage"]["child_ids"] = child_ids
-            parent["lineage"]["split_reason"] = reason
-            parent["assessment"]["state"] = "decomposed"
-            parent["status"] = "skipped"
-            if parent["result"] is None:
-                parent["result"] = "decomposed"
-            if parent["evidence"] is None:
-                parent["evidence"] = reason
-            return add_event(state, "node_split", reason, parent_id)
+            return _apply_split_plan(state, plan)
 
         state, result, replay = _mutate_command(store, args, command, plan, split)
         return 0, "mutation_reconciled" if replay else "node_split", {**_public_state(state), "event": result}, []
+
+    if command == "node-observe":
+        observation = _read_command_object(
+            args.observation_json, args.observation_file, "observation"
+        )
+        operation = {"node_id": args.node_id, "observation": observation}
+
+        def observe(state: dict[str, Any]) -> dict[str, Any]:
+            return _append_runtime_observation(state, args.node_id, observation)
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, observe
+        )
+        projection = state["runtime_graph"]["projections"].get(args.node_id)
+        return (
+            0,
+            "mutation_reconciled" if replay else "runtime_observed",
+            {
+                **_public_state(state),
+                "node_id": args.node_id,
+                "projection": projection,
+                "runtime": _runtime_diagnostics(state),
+            },
+            [],
+        )
+
+    if command == "graph-reconcile":
+        operation = {"policy": "highest-critical-path-actionable-v1"}
+
+        def reconcile_graph(state: dict[str, Any]) -> dict[str, Any]:
+            return _reconcile_runtime_graph(state)
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, reconcile_graph
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "runtime_graph_reconciled",
+            {
+                **_public_state(state),
+                "reconciliation": result,
+                "runtime": _runtime_diagnostics(state),
+            },
+            [],
+        )
+
+    if command == "graph-expand-auto":
+        plan = _read_command_object(args.plan_json, args.plan_file, "expansion")
+
+        def expand_graph(state: dict[str, Any]) -> dict[str, Any]:
+            return _expand_runtime_graph(state, plan)
+
+        state, result, replay = _mutate_command(
+            store, args, command, plan, expand_graph
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "runtime_graph_expanded",
+            {
+                **_public_state(state),
+                "expansion": result,
+                "runtime": _runtime_diagnostics(state),
+            },
+            [],
+        )
+
+    if command == "judge-gate-add":
+        gate_plan = _read_command_object(args.gate_json, args.gate_file, "gate")
+        operation = {"node_id": args.node_id, "gate": gate_plan}
+
+        def add_gate(state: dict[str, Any]) -> dict[str, Any]:
+            return _configure_judge_gate(state, args.node_id, gate_plan)
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, add_gate
+        )
+        return (
+            0,
+            "mutation_reconciled" if replay else "judge_gate_configured",
+            {
+                **_public_state(state),
+                "node_id": args.node_id,
+                "gate": state["runtime_graph"]["gates"].get(args.node_id),
+                "runtime": _runtime_diagnostics(state),
+            },
+            [],
+        )
+
+    if command == "judge-complete":
+        if args.result_file == "-" and args.evidence_file == "-":
+            raise StateError(
+                "result and evidence cannot both read from standard input; "
+                "use a regular file or inline value for one of them",
+                code="invalid_invocation",
+                exit_code=2,
+            )
+        result_text = _read_command_text(args.result, args.result_file, "result")
+        evidence_text = _read_command_text(
+            args.evidence, args.evidence_file, "evidence"
+        )
+        operation = {
+            "node_id": args.node_id,
+            "verdict": args.verdict,
+            "result": result_text,
+            "evidence": evidence_text,
+            "actual_cost": args.actual_cost,
+        }
+
+        def complete_judge(state: dict[str, Any]) -> dict[str, Any]:
+            return _complete_judge(
+                state,
+                args.node_id,
+                verdict=args.verdict,
+                result=result_text,
+                evidence=evidence_text,
+                actual_cost=args.actual_cost,
+            )
+
+        state, result, replay = _mutate_command(
+            store, args, command, operation, complete_judge
+        )
+        metadata = state["runtime_graph"]["node_metadata"].get(args.node_id, {})
+        target_id = metadata.get("judge_for")
+        return (
+            0,
+            "mutation_reconciled" if replay else "judge_completed",
+            {
+                **_public_state(state),
+                "judge_id": args.node_id,
+                "target_id": target_id,
+                "gate": None if target_id is None else state["runtime_graph"]["gates"].get(target_id),
+                "judgment": result,
+                "runtime": _runtime_diagnostics(state),
+            },
+            [],
+        )
 
     if command == "node-route":
         operation = {
@@ -4080,6 +6006,7 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     "pending": {"ready", "blocked"},
                     "ready": {"running", "blocked"},
                     "running": {"done", "failed"},
+                    "judging": set(),
                     "blocked": {"pending", "ready", "failed"},
                     "failed": {"pending"},
                     "done": set(),
@@ -4094,8 +6021,11 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 if args.status == "running":
                     if node["launch"]["state"] not in ("bound", "running"):
                         raise StateError("running node requires a bound child launch")
-                    if any(state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES for dependency in node["dependencies"]):
-                        raise StateError("node dependencies are not terminal-successful")
+                    if any(
+                        not _dependency_satisfied(state, args.node_id, dependency)
+                        for dependency in node["dependencies"]
+                    ):
+                        raise StateError("node dependencies are not satisfied")
                     node["launch"]["state"] = "running"
                     state["status"] = "running"
                     state["phase"] = node["stage"]
@@ -4112,11 +6042,16 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                     if not _planning_at_fixed_point(state):
                         raise StateError(PLANNING_FIXED_POINT_ERROR)
                     if any(
-                        state["nodes"][dependency]["status"] not in SUCCESS_NODE_STATUSES
+                        not _dependency_satisfied(state, args.node_id, dependency)
                         for dependency in node["dependencies"]
                     ):
-                        raise StateError("node dependencies are not terminal-successful")
+                        raise StateError("node dependencies are not satisfied")
                 if args.status == "done":
+                    if args.node_id in state["runtime_graph"]["gates"]:
+                        raise StateError("gated work must pass judge-complete verdicts before done")
+                    metadata = _runtime_metadata(state, args.node_id)
+                    if metadata is not None and metadata.get("kind") == "judge":
+                        raise StateError("runtime judge nodes must use judge-complete")
                     if not args.result or not args.evidence:
                         raise StateError("done node requires --result and --evidence")
                     node["attempts"][-1]["scope_evidence"] = _complete_scope_evidence(state, node)
@@ -4169,6 +6104,13 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                 if not isinstance(node_id, str) or node_id not in state["nodes"]:
                     raise StateError("plan references an unknown node")
                 node = state["nodes"][node_id]
+                if item["op"] != "priority":
+                    lock_reason = _runtime_structural_lock(state, node_id)
+                    if lock_reason is not None:
+                        raise StateError(
+                            "graph-replan cannot structurally mutate runtime-controlled work: "
+                            + lock_reason
+                        )
                 if node["status"] not in ("pending", "ready", "failed") or node["launch"]["state"] != "unclaimed":
                     raise StateError("replan can change only unclaimed future work")
                 if item["op"] in ("dependency_add", "dependency_remove"):
@@ -4179,6 +6121,12 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         or dependency not in state["nodes"]
                     ):
                         raise StateError("dependency operation is malformed")
+                    dependency_lock = _runtime_structural_lock(state, dependency)
+                    if dependency_lock is not None:
+                        raise StateError(
+                            "graph-replan cannot attach or detach runtime-controlled work: "
+                            + dependency_lock
+                        )
                     dependencies = node["dependencies"]
                     if item["op"] == "dependency_add" and dependency not in dependencies:
                         dependencies.append(dependency)
@@ -4205,6 +6153,12 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
                         raise StateError("supersede operation is malformed")
                     if replacement == node_id:
                         raise StateError("node cannot supersede itself")
+                    replacement_lock = _runtime_structural_lock(state, replacement)
+                    if replacement_lock is not None:
+                        raise StateError(
+                            "graph-replan cannot supersede through runtime-controlled work: "
+                            + replacement_lock
+                        )
                     if _raw_over_budget(state, node):
                         raise StateError("split-policy work must use node-split, not supersede")
                     cursor = replacement
@@ -4489,6 +6443,26 @@ def execute_command(args: Any, store: StateStore) -> tuple[int, str, Any, list[s
         def abort(state: dict[str, Any]) -> dict[str, Any]:
             state["status"] = "aborted"
             state["phase"] = "aborted"
+            resolved_at = now_iso()
+            runtime = state["runtime_graph"]
+            for gate in runtime["gates"].values():
+                if gate["status"] in ("configured", "pending"):
+                    gate["status"] = "failed"
+                    gate["resolved_at"] = resolved_at
+            for loop in runtime["loops"].values():
+                if loop["status"] == "active":
+                    loop["status"] = "exhausted"
+                    current = loop["current_node_id"]
+                    if len(loop["history"]) == loop["iteration"] - 1:
+                        loop["history"].append(
+                            {
+                                "iteration": loop["iteration"],
+                                "node_id": current,
+                                "gate_status": "failed",
+                                "at": resolved_at,
+                            }
+                        )
+                    loop["updated_at"] = resolved_at
             for node in state["nodes"].values():
                 if node["status"] not in TERMINAL_NODE_STATUSES:
                     node["status"] = "cancelled"
